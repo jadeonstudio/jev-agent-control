@@ -11,8 +11,9 @@ export const EVIDENCE = /^sha256:[0-9a-f]{64}$/;
 export const KINDS = ['decisions', 'outcomes', 'evaluations'];
 export const LABEL_SOURCES = ['objective', 'human', 'host_review', 'provider_agreement'];
 
-// Preserve option and question order: both are part of the model's actual input.
+// Preserve state, option and question order: all are part of the model's actual input.
 export function stable(value, parent = '') {
+  if (parent === 'state') return structuredClone(value);
   if (Array.isArray(value)) return value.map(v => stable(v));
   if (!isObject(value)) return value;
   const keys = ['criteria', 'questions'].includes(parent) ? Object.keys(value) : Object.keys(value).sort();
