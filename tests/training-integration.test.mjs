@@ -1,0 +1,115 @@
+import test from 'node:test';
+import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import path from 'node:path';
+import { EventEmitter } from 'node:events';
+import { PassThrough } from 'node:stream';
+import { spawnSync } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
+import { randomUUID } from 'node:crypto';
+import { createDecisionEngine } from '../src/engine.mjs';
+import { normalizeInference, createLayaClient } from '../src/inference.mjs';
+import { setMode } from '../src/storage.mjs';
+import { DEFAULTS } from '../src/constants.mjs';
+import { startMcp, TOOLS } from '../src/mcp.mjs';
+import { readMetrics } from '../src/metrics.mjs';
+import { digest } from '../src/training/schema.mjs';
+import { buildDataset, readDataset, exportDataset } from '../src/training/dataset.mjs';
+import { evaluateDecision, pairedPreferences } from '../src/training/evaluate.mjs';
+import { fixture, request, response, trace, decision, outcome, layaConfig, KEY } from './training-helpers.mjs';
+const ROOT = fileURLToPath(new URL('../', import.meta.url));
+const cli = (f, args, input) => spawnSync(process.execPath, [path.join(ROOT, 'bin/jev-control.mjs'), ...args], {
+  input, encoding: 'utf8', timeout: 8000, env: { ...process.env, HOME: f.home, JEV_HOME: f.home, TYPESAFE_API_KEY: '', JEV_DISABLE: '0' },
+});
+const identity = l => ({ model: l.model, checkpoint: l.checkpoint, runtime_version: l.runtimeVersion, device: l.device, precision: 'torch.float32' });
+
+test('all provider, capture and dataset CLI commands are wired, offline and strict', t => {
+  const f = fixture(t, false);
+  for (const args of [['training','capture','status'], ['training','capture','on'], ['training','capture','off'], ['dataset','stats'], ['dataset','validate'], ['provider','status']]) {
+    const r = cli(f,args); assert.equal(r.status,0,r.stderr); assert.equal(r.stdout.includes(KEY),false);
+  }
+  assert.equal(cli(f,['compare']).status,2); assert.equal(cli(f,['training','capture','on','extra']).status,2);
+  assert.equal(cli(f,['dataset','train']).status,2); assert.equal(cli(f,['provider','other']).status,2);
+  assert.ok(cli(f,['help']).stdout.includes('dataset export'));
+});
+test('Laya readiness and ON do not require a TypeSafe credential; OFF does no inference', async t => {
+  const f = fixture(t,false); const p = layaConfig(f.home); p.laya.python = process.execPath;
+  fs.writeFileSync(path.join(f.home,'model.safetensors'),'synthetic, not a model'); f.writeProviders(p);
+  const r = cli(f,['on']); assert.equal(r.status,0,r.stderr); assert.equal(JSON.parse(r.stdout).credential,'not-required');
+  assert.equal(cli(f,['off']).status,0);
+  let calls=0; const e=createDecisionEngine({home:f.home,env:{},provider:async()=>{calls++;throw new Error('unexpected');}});t.after(()=>e.close());
+  assert.equal((await e.decide(request())).reason,'OFF');assert.equal(calls,0);
+});
+test('Laya normalization preserves provenance and requires checkpoint-specific qualification', t => {
+  const p=layaConfig('/tmp');const raw={...response(),identity:identity(p.laya)};
+  const n=normalizeInference('laya',raw,request(),DEFAULTS,p);assert.equal(n.eligible,false);assert.equal(n.provenance.provider,'laya');
+  p.laya.qualification={checkpoint:p.laya.checkpoint,calibrationVersion:'fixture-v1',purposes:['route'],minConfidence:.9,minChoiceProbability:.9,noulCertainty:.95};
+  assert.equal(normalizeInference('laya',raw,request(),DEFAULTS,p).eligible,true);
+  assert.throws(()=>normalizeInference('laya',{...raw,identity:{...raw.identity,checkpoint:'b'.repeat(64)}},request(),DEFAULTS,p),/LAYA_IDENTITY_MISMATCH/);
+});
+test('local inference counts never masquerade as Jev network calls or Jev token usage', async t => {
+  const f=fixture(t);const p=layaConfig(f.home);f.writeProviders(p);
+  const e=createDecisionEngine({home:f.home,env:{},provider:async()=>({...response(),identity:identity(p.laya)})});t.after(()=>e.close());
+  const r=await e.decide({...request(),trace:trace()});assert.equal(r.networkCalls,0);assert.equal(r.inferenceCalls,1);assert.equal(r.apply,false);
+  const m=readMetrics(f.home);assert.equal(m.inferenceCalls,1);assert.equal(m.jevReportedTokens.input,0);assert.equal(m.providerActivity.laya.inputTokens,100);
+});
+test('Jev/Laya compare is explicit, independent, and invalidates stale active results', async t => {
+  const f=fixture(t);const p=layaConfig(f.home);p.provider='jev';f.writeProviders(p);let calls=0;
+  const e=createDecisionEngine({home:f.home,env:f.env,provider:async payload=>{
+    calls++;if(payload.model==='laya/base'){setMode(f.home,'off',{});return {...response(),identity:identity(p.laya)};}return response();
+  }});t.after(()=>e.close());
+  await assert.rejects(e.compare(request()),/EXPLICIT_REMOTE/);assert.equal(calls,0);
+  const r=await e.compare({...request(),trace:trace()},{remoteConsent:true});assert.equal(calls,2);
+  assert.equal(r.active.apply,false);assert.deepEqual(r.active.answers,{});assert.equal(r.observers[0].applied,false);
+  assert.equal('answers' in r.observers[0],false);
+});
+test('warm worker uses one child, preserves split UTF-8, and receives no inherited API secrets', async t => {
+  const f=fixture(t,false);const p=layaConfig(f.home,{model:'laya/한글'});p.laya.python=process.execPath;
+  fs.writeFileSync(path.join(f.home,'model.safetensors'),'fake');let starts=0,kills=0;
+  const client=createLayaClient({spawnImpl:(command,args,options)=>{
+    starts++;assert.equal(options.shell,false);assert.equal(options.env.TYPESAFE_API_KEY,undefined);assert.equal(options.env.HF_TOKEN,undefined);
+    const c=new EventEmitter();c.stdin=new PassThrough();c.stdout=new PassThrough();c.stderr=new PassThrough();c.kill=()=>{kills++;queueMicrotask(()=>c.emit('exit',0));return true;};
+    c.stdin.on('data',b=>{const msg=JSON.parse(b.toString());const out=Buffer.from(JSON.stringify(msg.init?{ready:true,identity:identity(p.laya)}:{id:msg.id,result:{...response(),identity:identity(p.laya)}})+'\n');
+      queueMicrotask(()=>{for(let i=0;i<out.length;i++)c.stdout.write(out.subarray(i,i+1));});});return c;
+  }});t.after(()=>client.close());
+  const r=await client.infer(request(),p,{timeoutMs:500,env:{TYPESAFE_API_KEY:KEY,HF_TOKEN:'do-not-inherit'}});
+  assert.equal(r.identity.model,'laya/한글');await client.infer(request(),p,{timeoutMs:500,env:{}});assert.equal(starts,1);
+  client.close();assert.ok(kills>=1);assert.equal(client.status().running,false);
+});
+test('worker cancellation and timeout settle requests and tear down the child', async t => {
+  const f=fixture(t,false),p=layaConfig(f.home);p.laya.python=process.execPath;fs.writeFileSync(path.join(f.home,'model.safetensors'),'fake');
+  const client=createLayaClient({spawnImpl:()=>{const c=new EventEmitter();c.stdin=new PassThrough();c.stdout=new PassThrough();c.stderr=new PassThrough();c.kill=()=>true;
+    c.stdin.on('data',b=>{if(JSON.parse(b.toString()).init)queueMicrotask(()=>c.stdout.write(JSON.stringify({ready:true,identity:identity(p.laya)})+'\n'));});return c;}});t.after(()=>client.close());
+  await assert.rejects(client.infer(request(),p,{timeoutMs:20,env:{}}),/TIMEOUT/);assert.equal(client.status().running,false);
+  const abort=new AbortController();const pending=client.infer(request(),p,{timeoutMs:500,env:{},signal:abort.signal});abort.abort();await assert.rejects(pending,/CANCELLED/);
+});
+test('MCP exposes one bounded weak-evidence recorder and closes provider runtime', async t => {
+  const f=fixture(t);const d=f.save(decision());const input=new PassThrough(),output=new PassThrough();const messages=[];
+  output.on('data',b=>messages.push(...b.toString().trim().split('\n').map(JSON.parse)));
+  let closed=0;const engine={...f.engine,close:()=>{closed++;f.engine.close();}};const server=startMcp(engine,{input,output});t.after(()=>{server.close();input.destroy();output.destroy();});
+  const send=(id,method,params)=>input.write(JSON.stringify({jsonrpc:'2.0',...(id?{id}:{}),method,params})+'\n');
+  send(1,'initialize',{protocolVersion:'2025-06-18',clientInfo:{name:'training-test',version:'1'},capabilities:{}});send(null,'notifications/initialized');
+  send(2,'tools/call',{name:'jev_record',arguments:{kind:'outcome',data:outcome(d)}});
+  await new Promise(r=>setTimeout(r,20));const r=messages.find(x=>x.id===2);assert.equal(r.result.isError,false);
+  const s=f.store.scan();const o=s.events.find(e=>e.kind==='outcomes');assert.equal(o.data.source,'host_review');assert.equal(o.data.labels[0].source,'host_review');
+  assert.equal(evaluateDecision(s.events.find(e=>e.kind==='decisions'),[o]).labels.length,0);
+  assert.ok(TOOLS.find(t=>t.name==='jev_decide').inputSchema.properties.trace);
+  server.close();assert.ok(closed>0);
+});
+test('Score and Noul supervised exports preserve label order without invented fractional targets', t => {
+  const f=fixture(t);let d=decision();d.request.questions={flag:{type:'noul',instructions:'Is additional inspection needed?'},depth:{type:'score',instructions:'Rate scope.',criteria:['small','medium','large']}};
+  d.request_hash=digest(d.request);d.answers={flag:{type:'noul',value:false,confidence:null,probabilityTrue:.01},depth:{type:'score',value:.2,confidence:.9,probabilities:{0:.8,1:.2,2:0}}};f.save(d);
+  const o=outcome(d,{executed:false,executed_answers:{},metrics:{},source:'human',checks:[],labels:[
+    {question_id:'flag',value:false,source:'human',label_confidence:1,evidence_ref:'sha256:'+'a'.repeat(64)},
+    {question_id:'depth',value:1,source:'human',label_confidence:1,evidence_ref:'sha256:'+'a'.repeat(64)},]});f.store.outcome(o);
+  const b=buildDataset(f.store);assert.equal(b.sample_count,2);const samples=readDataset(f.store,b.dataset_version).samples;
+  assert.deepEqual(samples.find(s=>s.question_id==='flag').target.probabilities,{false:1,true:0});
+  assert.deepEqual(samples.find(s=>s.question_id==='depth').target.probabilities,{0:0,1:1,2:0});assert.equal(exportDataset(f.store,b.dataset_version).samples,2);
+});
+test('routing preference requires separately executed comparable alternatives, not shadow guesses', t => {
+  const d1=decision(),d2=decision();d2.trace=d1.trace;d2.answers.worker={type:'choice',value:'strong',confidence:.99,selectedProbability:.99,probabilities:{light:.01,strong:.99}};
+  const o1=outcome(d1),o2=outcome(d2);o2.metrics.latency_ms=9999;o2.metrics.token_usage=9000;
+  const rows=[d1,d2].map((d,i)=>{const o=[o1,o2][i],de={event_id:d.decision_id,data:d},oe={event_id:randomUUID(),data:o};return{decision:de,outcome:o,evaluation:evaluateDecision(de,[oe])};});
+  assert.equal(pairedPreferences(rows).length,1);assert.equal(pairedPreferences(rows)[0].is_ground_truth,false);
+  rows[1].outcome.execution_id=rows[0].outcome.execution_id;assert.equal(pairedPreferences(rows).length,0);
+});
