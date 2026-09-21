@@ -8,7 +8,7 @@ import { loadFeaturePolicy, policyFingerprint, effectiveMode, TIERS } from './fe
 import { validateRouteInput, routeGuard, routeRequest, chooseRoute } from './routing.mjs';
 import { validateFilterInput, filterRequest, filterChoices, packFilterBatches } from './filtering.mjs';
 
-/** Shared, optional features. No classifier.dev calls, model APIs, shell commands or context mutation. */
+/** Common routing/filtering policies. Provider choice is local configuration, never another model decision. */
 export function createControlLayer({ home = resolveHome(), env = process.env, engine = createDecisionEngine({ home, env }), now = Date.now } = {}) {
   const pending = new Map();
   function remember(id, value) {
@@ -16,13 +16,14 @@ export function createControlLayer({ home = resolveHome(), env = process.env, en
     while (pending.size >= 128) pending.delete(pending.keys().next().value);
     pending.set(id, { ...value, at: now() });
   }
+  const expected = (initial, policy) => initial.provider === 'laya' ? initial.model : policy.expectedModel;
   function status() {
     const base = engine.status();
     try {
       const p = loadFeaturePolicy(home);
       return { ...base, features: { router: { mode: effectiveMode(base.mode, p.router.mode), configuredMode: p.router.mode,
-        expectedModel: p.router.expectedModel, configuredTargets: Object.fromEntries(Object.entries(p.router.profiles).map(([host, targets]) => [host, Object.keys(targets)])) },
-      bulk: { mode: effectiveMode(base.mode, p.bulk.mode), configuredMode: p.bulk.mode, expectedModel: p.bulk.expectedModel } }, featurePolicyError: null };
+        expectedModel: expected(base, p.router), configuredTargets: Object.fromEntries(Object.entries(p.router.profiles).map(([host, targets]) => [host, Object.keys(targets)])) },
+      bulk: { mode: effectiveMode(base.mode, p.bulk.mode), configuredMode: p.bulk.mode, expectedModel: expected(base, p.bulk) } }, featurePolicyError: null };
     } catch (error) { return { ...base, features: { router: { mode: 'off' }, bulk: { mode: 'off' } }, featurePolicyError: errorCode(error) }; }
   }
   function current(policy, feature, mode, revision) {
@@ -35,13 +36,13 @@ export function createControlLayer({ home = resolveHome(), env = process.env, en
   function log(kind, result, policy, extra = {}) {
     if (result.mode === 'off' || !engine.status().telemetry) return;
     appendEvent(home, { kind, at: new Date().toISOString(), id: result.id, mode: result.mode, apply: result.apply,
-      reason: result.reason, networkCalls: result.networkCalls, elapsedMs: result.elapsedMs,
+      reason: result.reason, networkCalls: result.networkCalls, inferenceCalls: result.inferenceCalls, elapsedMs: result.elapsedMs,
       model: result.model ?? null, policy: policy ? policyFingerprint(policy) : null, ...extra });
   }
-  async function route(input, { signal } = {}) {
+  async function route(input, { signal, trace } = {}) {
     const start = performance.now();
     const result = { version: 1, id: randomUUID(), mode: 'off', apply: false, source: 'host', reason: 'OFF', route: null,
-      networkCalls: 0, usage: { inputTokens: null, outputTokens: null }, authorizesExecution: false, changesHostModel: false };
+      networkCalls: 0, inferenceCalls: 0, usage: { inputTokens: null, outputTokens: null }, authorizesExecution: false, changesHostModel: false };
     let policy, proposal, revision;
     try {
       policy = loadFeaturePolicy(home);
@@ -53,40 +54,34 @@ export function createControlLayer({ home = resolveHome(), env = process.env, en
       const guard = routeGuard(request, policy.router);
       if (guard) { result.reason = guard; return result; }
       if (containsSensitiveData(request)) fail('SENSITIVE_INPUT');
+      const model = expected(initial, policy.router);
       let normalized;
-      const d = await engine.decide(routeRequest(request), { signal, modeLimit: policy.router.mode, modelOverride: policy.router.expectedModel, onEvaluated: n => { normalized = n; } });
-      Object.assign(result, { id: d.id, networkCalls: d.networkCalls, usage: d.usage, model: d.model ?? null, reason: d.reason });
+      const d = await engine.decide(routeRequest(request), { signal, trace, modeLimit: policy.router.mode, modelOverride: model, onEvaluated: n => { normalized = n; } });
+      Object.assign(result, { id: d.id, networkCalls: d.networkCalls, inferenceCalls: d.inferenceCalls ?? d.networkCalls,
+        usage: d.usage, model: d.model ?? null, reason: d.reason, provenance: d.provenance });
       current(policy, 'router', result.mode, revision);
       if (signal?.aborted) fail('CANCELLED');
       if (!normalized || !normalized.eligible) return result;
-      if (normalized.model !== policy.router.expectedModel) fail('MODEL_VERSION_MISMATCH');
+      if (normalized.model !== model) fail('MODEL_VERSION_MISMATCH');
       proposal = chooseRoute(normalized.answers, request, policy.router);
       if (!proposal.route) { result.reason = proposal.reason; return result; }
-      if (result.mode === 'shadow') {
-        remember(result.id, { kind: 'route', proposal: proposal.route.tier });
-        result.reason = 'SHADOW';
-      } else if (d.apply) {
-        result.apply = true; result.source = 'policy'; result.route = proposal.route; result.features = proposal.features; result.reason = proposal.reason;
-      }
+      if (result.mode === 'shadow') { remember(result.id, { kind: 'route', proposal: proposal.route.tier }); result.reason = 'SHADOW'; }
+      else if (d.apply) { result.apply = true; result.source = 'policy'; result.route = proposal.route; result.features = proposal.features; result.reason = proposal.reason; }
     } catch (error) { result.reason = errorCode(error); result.apply = false; result.route = null; delete result.features; }
-    finally {
-      result.elapsedMs = Math.round((performance.now() - start) * 1000) / 1000;
-      log('route', result, policy, { candidateAvailable: Boolean(proposal?.route) });
-    }
+    finally { result.elapsedMs = Math.round((performance.now() - start) * 1000) / 1000; log('route', result, policy, { candidateAvailable: Boolean(proposal?.route) }); }
     return result;
   }
-  async function filter(input, { signal } = {}) {
+  async function filter(input, { signal, trace } = {}) {
     const start = performance.now();
     const result = { version: 1, id: randomUUID(), mode: 'off', apply: false, reason: 'OFF', keepIds: [], rejectIds: [], reviewIds: [],
-      networkCalls: 0, valid: false, authorizesExecution: false, mutatesSource: false };
+      networkCalls: 0, inferenceCalls: 0, decisionIds: [], valid: false, authorizesExecution: false, mutatesSource: false };
     let policy, request, revision;
-    const rejected = new Set(), review = new Set();
-    let resolved = 0;
+    const rejected = new Set(), review = new Set(); let resolved = 0;
     try {
-      policy = loadFeaturePolicy(home);
-      request = validateFilterInput(input, policy.bulk.maxItems);
+      policy = loadFeaturePolicy(home); request = validateFilterInput(input, policy.bulk.maxItems);
       result.valid = true; result.keepIds = request.items.map(i => i.id);
       const initial = engine.status(); revision = initial.policyRevision;
+      const model = expected(initial, policy.bulk);
       result.mode = effectiveMode(initial.mode, policy.bulk.mode);
       if (result.mode === 'off') return result;
       if (request.coverage === 'exhaustive') { result.reason = 'EXHAUSTIVE_KEEP_ALL'; return result; }
@@ -95,56 +90,47 @@ export function createControlLayer({ home = resolveHome(), env = process.env, en
       if (signal?.aborted) fail('CANCELLED');
       const candidates = request.items.filter(i => !i.required);
       if (!candidates.length) { result.reason = 'NOTHING_TO_FILTER'; return result; }
-      const packed = packFilterBatches(request.query, candidates, { ...initial.requestLimits, batchSize: policy.bulk.batchSize, model: policy.bulk.expectedModel });
+      // Laya evaluates only one snippet per state; a token-admission failure keeps that snippet.
+      const batchSize = initial.provider === 'laya' ? 1 : policy.bulk.batchSize;
+      const packed = packFilterBatches(request.query, candidates, { ...initial.requestLimits, batchSize, model });
       for (const id of packed.deferred) review.add(id);
-      const deadline = AbortSignal.timeout(policy.bulk.maxTotalMs);
-      const combined = signal ? AbortSignal.any([signal, deadline]) : deadline;
+      const deadline = AbortSignal.timeout(policy.bulk.maxTotalMs), combined = signal ? AbortSignal.any([signal, deadline]) : deadline;
       for (let index = 0; index < packed.batches.length; index++) {
         current(policy, 'bulk', result.mode, revision);
         if (signal?.aborted) fail('CANCELLED');
-        if (result.networkCalls >= policy.bulk.maxRequests || deadline.aborted) {
-          for (const item of packed.batches.slice(index).flat()) review.add(item.id);
-          break;
+        if (result.inferenceCalls >= policy.bulk.maxRequests || deadline.aborted) {
+          for (const item of packed.batches.slice(index).flat()) review.add(item.id); break;
         }
-        const batch = packed.batches[index];
-        let normalized;
-        const d = await engine.decide(filterRequest(request.query, batch), { signal: combined, modeLimit: policy.bulk.mode, modelOverride: policy.bulk.expectedModel, onEvaluated: n => { normalized = n; } });
-        result.networkCalls += d.networkCalls;
+        const batch = packed.batches[index]; let normalized;
+        const d = await engine.decide(filterRequest(request.query, batch), { signal: combined, trace, modeLimit: policy.bulk.mode,
+          modelOverride: model, onEvaluated: n => { normalized = n; } });
+        result.networkCalls += d.networkCalls; result.inferenceCalls += d.inferenceCalls ?? d.networkCalls; result.decisionIds.push(d.id);
         if (d.model) result.model = d.model;
         current(policy, 'bulk', result.mode, revision);
         if (signal?.aborted) fail('CANCELLED');
-        if (d.reason === 'MODEL_VERSION_MISMATCH') fail('MODEL_VERSION_MISMATCH');
-        // Preserve the original engine's all-question acceptance gate: uncertain chunks keep ALL items.
-        if (!normalized?.eligible || (!d.apply && d.reason !== 'SHADOW') || normalized.model !== policy.bulk.expectedModel) {
+        if (['MODEL_VERSION_MISMATCH', 'LAYA_IDENTITY_MISMATCH'].includes(d.reason)) fail('MODEL_VERSION_MISMATCH');
+        if (!normalized?.eligible || (!d.apply && d.reason !== 'SHADOW') || normalized.model !== model) {
           for (const item of batch) review.add(item.id);
-          // Authentication, provider outage, version drift or budget errors cannot be repaired by retrying more chunks.
-          if (!['LOW_CONFIDENCE', 'SHADOW', 'ACCEPTED'].includes(d.reason) || (normalized && normalized.model !== policy.bulk.expectedModel)) {
-            for (const item of packed.batches.slice(index + 1).flat()) review.add(item.id);
-            break;
+          if (!['LOW_CONFIDENCE', 'SHADOW', 'ACCEPTED'].includes(d.reason) || (normalized && normalized.model !== model)) {
+            for (const item of packed.batches.slice(index + 1).flat()) review.add(item.id); break;
           }
           continue;
         }
         resolved += batch.length;
-        for (const item of filterChoices(normalized.answers, batch, policy.bulk)) {
-          if (item.reject) rejected.add(item.id);
-          if (item.review) review.add(item.id);
-        }
+        for (const item of filterChoices(normalized.answers, batch, policy.bulk)) { if (item.reject) rejected.add(item.id); if (item.review) review.add(item.id); }
       }
       current(policy, 'bulk', result.mode, revision);
       if (signal?.aborted) fail('CANCELLED');
       if (result.mode === 'shadow') {
-        if (resolved) remember(result.id, { kind: 'filter', rejected: [...rejected], ids: request.items.map(i => i.id) });
-        result.reason = 'SHADOW';
+        if (resolved) remember(result.id, { kind: 'filter', rejected: [...rejected], ids: request.items.map(i => i.id) }); result.reason = 'SHADOW';
       } else {
         result.apply = resolved > 0; result.reason = resolved ? (review.size ? 'PARTIAL_KEEP' : 'FILTERED') : 'KEEP_ALL_FALLBACK';
         result.rejectIds = request.items.filter(i => rejected.has(i.id)).map(i => i.id);
         result.keepIds = request.items.filter(i => !rejected.has(i.id)).map(i => i.id);
         result.reviewIds = request.items.filter(i => review.has(i.id)).map(i => i.id);
       }
-    } catch (error) {
-      result.reason = errorCode(error); result.apply = false; result.rejectIds = []; result.reviewIds = [];
-      result.keepIds = request?.items.map(i => i.id) ?? [];
-    } finally {
+    } catch (error) { result.reason = errorCode(error); result.apply = false; result.rejectIds = []; result.reviewIds = []; result.keepIds = request?.items.map(i => i.id) ?? []; }
+    finally {
       result.elapsedMs = Math.round((performance.now() - start) * 1000) / 1000;
       result.counts = { input: request?.items.length ?? 0, kept: result.keepIds.length, rejected: result.rejectIds.length, review: result.reviewIds.length };
       log('filter', result, policy, { inputCount: result.counts.input, candidateRejectCount: rejected.size, rejectedCount: result.rejectIds.length });
@@ -164,15 +150,12 @@ export function createControlLayer({ home = resolveHome(), env = process.env, en
       const misses = input.relevantIds.filter(id => item.rejected.includes(id)).length;
       metrics = { relevant: input.relevantIds.length, missed: misses, recall: input.relevantIds.length ? 1 - misses / input.relevantIds.length : null, suppliedLabelsOnly: true };
     }
-    pending.delete(input.id);
-    const base = engine.status();
+    pending.delete(input.id); const base = engine.status();
     if (base.mode !== 'off' && base.telemetry) appendEvent(home, { kind: 'observation', at: new Date().toISOString(), id: input.id, feature: item.kind, ...metrics });
     return metrics;
   }
   return Object.freeze({ route, filter, observe, status });
 }
-export const observeSchema = {
-  type: 'object', additionalProperties: false, required: ['id'], properties: {
-    id: { type: 'string' }, tier: { type: 'string', enum: TIERS }, relevantIds: { type: 'array', maxItems: 128, uniqueItems: true, items: { type: 'string' } },
-  },
-};
+export const observeSchema = { type: 'object', additionalProperties: false, required: ['id'], properties: {
+  id: { type: 'string' }, tier: { type: 'string', enum: TIERS }, relevantIds: { type: 'array', maxItems: 128, uniqueItems: true, items: { type: 'string' } },
+} };
