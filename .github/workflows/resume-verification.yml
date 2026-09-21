@@ -1,0 +1,52 @@
+name: Resume checkpoint verification
+on:
+  push:
+    branches: [feat/decision-training-capture]
+    paths:
+      - scripts/resume_core.py
+      - scripts/resume_data.py
+      - tests/training*.mjs
+      - tests/test_laya_worker.py
+      - .github/workflows/resume-verification.yml
+permissions:
+  contents: read
+jobs:
+  verify-and-save:
+    if: github.ref == 'refs/heads/feat/decision-training-capture'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    env:
+      PYTHONDONTWRITEBYTECODE: '1'
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          ref: ${{ github.sha }}
+      - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+        with:
+          node-version: 22
+      - name: Apply reviewed integration changes
+        run: |
+          python3 scripts/resume_core.py
+          python3 scripts/resume_data.py
+          git diff --check
+      - name: All offline JavaScript regressions
+        run: |
+          node scripts/check.mjs
+          node --test tests/*.test.mjs
+      - name: Python boundaries and complete dataset smoke
+        run: |
+          python3 -m unittest discover -s tests -p test_laya_worker.py
+          node bin/jev-control.mjs smoke
+          node examples/fast-path.mjs
+          node examples/training-pipeline.mjs
+      - name: Save verified source on the existing feature branch only
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git rm -- scripts/resume_core.py scripts/resume_data.py
+          git add -- bin src workers tests examples docs README.md SECURITY.md AGENTS.md package.json package-lock.json skills .gitignore
+          git diff --cached --check
+          git commit -m 'feat: complete opt-in decision training pipeline and provider integration'
+          git push origin HEAD:refs/heads/feat/decision-training-capture
