@@ -5,6 +5,7 @@ on:
     paths:
       - scripts/resume_core.py
       - scripts/resume_data.py
+      - scripts/resume_finish.py
       - tests/training*.mjs
       - tests/test_laya_worker.py
       - .github/workflows/resume-verification.yml
@@ -30,12 +31,7 @@ jobs:
         run: |
           python3 scripts/resume_core.py
           python3 scripts/resume_data.py
-          python3 - <<'PY'
-          from pathlib import Path
-          for name in ['AGENTS.md', 'SECURITY.md', 'docs/ARCHITECTURE.md', 'docs/TESTING.md']:
-              p = Path(name)
-              p.write_text(p.read_text().rstrip() + '\n')
-          PY
+          python3 scripts/resume_finish.py
           git diff --check
       - name: All offline JavaScript regressions
         run: |
@@ -51,7 +47,7 @@ jobs:
         run: |
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
-          git rm -- scripts/resume_core.py scripts/resume_data.py
+          git rm -- scripts/resume_core.py scripts/resume_data.py scripts/resume_finish.py
           git add -- bin src workers tests examples docs README.md SECURITY.md AGENTS.md package.json package-lock.json skills .gitignore
           git diff --cached --check
           git commit -m 'feat: complete opt-in decision training pipeline and provider integration'
