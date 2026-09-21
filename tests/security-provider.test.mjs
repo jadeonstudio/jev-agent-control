@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
 import http from 'node:http';
+import { execFileSync } from 'node:child_process';
 import { callTypeSafe } from '../src/provider.mjs';
 import { API_URL, MAX_RESPONSE_BYTES } from '../src/constants.mjs';
 import { resolveHome, saveCredential, getCredential, removeCredential, readText, atomicWrite, setMode, loadConfig, validateConfig } from '../src/storage.mjs';
@@ -15,10 +16,29 @@ test('credentials use env first; managed file is 0600 and removable', t => {
   removeCredential(home); assert.equal(getCredential(home, {}).source, 'missing');
 });
 test('worktree credentials and permissive managed files/directories are refused', t => {
-  const home = tempHome(t); fs.mkdirSync(path.join(home, '.git')); assert.throws(() => saveCredential(home, KEY), /KEY_IN_REPOSITORY_REFUSED/);
-  fs.rmdirSync(path.join(home, '.git')); saveCredential(home, KEY);
+  const home = tempHome(t); fs.mkdirSync(path.join(home, '.git')); fs.writeFileSync(path.join(home, '.git', 'HEAD'), 'ref: refs/heads/main\n');
+  assert.throws(() => saveCredential(home, KEY), /KEY_IN_REPOSITORY_REFUSED/);
+  fs.rmSync(path.join(home, '.git'), { recursive: true }); saveCredential(home, KEY);
   fs.chmodSync(path.join(home, 'credentials.env'), 0o644); assert.throws(() => getCredential(home, {}), /PRIVATE_FILE_REQUIRED/);
   fs.chmodSync(path.join(home, 'credentials.env'), 0o600); fs.chmodSync(home, 0o755); assert.throws(() => getCredential(home, {}), /PRIVATE_DIRECTORY_REQUIRED/); fs.chmodSync(home, 0o700);
+});
+test('non-repository .git cache ancestors do not prevent private credential storage', t => {
+  const root = tempHome(t), home = path.join(root, '.local', 'share', 'jev');
+  fs.mkdirSync(path.join(root, '.git', 'gk'), { recursive: true });
+  saveCredential(home, KEY);
+  assert.equal(getCredential(home, {}).key, KEY);
+  assert.equal(fs.statSync(path.join(home, 'credentials.env')).mode & 0o777, 0o600);
+});
+test('ancestor Git metadata, linked-worktree files and symlink markers stay blocked', t => {
+  const root = tempHome(t), marker = path.join(root, '.git'), home = path.join(root, 'nested', 'jev');
+  execFileSync('git', ['init', '--quiet', root]);
+  assert.throws(() => saveCredential(home, KEY), /KEY_IN_REPOSITORY_REFUSED/);
+  assert.equal(fs.existsSync(path.join(home, 'credentials.env')), false);
+  fs.rmSync(marker, { recursive: true });
+  fs.writeFileSync(marker, 'gitdir: /fixture/worktrees/linked\n');
+  assert.throws(() => saveCredential(home, KEY), /KEY_IN_REPOSITORY_REFUSED/);
+  fs.unlinkSync(marker); fs.symlinkSync(path.join(root, 'missing'), marker);
+  assert.throws(() => saveCredential(home, KEY), /KEY_IN_REPOSITORY_REFUSED/);
 });
 test('key file is parsed as one assignment, never shell-evaluated', t => {
   const home = tempHome(t); const f = path.join(home, 'credentials.env');

@@ -118,7 +118,13 @@ export function saveCredential(home, key) {
   // Do not create a credential file anywhere beneath a Git worktree.
   let current = path.resolve(home);
   for (;;) {
-    if (fs.existsSync(path.join(current, '.git'))) fail('KEY_IN_REPOSITORY_REFUSED');
+    const marker = path.join(current, '.git');
+    const stat = fs.lstatSync(marker, { throwIfNoEntry: false });
+    if (stat) {
+      // A tool cache named .git is not a repository; retain protection for partial Git metadata and worktree links.
+      if (!stat.isDirectory() || fs.readdirSync(marker).some(name =>
+        ['HEAD', 'objects', 'refs', 'config', 'index', 'commondir'].includes(name))) fail('KEY_IN_REPOSITORY_REFUSED');
+    }
     const parent = path.dirname(current); if (parent === current) break; current = parent;
   }
   ensureDir(home, true);
