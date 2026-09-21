@@ -1,0 +1,12 @@
+node_modules/
+.env
+.env.*
+!.env.example
+credentials.env
+*.pem
+*.key
+*.log
+*.jsonl
+coverage/
+.DS_Store
+.jev-local/
