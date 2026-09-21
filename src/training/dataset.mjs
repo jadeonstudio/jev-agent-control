@@ -1,7 +1,9 @@
 import path from 'node:path';
 import { readText } from '../storage.mjs';
-import { fail } from '../constants.mjs';
-import { POLICY_VERSION, HASH, encode, digest, safeContent, targetDistribution, validateTarget } from './schema.mjs';
+import { DEFAULTS, PURPOSES, fail } from '../constants.mjs';
+import { validateRequest, wireRequest } from '../contracts.mjs';
+// Canonical validation shares the inference input contract.
+import { POLICY_VERSION, HASH, encode, digest, safeContent, targetDistribution, validateTarget, validateProvenance, only, id } from './schema.mjs';
 import { EVALUATION_POLICY, indexEvents, evaluateDecision, pairedPreferences, summarizeComparisons } from './evaluate.mjs';
 
 export function validateDatasetSource(store) {
@@ -13,7 +15,10 @@ function groupedSplits(samples) {
   const parent = new Map();
   const find = key => { if (!parent.has(key)) parent.set(key, key); if (parent.get(key) !== key) parent.set(key, find(parent.get(key))); return parent.get(key); };
   const union = (a, b) => { a = find(a); b = find(b); if (a !== b) parent.set(a > b ? a : b, a > b ? b : a); };
-  for (const s of samples) union(`task:${s.task_id}`, `input:${s.request_hash}`);
+  for (const s of samples) {
+    for (const task of s.task_ids) union(`task:${task}`, `input:${s.request_hash}`);
+    union(`input:${s.request_hash}`, `state:${digest(s.state)}`);
+  }
   for (const s of samples) {
     s.group_id = digest(find(`task:${s.task_id}`));
     const n = parseInt(s.group_id.slice(0, 8), 16) % 100;
@@ -26,7 +31,7 @@ export function buildDataset(store) {
     const rows = [], candidates = [], excluded = { missingTaskSnapshot: 0, noSupportedLabel: 0, conflicts: 0, duplicates: 0, unknownProvenance: 0 };
     for (const [key, event] of [...index.decisions].sort(([a], [b]) => a.localeCompare(b))) {
       const d = event.data, outcomes = index.outcomes.get(key) || [], evaluation = evaluateDecision(event, outcomes);
-      rows.push({ decision: event, evaluation, outcome: outcomes.find(e => e.data.final)?.data });
+      rows.push({ decision: event, evaluation, outcome: outcomes.find(e => e.data.final && e.data.executed)?.data });
       if (!d.trace.task_id || !d.trace.snapshot_id) { excluded.missingTaskSnapshot++; continue; }
       if (d.provenance.model_version === 'unknown' || d.provenance.checkpoint === 'unknown' ||
           (d.provenance.provider === 'jev' && /(?:latest|preview)$/.test(d.provenance.model_version))) { excluded.unknownProvenance++; continue; }
@@ -35,7 +40,7 @@ export function buildDataset(store) {
         const question = d.request.questions[a.question_id];
         const target = { value: a.value, probabilities: targetDistribution(question, a.value) };
         const sample = { schema_version: 1, sample_id: digest({ request_hash: d.request_hash, question_id: a.question_id, target }),
-          task_id: d.trace.task_id, snapshot_id: d.trace.snapshot_id, request_hash: d.request_hash,
+          task_id: d.trace.task_id, snapshot_id: d.trace.snapshot_id, task_ids: [d.trace.task_id], snapshot_ids: [d.trace.snapshot_id], request_hash: d.request_hash,
           purpose: d.request.purpose, state: d.request.state, question_id: a.question_id, question,
           target, label_source: a.source, label_confidence: a.label_confidence,
           label_confidence_is_calibrated: false, evaluation_policy_version: POLICY_VERSION,
@@ -54,6 +59,8 @@ export function buildDataset(store) {
       if (!unique.has(s.sample_id)) unique.set(s.sample_id, s);
       else {
         excluded.duplicates++; const first = unique.get(s.sample_id);
+        first.task_ids = [...new Set([...first.task_ids, ...s.task_ids])].sort();
+        first.snapshot_ids = [...new Set([...first.snapshot_ids, ...s.snapshot_ids])].sort();
         first.provenance = [...new Map([...first.provenance, ...s.provenance].map(p => [encode(p), p])).values()].sort((a, b) => encode(a).localeCompare(encode(b)));
         for (const k of ['decisions', 'outcomes']) first.raw_refs[k] = [...new Set([...first.raw_refs[k], ...s.raw_refs[k]])].sort();
         first.label_confidence = Math.min(first.label_confidence, s.label_confidence);
@@ -77,7 +84,7 @@ export function buildDataset(store) {
       provider_distribution: providers, label_source_distribution: distribution('label_source'), split_distribution: distribution('split'),
       evaluation_policy_version: POLICY_VERSION, filter_rules: EVALUATION_POLICY, exclusions: { ...index.report, ...excluded },
       data_sha256: digest(data), preferences_sha256: digest(prefs),
-      split_rule: 'connected task_id OR identical request_hash; deterministic 80/10/10 group split', online_learning: false };
+      split_rule: 'connected ALL task IDs OR identical request/state hash; deterministic 80/10/10 group split', online_learning: false };
     const manifestPath = path.join(store.root, 'manifests', `${version}.json`);
     const previous = readText(manifestPath, { optional: true, privateFile: true, maxBytes: 49152 });
     store.writeDerived(`datasets/${version}/canonical.jsonl`, data);
@@ -96,15 +103,29 @@ export function readDataset(store, version) {
   const samples = contents.trim() ? contents.trim().split('\n').map(JSON.parse) : [];
   if (samples.length !== manifest.sample_count) fail('DATASET_MANIFEST_MISMATCH');
   for (const s of samples) {
-    safeContent(s); validateTarget(s.question, s.target.value);
+    safeContent(s);
+    only(s, ['schema_version','sample_id','task_id','snapshot_id','task_ids','snapshot_ids','request_hash','purpose','state','question_id','question','target','label_source','label_confidence','label_confidence_is_calibrated','evaluation_policy_version','provenance','raw_refs','group_id','split'], ['sample_id','task_ids','snapshot_ids','request_hash','provenance','raw_refs','question','target']);
+    if (!Array.isArray(s.provenance) || !s.provenance.length || !Array.isArray(s.task_ids) || !s.task_ids.length || !Array.isArray(s.snapshot_ids) || !s.snapshot_ids.length || !PURPOSES.includes(s.purpose)) fail('INVALID_CANONICAL_DATASET');
+    s.provenance.forEach(validateProvenance); s.task_ids.forEach(id); id(s.task_id);
+    if (!s.task_ids.includes(s.task_id) || !s.snapshot_ids.includes(s.snapshot_id) || s.snapshot_ids.some(x => !HASH.test(x)) || !HASH.test(s.request_hash) || !HASH.test(s.group_id)) fail('INVALID_CANONICAL_DATASET');
+    validateRequest({purpose:s.purpose,risk:'routine',state:s.state,questions:{[s.question_id]:s.question}}, DEFAULTS);
+    if (!Number.isFinite(s.label_confidence) || s.label_confidence < EVALUATION_POLICY.minLabelConfidence || s.label_confidence > 1 || !['objective','human','mixed_independent'].includes(s.label_source)) fail('INVALID_CANONICAL_DATASET');
+    for (const key of ['decisions','outcomes']) { if (!Array.isArray(s.raw_refs[key]) || !s.raw_refs[key].length) fail('INVALID_CANONICAL_DATASET'); s.raw_refs[key].forEach(id); }
+    validateTarget(s.question, s.target.value);
     if (s.schema_version !== 1 || s.evaluation_policy_version !== POLICY_VERSION ||
         !['train', 'calibration', 'test'].includes(s.split) || encode(targetDistribution(s.question, s.target.value)) !== encode(s.target.probabilities) ||
         s.sample_id !== digest({ request_hash: s.request_hash, question_id: s.question_id, target: s.target })) fail('INVALID_CANONICAL_DATASET');
   }
   return { manifest, samples, contents };
 }
-export const LAYA_EXPORT_VERSION = 'laya-typed-decisions-json-v1';
+export const LAYA_EXPORT_VERSION = 'laya-typed-decisions-json-v2';
 export const LAYA_UPSTREAM = 'NandhaKishorM/laya@42626c348753fbb17572a813127df2278a1ec527:notebooks/laya_finetune_typed_decisions_2xT4_kaggle.ipynb';
+// Match official Agent._to_internal json.dumps(list): ensure_ascii=True, comma-space.
+const pythonString = s => JSON.stringify(s).replace(/[-￿]/g, c => String.fromCharCode(92, 117) + c.charCodeAt(0).toString(16).padStart(4, '0'));
+export function layaQuestion(sample) {
+  const q = wireRequest({state:sample.state,questions:{[sample.question_id]:sample.question}}, 'export').questions[sample.question_id];
+  return {...q, instructions: '[' + q.instructions.map(pythonString).join(', ') + ']'};
+}
 export function exportDataset(store, version, format = 'laya') {
   if (!['laya', 'canonical'].includes(format)) fail('INVALID_EXPORT_FORMAT');
   return store.lock(() => {
@@ -115,14 +136,14 @@ export function exportDataset(store, version, format = 'laya') {
     else for (const split of ['train', 'calibration', 'test']) {
       const rows = samples.filter(s => s.split === split).map(s => ({
         // These THREE values are JSON strings because the official notebook calls json.loads on each.
-        state: JSON.stringify(s.state), questions: JSON.stringify({ [s.question_id]: s.question }),
+        state: JSON.stringify(s.state), questions: JSON.stringify({ [s.question_id]: layaQuestion(s) }),
         gold: JSON.stringify({ [s.question_id]: { probabilities: s.target.probabilities } }),
       }));
       files.push(store.writeDerived(`${folder}/${split}.jsonl`, rows.map(encode).join('\n') + (rows.length ? '\n' : '')));
     }
     files.push(store.writeDerived(`${folder}/manifest.json`, encode({ dataset_version: version,
       sample_count: manifest.sample_count, format, exporter_version: LAYA_EXPORT_VERSION,
-      upstream_contract: LAYA_UPSTREAM, evaluation_policy_version: POLICY_VERSION,
+      upstream_contract: LAYA_UPSTREAM, input_transform: 'wire-request-v1 plus official json.dumps(instructions)', evaluation_policy_version: POLICY_VERSION,
       source_data_sha256: manifest.data_sha256, training_executed: false,
       loader: 'datasets.load_dataset("json", data_files={"train": "train.jsonl", "validation": "calibration.jsonl", "test": "test.jsonl"})',
       note: 'Do not merge the holdout into training. Run tokenizer admission and inspect label quality before offline training.' }) + '\n'));

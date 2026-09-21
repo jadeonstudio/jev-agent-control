@@ -12,6 +12,7 @@ export function outsideGit(target) {
     const marker = path.join(dir, '.git');
     const s = fs.lstatSync(marker, { throwIfNoEntry: false });
     if (s && (!s.isDirectory() || fs.readdirSync(marker).some(k => ['HEAD', 'objects', 'refs', 'config', 'index', 'commondir'].includes(k)))) fail('TRAINING_IN_REPOSITORY_REFUSED');
+    if (fs.existsSync(path.join(dir, 'HEAD')) && fs.existsSync(path.join(dir, 'objects')) && fs.existsSync(path.join(dir, 'refs'))) fail('TRAINING_IN_REPOSITORY_REFUSED');
     const parent = path.dirname(dir); if (parent === dir) return; dir = parent;
   }
 }
@@ -21,10 +22,12 @@ export function createTrainingStore({ home = resolveHome(), now = () => new Date
     const raw = readText(settings, { optional: true, privateFile: true, maxBytes: 1024 });
     if (raw === null) return { version: 1, trainingCapture: false };
     let c; try { c = JSON.parse(raw); } catch { fail('INVALID_TRAINING_CONFIG'); }
-    only(c, ['version', 'trainingCapture'], ['version', 'trainingCapture']);
+    only(c, ['version', 'trainingCapture', 'generation'], ['version', 'trainingCapture']);
+    if (c.generation !== undefined && !UUID.test(c.generation)) fail('INVALID_TRAINING_CONFIG');
     if (c.version !== 1 || typeof c.trainingCapture !== 'boolean') fail('INVALID_TRAINING_CONFIG');
     return c;
   }
+  function ticket() { try { const c = config(); return c.trainingCapture ? (c.generation ?? 'legacy-enabled') : null; } catch { return null; } }
   function status() {
     try { return { ...config(), root, onlineLearning: false, contentInStatus: false }; }
     catch (e) { return { version: 1, trainingCapture: false, error: errorCode(e), root, onlineLearning: false, contentInStatus: false }; }
@@ -41,7 +44,7 @@ export function createTrainingStore({ home = resolveHome(), now = () => new Date
     if (typeof enabled !== 'boolean') fail('INVALID_TRAINING_CONFIG');
     return lock(() => {
       const old = readText(settings, { optional: true, privateFile: true, maxBytes: 1024 });
-      atomicWrite(settings, encode({ version: 1, trainingCapture: enabled }) + '\n', { expected: old });
+      atomicWrite(settings, encode({ version: 1, trainingCapture: enabled, generation: randomUUID() }) + '\n', { expected: old });
       return status();
     });
   }
@@ -72,11 +75,15 @@ export function createTrainingStore({ home = resolveHome(), now = () => new Date
     if (!config().trainingCapture) return { stored: false, reason: 'CAPTURE_OFF' };
     return lock(() => appendUnlocked(kind, data, eventId));
   }
-  function decision(data, { secret = '' } = {}) {
+  function decision(data, { secret = '', expectedTicket } = {}) {
     try {
       if (!config().trainingCapture) return { stored: false, reason: 'CAPTURE_OFF' };
+      if (expectedTicket !== undefined && (expectedTicket === null || ticket() !== expectedTicket)) return { stored: false, reason: 'CAPTURE_CONSENT_CHANGED' };
       safeContent(data, secret); validateDecision(data);
-      return append('decisions', structuredClone(data), data.decision_id);
+      return lock(() => {
+        if (expectedTicket !== undefined && (expectedTicket === null || ticket() !== expectedTicket)) return { stored: false, reason: 'CAPTURE_CONSENT_CHANGED' };
+        return appendUnlocked('decisions', structuredClone(data), data.decision_id);
+      });
     } catch (e) { return { stored: false, reason: errorCode(e) }; }
   }
   function outcome(data, { eventId, trust = 'operator' } = {}) {
@@ -91,7 +98,7 @@ export function createTrainingStore({ home = resolveHome(), now = () => new Date
   }
   function scanUnlocked() {
     outsideGit(root);
-    const events = [], invalid = [], duplicates = new Map();
+    const events = [], invalid = [], duplicates = new Map(); let totalBytes = 0;
     for (const kind of KINDS) {
       const dir = path.join(root, 'raw', kind); noSymlinks(dir);
       if (!fs.existsSync(dir)) continue;
@@ -100,11 +107,14 @@ export function createTrainingStore({ home = resolveHome(), now = () => new Date
       for (const name of names) {
         if (!name.endsWith('.json')) continue;
         try {
-          const e = validateEvent(JSON.parse(readText(path.join(dir, name), { privateFile: true, maxBytes: 49152 })));
+          const source = readText(path.join(dir, name), { privateFile: true, maxBytes: 49152 });
+          totalBytes += Buffer.byteLength(source);
+          if (totalBytes > 64 * 1024 * 1024) fail('TRAINING_SNAPSHOT_TOO_LARGE');
+          const e = validateEvent(JSON.parse(source));
           if (e.kind !== kind || name !== `${e.event_id}.json`) fail('TRAINING_EVENT_PATH_MISMATCH');
           if (duplicates.has(e.event_id)) fail('TRAINING_DUPLICATE_EVENT');
           duplicates.set(e.event_id, e); events.push(e);
-        } catch (error) { invalid.push({ kind, code: errorCode(error) }); }
+        } catch (error) { if (errorCode(error) === 'TRAINING_SNAPSHOT_TOO_LARGE') throw error; invalid.push({ kind, code: errorCode(error) }); }
       }
     }
     return { events, invalid };
@@ -115,11 +125,13 @@ export function createTrainingStore({ home = resolveHome(), now = () => new Date
   }
   function writeDerived(relative, contents) {
     if (typeof relative !== 'string' || path.isAbsolute(relative) || relative.split(/[\\/]/).includes('..') || !/^(datasets|manifests|exports)\//.test(relative)) fail('INVALID_DATASET_PATH');
-    outsideGit(root); safeContent(JSON.parse(contents.trim().split('\n')[0] || '{}'));
+    outsideGit(root);
+    if (typeof contents !== 'string' || Buffer.byteLength(contents) > 64 * 1024 * 1024) fail('DATASET_TOO_LARGE');
+    for (const line of contents.split('\n').filter(x => x.trim())) safeContent(JSON.parse(line));
     const file = path.join(root, relative); noSymlinks(file); ensureDir(path.dirname(file), true);
     const old = readText(file, { optional: true, privateFile: true, maxBytes: 64 * 1024 * 1024 });
     if (old !== null) { if (old !== contents) fail('IMMUTABLE_DATASET_CONFLICT'); return file; }
     atomicWrite(file, contents, { expected: null }); return file;
   }
-  return Object.freeze({ root, home, status, config, setCapture, lock, scan, scanUnlocked, appendUnlocked, decision, outcome, writeDerived });
+  return Object.freeze({ root, home, status, config, ticket, setCapture, lock, scan, scanUnlocked, appendUnlocked, decision, outcome, writeDerived });
 }

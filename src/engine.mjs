@@ -6,6 +6,7 @@ import { validateRequest, containsSensitiveData, wireRequest } from './contracts
 import { callTypeSafe } from './provider.mjs';
 import { loadProviderConfig, layaReady, createLayaClient, normalizeInference } from './inference.mjs';
 import { createTrainingStore } from './training/store.mjs';
+import { recordHost } from './training/host.mjs';
 import { CAPTURE_VERSION, digest, validateTrace } from './training/schema.mjs';
 
 /** Shared control; the selected inference adapter does not own permissions or training labels. */
@@ -43,6 +44,7 @@ export function createDecisionEngine({ home = resolveHome(), env = process.env, 
     const start = performance.now();
     const result = { version: 1, id: randomUUID(), mode: 'off', apply: false, source: 'host', reason: 'OFF', answers: {},
       usage: { inputTokens: null, outputTokens: null }, networkCalls: 0, inferenceCalls: 0, elapsedMs: 0, authorizesExecution: false };
+    const captureTicket = training.ticket();
     let config, settings, request, normalized, trace = {}, key = '', inputBytes = 0, eligible = false, reserved = false, circuit;
     try {
       config = loadConfig(home, env);
@@ -110,11 +112,12 @@ export function createDecisionEngine({ home = resolveHome(), env = process.env, 
         const captured = training.decision({ decision_id: result.id, trace, arm: result.mode === 'shadow' ? 'shadow' : 'active',
           request, request_hash: digest(request), provenance: normalized.provenance, answers: normalized.answers,
           mode: result.mode, apply: result.apply, latency_ms: result.elapsedMs, usage: result.usage,
-          inference_calls: result.inferenceCalls, network_calls: result.networkCalls, capture_policy_version: CAPTURE_VERSION }, { secret: key });
+          inference_calls: result.inferenceCalls, network_calls: result.networkCalls, capture_policy_version: CAPTURE_VERSION }, { secret: key, expectedTicket: captureTicket });
         result.trainingCapture = { stored: captured.stored, reason: captured.reason ?? null };
       }
       if (config?.telemetry && result.mode !== 'off') {
         result.telemetryStored = appendEvent(home, { kind: 'decision', at: new Date().toISOString(), id: result.id, mode: result.mode,
+          captureStored: result.trainingCapture?.stored ?? null, captureReason: result.trainingCapture?.reason ?? null,
           provider: result.provider ?? null, model: result.model ?? null, purpose: request?.purpose ?? 'unknown',
           reason: result.reason, apply: result.apply, eligible, inputBytes, questionCount: request ? Object.keys(request.questions).length : 0,
           networkCalls: result.networkCalls, inferenceCalls: result.inferenceCalls, elapsedMs: result.elapsedMs, usage: result.usage });
@@ -158,11 +161,15 @@ export function createDecisionEngine({ home = resolveHome(), env = process.env, 
     const active = await decide(snapshot, { signal, trace });
     const observer = initial.provider === 'jev' ? 'laya' : 'jev';
     const shadow = await decide(snapshot, { signal, trace, modeLimit: 'shadow', providerOverride: observer });
+    if (status().policyRevision !== initial.policyRevision || signal?.aborted) {
+      active.apply = false; active.source = 'host'; active.answers = {}; active.reason = 'COMPARISON_CONTEXT_CHANGED';
+    }
     return { active, comparison_id, observers: [{ provider: observer, decision_id: shadow.id, reason: shadow.reason,
       elapsedMs: shadow.elapsedMs, applied: false }], agreementIsAccuracy: false };
   }
   return Object.freeze({ decide, status, feedback, close, compare,
-    recordOutcome: input => training.outcome(input, { trust: 'host' }) });
+    recordOutcome: input => training.outcome(input, { trust: 'host' }),
+    recordHost: input => recordHost(training, input) });
 }
 export async function decideOrDelegate(engine, request, { use, delegate, signal } = {}) {
   if (typeof use !== 'function' || typeof delegate !== 'function') throw new ControlError('HANDLERS_REQUIRED');

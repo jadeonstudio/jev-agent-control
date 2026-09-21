@@ -2,6 +2,7 @@ import { parseArgs } from 'node:util';
 import { MAX_FRAME_BYTES, fail } from './constants.mjs';
 import { resolveHome } from './storage.mjs';
 import { initializeFeaturePolicy, loadFeaturePolicy, setFeatureMode } from './feature-policy.mjs';
+import { createDecisionEngine } from './engine.mjs';
 import { createControlLayer } from './control-layer.mjs';
 import { evaluatePairedRuns } from './evaluation.mjs';
 
@@ -27,7 +28,9 @@ export async function featureMain(argv = process.argv.slice(2), env = process.en
   const sub = positionals[1];
   if (positionals.length > (['router', 'bulk', 'policy'].includes(command) ? 2 : 1)) fail('UNEXPECTED_ARGUMENTS');
   const home = resolveHome({ ...env, ...(values.home ? { JEV_HOME: values.home } : {}) });
-  const layer = createControlLayer({ home, env });
+  const engine = createDecisionEngine({ home, env });
+  const layer = createControlLayer({ home, env, engine });
+  try {
   if (command === 'router' || command === 'bulk') {
     if (!['off', 'shadow', 'on'].includes(sub)) fail('INVALID_FEATURE_MODE');
     setFeatureMode(home, command, sub); print(layer.status());
@@ -36,11 +39,13 @@ export async function featureMain(argv = process.argv.slice(2), env = process.en
     if (sub === 'init') print(initializeFeaturePolicy(home));
     else if (sub === 'check') print({ valid: true, policy: loadFeaturePolicy(home), nativeTargetsVerified: false });
     else fail('INVALID_POLICY_COMMAND');
-  } else if (command === 'route') print(await layer.route(await jsonStdin()));
+  } else if (command === 'route') { const { trace, ...request } = await jsonStdin(); print(await layer.route(request, { trace })); }
   else if (command === 'filter') {
-    const result = await layer.filter(await jsonStdin()); print(result);
+    const { trace, ...request } = await jsonStdin();
+    const result = await layer.filter(request, { trace }); print(result);
     if (!result.valid) process.exitCode = 2;
   } else if (command === 'evaluate') print(evaluatePairedRuns(await jsonStdin(1048576)));
   return true;
+  } finally { engine.close(); }
 }
-export const FEATURE_HELP = `\nClassifier-inspired features (TypeSafe API only):\n  policy init|check   Create/validate private features.json; no automatic targets\n  router off|shadow|on  Cap routing independently of the global switch\n  bulk off|shadow|on    Cap prefiltering independently of the global switch\n  route|filter       Read bounded JSON from stdin; results contain no raw text\n  evaluate           Offline paired-execution report from JSON stdin\nSee docs/CLASSIFIER_DESIGN.md for configuration, examples and limitations.\n`;
+export const FEATURE_HELP = `\nClassifier-inspired features (explicit Jev or local Laya provider):\n  policy init|check   Create/validate private features.json; no automatic targets\n  router off|shadow|on  Cap routing independently of the global switch\n  bulk off|shadow|on    Cap prefiltering independently of the global switch\n  route|filter       Read bounded JSON from stdin; results contain no raw text\n  evaluate           Offline paired-execution report from JSON stdin\nSee docs/CLASSIFIER_DESIGN.md for configuration, examples and limitations.\n`;

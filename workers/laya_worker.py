@@ -26,6 +26,8 @@ def fingerprint(directory):
     root = Path(directory)
     if not root.is_absolute() or not root.is_dir():
         raise ValueError("LOCAL_MODEL_REQUIRED")
+    if any(p.is_symlink() for p in [root, *root.parents]):
+        raise ValueError('MODEL_SYMLINK_REFUSED')
     records = []
     # Hash every inference asset, not just the weights; temperature/tokenizer changes alter decisions.
     for p in sorted(root.rglob("*")):

@@ -57,7 +57,7 @@ export function installationPlan({ home, env = process.env, target = 'both', sco
   const server = { command: process.execPath, args: [cli, 'mcp'], env: { JEV_HOME: home } };
   const block = [BEGIN, `[mcp_servers.${SERVER_NAME}]`, `command = ${JSON.stringify(server.command)}`,
     `args = ${JSON.stringify(server.args)}`, 'env_vars = ["TYPESAFE_API_KEY", "JEV_DISABLE"]',
-    'startup_timeout_sec = 10', 'tool_timeout_sec = 15', 'enabled = true',
+    'startup_timeout_sec = 10', 'tool_timeout_sec = 210', 'enabled = true',
     `[mcp_servers.${SERVER_NAME}.env]`, `JEV_HOME = ${JSON.stringify(home)}`, END].join('\n');
   for (const agent of agents) {
     let file;

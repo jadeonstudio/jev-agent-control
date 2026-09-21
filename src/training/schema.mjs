@@ -3,7 +3,7 @@ import { DEFAULTS, PURPOSES, fail, isObject } from '../constants.mjs';
 import { validateRequest, containsSensitiveData } from '../contracts.mjs';
 
 export const SCHEMA_VERSION = 1;
-export const POLICY_VERSION = 'downstream-evidence-v1';
+export const POLICY_VERSION = 'downstream-evidence-v2';
 export const CAPTURE_VERSION = 'minimal-state-v1';
 export const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i;
 export const HASH = /^[0-9a-f]{64}$/;
@@ -39,6 +39,11 @@ export function safeContent(value, key = '') {
     if (++nodes > 4000 || depth > 14) fail('TRAINING_SENSITIVE_OR_OVERSIZED');
     if (typeof v === 'number' && !Number.isFinite(v)) fail('INVALID_TRAINING_SCHEMA');
     if (typeof v === 'string') {
+      const trimmed = v.trim();
+      if ((trimmed.startsWith('{') && trimmed.endsWith('}')) || (trimmed.startsWith('[') && trimmed.endsWith(']'))) {
+        let parsed; try { parsed = JSON.parse(trimmed); } catch { /* ordinary text */ }
+        if (parsed && typeof parsed === 'object') { if (containsSensitiveData(parsed, key)) fail('TRAINING_SENSITIVE_OR_OVERSIZED'); visit(parsed, depth + 1); }
+      }
       if (/[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}/.test(v) || /\b(?:010|011)[ -]?\d{3,4}[ -]?\d{4}\b/.test(v) ||
           /\b\d{6}[- ]?[1-4]\d{6}\b/.test(v) || /\b(?:sk_live_|sk_test_|xox[baprs]-|AIza)[A-Za-z0-9_-]{8,}/.test(v)) fail('TRAINING_SENSITIVE_OR_OVERSIZED');
     }
@@ -68,6 +73,7 @@ export function validateProvenance(p) {
     ['provider', 'model', 'model_version', 'checkpoint', 'runtime_version', 'preprocessing_version', 'confidence_semantics']);
   if (!['jev', 'laya', 'host'].includes(p.provider)) fail('INVALID_TRAINING_SCHEMA');
   for (const key of Object.keys(p)) text(p[key], 200);
+  if (p.provider === 'laya' && !HASH.test(p.checkpoint)) fail('INVALID_TRAINING_SCHEMA');
 }
 export function validateTarget(q, value) {
   if (q.type === 'choice' && (typeof value !== 'string' || !Object.hasOwn(q.criteria, value))) fail('INVALID_TRAINING_TARGET');
@@ -100,6 +106,7 @@ export function validatePrediction(request, answers, host = false) {
       if (Math.abs(Object.values(a.probabilities).reduce((s, p) => s + p, 0) - 1) > .02) fail('INVALID_TRAINING_SCHEMA');
       if (q.type === 'score' && Math.abs(keys.reduce((s, k) => s + Number(k) * a.probabilities[k], 0) - a.value) > .05) fail('INVALID_TRAINING_SCHEMA');
       if (q.type === 'choice' && a.probabilities[a.value] + 1e-9 < Math.max(...Object.values(a.probabilities))) fail('INVALID_TRAINING_SCHEMA');
+      if (a.selectedProbability !== undefined && (q.type !== 'choice' || a.selectedProbability !== a.probabilities[a.value])) fail('INVALID_TRAINING_SCHEMA');
     }
   }
 }
@@ -108,7 +115,7 @@ export function validateDecision(d) {
     ['decision_id', 'trace', 'arm', 'request', 'request_hash', 'provenance', 'answers', 'mode', 'apply', 'latency_ms', 'usage', 'inference_calls', 'network_calls', 'capture_policy_version']);
   id(d.decision_id); validateTrace(d.trace); validateProvenance(d.provenance);
   if (!['active', 'shadow', 'host'].includes(d.arm) || !['shadow', 'on'].includes(d.mode) || typeof d.apply !== 'boolean') fail('INVALID_TRAINING_SCHEMA');
-  if (d.arm === 'shadow' && d.apply) fail('INVALID_TRAINING_SCHEMA');
+  if ((d.arm === 'shadow' || d.mode === 'shadow') && d.apply) fail('INVALID_TRAINING_SCHEMA');
   if ((d.arm === 'host') !== (d.provenance.provider === 'host')) fail('INVALID_TRAINING_SCHEMA');
   const req = validateRequest(d.request, DEFAULTS);
   if (req.risk !== 'routine' || Buffer.byteLength(JSON.stringify(req.state)) > 4096 || d.request_hash !== digest(req)) fail('INVALID_TRAINING_SCHEMA');
@@ -138,7 +145,7 @@ export function validateOutcome(o) {
     only(c, ['kind', 'passed', 'required', 'scope', 'evidence_ref', 'question_id', 'exit_status'], ['kind', 'passed', 'required', 'scope', 'evidence_ref']);
     if (!['tests', 'build', 'lint', 'typecheck', 'runtime', 'artifact', 'command', 'label'].includes(c.kind) || typeof c.passed !== 'boolean' || typeof c.required !== 'boolean' || !['task', 'partial'].includes(c.scope) || !EVIDENCE.test(c.evidence_ref)) fail('INVALID_TRAINING_SCHEMA');
     if (c.question_id !== undefined) text(c.question_id, 64);
-    if (c.exit_status !== undefined && !Number.isInteger(c.exit_status)) fail('INVALID_TRAINING_SCHEMA');
+    if (c.exit_status !== undefined && (!Number.isInteger(c.exit_status) || c.passed !== (c.exit_status === 0))) fail('INVALID_TRAINING_SCHEMA');
   }
   for (const a of o.labels) {
     only(a, ['question_id', 'value', 'source', 'label_confidence', 'evidence_ref'], ['question_id', 'value', 'source', 'label_confidence', 'evidence_ref']);

@@ -1,5 +1,6 @@
 import fs from 'node:fs';
 import path from 'node:path';
+import { StringDecoder } from 'node:string_decoder';
 import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { randomUUID } from 'node:crypto';
@@ -57,7 +58,7 @@ export function normalizeInference(provider, raw, request, config, settings) {
   }
   const identity = raw?.identity, l = settings.laya;
   if (!identity || identity.checkpoint !== l.checkpoint || identity.runtime_version !== l.runtimeVersion || identity.model !== l.model ||
-      identity.device.split(':')[0] !== l.device || !['torch.float32', 'torch.float16', 'torch.bfloat16'].includes(identity.precision)) fail('LAYA_IDENTITY_MISMATCH');
+      typeof identity.device !== 'string' || identity.device.split(':')[0] !== l.device || !['torch.float32', 'torch.float16', 'torch.bfloat16'].includes(identity.precision)) fail('LAYA_IDENTITY_MISMATCH');
   const policy = l.qualification;
   // Canonical shape validation is shared; probability meaning and acceptance are provider-specific.
   const n = normalizeResponse({ ...raw, model: identity.model }, request, { ...config,
@@ -70,13 +71,13 @@ export function normalizeInference(provider, raw, request, config, settings) {
 }
 
 /** One optional warm Python process. No shell, API keys, downloaded code, HTTP listener or automatic training. */
-export function createLayaClient() {
-  let child, starting, readyIdentity, identityKey, buffer = '', idle;
+export function createLayaClient({ spawnImpl = spawn } = {}) {
+  let child, starting, readyIdentity, identityKey, buffer = '', idle, decoder = new StringDecoder('utf8');
   const pending = new Map();
   let readyResolve, readyReject, startupTimer;
   function stop(code = 'LAYA_WORKER_STOPPED') {
     clearTimeout(idle); clearTimeout(startupTimer);
-    const old = child; child = null; starting = null; readyIdentity = null; buffer = '';
+    const old = child; child = null; starting = null; readyIdentity = null; buffer = ''; decoder = new StringDecoder('utf8');
     readyReject?.(new ControlError(code)); readyReject = null; readyResolve = null;
     for (const p of pending.values()) { clearTimeout(p.timer); p.reject(new ControlError(code)); }
     pending.clear();
@@ -94,7 +95,7 @@ export function createLayaClient() {
     const allowedEnv = Object.fromEntries(['HOME', 'PATH', 'TMPDIR', 'SYSTEMROOT'].filter(k => typeof env[k] === 'string').map(k => [k, env[k]]));
     const promise = new Promise((resolve, reject) => { readyResolve = resolve; readyReject = reject; });
     starting = promise;
-    const process = spawn(l.python, ['-I', script], { shell: false, stdio: ['pipe', 'pipe', 'pipe'], env: {
+    const process = spawnImpl(l.python, ['-I', script], { shell: false, stdio: ['pipe', 'pipe', 'pipe'], env: {
       ...allowedEnv, HF_HUB_OFFLINE: '1', TRANSFORMERS_OFFLINE: '1', HF_HUB_DISABLE_TELEMETRY: '1', PYTHONUNBUFFERED: '1', TOKENIZERS_PARALLELISM: 'false',
     } });
     child = process;
@@ -104,7 +105,7 @@ export function createLayaClient() {
     process.on('exit', () => { if (child === process) stop('LAYA_WORKER_EXIT'); });
     process.stdout.on('data', chunk => {
       if (child !== process) return;
-      buffer += chunk.toString('utf8');
+      buffer += decoder.write(chunk);
       if (Buffer.byteLength(buffer) > 262144) { stop('LAYA_FRAME_TOO_LARGE'); return; }
       let end;
       while ((end = buffer.indexOf('\n')) >= 0) {

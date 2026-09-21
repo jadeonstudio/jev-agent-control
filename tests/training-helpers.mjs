@@ -44,5 +44,5 @@ export function fixture(t, capture = true) {
 }
 export function layaConfig(home, patch = {}) {
   return { version: 1, provider: 'laya', laya: { python: '/usr/bin/python3', modelPath: home, model: 'laya/base', checkpoint: 'a'.repeat(64),
-    runtimeVersion: '0.3.4', device: 'cpu', ...patch } };
+    runtimeVersion: '0.3.4', device: 'cpu', startupTimeoutMs: 1000, idleTimeoutMs: 1000, ...patch } };
 }

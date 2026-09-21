@@ -1,5 +1,27 @@
 # Jev Agent Control
 
+## v0.3: Jev/Laya와 선택적 학습 데이터 수집
+
+기존 Jev API 경로와 OFF/SHADOW/ON을 유지하면서 **공식 Laya Python worker를 선택 가능한 provider**로 추가했다. `provider status|jev|laya`로 로컬 설정을 선택한다. 자동 provider cascade나 모델 학습은 없다.
+
+**Training Capture 기본 OFF.** 켠 경우에만 최소 비식별 Decision → 별도 Outcome → versioned Evaluation → 검증된 canonical Dataset → Laya export를 저장소 밖 사용자 전용 경로에 축적한다. operational telemetry는 계속 content-free다. Decision은 정답이 아니며, agreement도 정확도가 아니다.
+
+```sh
+jev-control training capture status
+jev-control training capture on     # 사용자가 명시적으로 승인한 경우
+jev-control training capture off
+jev-control dataset stats
+jev-control dataset validate
+jev-control dataset build
+jev-control dataset export --version <dataset-hash> --format laya
+node examples/training-pipeline.mjs # 키/모델 없는 검증용 예제
+```
+
+실제 source schema, 결과 연결법, 보안 경계 및 공식 Laya export 계약은 [TRAINING_DATA.md](docs/TRAINING_DATA.md)를 확인한다. `jev_record`는 weak host evidence만 기록하며 MCP에서 human/runner 권위를 만들지 않는다. 실제 Laya 모델·MPS·native host 성능과 fine-tuning은 fixture 테스트와 별도 검증 대상이다.
+
+아래 기존 설치·모드·키 절차는 기본 Jev 경로에 계속 적용된다. Laya 설정에는 TypeSafe 키가 필요하지 않으며, Python·모델 다운로드/전처리는 명시적 별도 준비 작업이다.
+
+
 Codex와 Claude Code가 같은 **선택적 결정 계층**을 사용하는 로컬 MCP 서버·스킬·CLI입니다. v0.2는 classifier.dev의 분류 설계를 참고하되 **TypeSafe Jev API만 직접 호출**합니다. 별도 classifier.dev 계정·키·프록시가 없습니다.
 
 **Node.js 22+ · Git · macOS/Linux/WSL · 런타임 의존 패키지 0개 · 기본 OFF · API 키 없이 설치·오프라인 테스트 가능**
