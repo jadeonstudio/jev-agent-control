@@ -2,9 +2,10 @@ import { randomUUID } from 'node:crypto';
 import { POLICY_VERSION, encode, digest, validateTarget } from './schema.mjs';
 
 export const EVALUATION_POLICY = Object.freeze({
-  version: POLICY_VERSION, minLabelConfidence: .9, labelSources: ['objective', 'human'],
+  version: POLICY_VERSION, implementation_revision: 'evidence-guards-v1',
+  minLabelConfidence: .9, labelSources: ['objective', 'human'],
   agreementIsAccuracy: false, hostIsOracle: false,
-  qualityRule: 'runner/human report: task success AND required task-scoped checks AND no rollback/regression/runtime error/timeout',
+  qualityRule: 'runner/human report: task success AND required task-scoped checks AND no explicit failed quality metric, rollback, regression, runtime error or timeout',
   labelRule: 'explicit question-specific assertion or human correction; never derive labels from provider votes or generic success',
 });
 const PURPOSE_SIGNALS = Object.freeze({
@@ -40,15 +41,18 @@ export function indexEvents(snapshot) {
 }
 export function evaluateDecision(decisionEvent, outcomeEvents = []) {
   const d = decisionEvent.data;
-  const distinct = new Map(outcomeEvents.filter(e => e.data.final).map(e => [digest(e.data), e]));
-  const final = [...distinct.values()];
   const base = {
     decision_id: d.decision_id, policy_version: POLICY_VERSION,
+    implementation_revision: EVALUATION_POLICY.implementation_revision,
     outcome_ids: outcomeEvents.map(e => e.event_id).sort(), purpose: d.request.purpose,
     quality_observed: null, quality_is_global_correctness: false, labels: [], signals: {},
     utility: null, issues: [], evidence_sources: [], metrics: null, executed: false,
     execution_matches_prediction: false, baseline_skip_supported: false,
   };
+  // Enforce the join even for direct library callers, not just store-indexed calls.
+  if (outcomeEvents.some(e => e.data.decision_id !== d.decision_id)) return { ...base, state: 'INVALID_OUTCOME_LINK' };
+  const distinct = new Map(outcomeEvents.filter(e => e.data.final).map(e => [digest(e.data), e]));
+  const final = [...distinct.values()];
   const executions = final.filter(e => e.data.executed);
   if (executions.length > 1) return { ...base, state: 'AMBIGUOUS_OUTCOME' };
   if (!final.length) return { ...base, state: 'AWAITING_OUTCOME' };
@@ -74,7 +78,11 @@ export function evaluateDecision(decisionEvent, outcomeEvents = []) {
   base.baseline_skip_supported = base.execution_matches_prediction && d.apply && d.arm === 'active' &&
     o.source === 'runner' && m.baseline_call_skipped === true && m.human_override !== true;
   const required = o.checks.filter(c => c.required && c.scope === 'task' && c.kind !== 'label');
-  const negative = ['runtime_error', 'rollback', 'timeout', 'regression'].some(k => m[k] === true) || required.some(c => !c.passed);
+  // Explicit failure wins over a broad success claim. Missing/null checks are unknown,
+  // not failed, and independent label evidence is evaluated separately below.
+  const failedQuality = ['tests_passed', 'build_passed', 'lint_passed', 'typecheck_passed', 'artifact_created'].some(k => m[k] === false);
+  const negative = failedQuality || ['runtime_error', 'rollback', 'timeout', 'regression', 'serious_review_issue'].some(k => m[k] === true) || required.some(c => !c.passed);
+  if (negative && m.task_succeeded === true) base.issues.push('CONTRADICTORY_OUTCOME_EVIDENCE');
   if (o.executed && o.source !== 'host_review') {
     base.quality_observed = negative || m.task_succeeded === false ? false :
       (m.task_succeeded === true && required.length && required.every(c => c.passed) ? true : null);
@@ -97,8 +105,12 @@ export function evaluateDecision(decisionEvent, outcomeEvents = []) {
     if (!EVALUATION_POLICY.labelSources.includes(a.source) || a.label_confidence < EVALUATION_POLICY.minLabelConfidence) continue;
     const q = d.request.questions[a.question_id];
     try { if (!q) continue; validateTarget(q, a.value); } catch { base.issues.push('INVALID_LABEL'); continue; }
-    if (a.source === 'objective' && (report.source !== 'runner' || !report.checks.some(c => c.kind === 'label' && c.passed && c.required &&
-        c.scope === 'task' && c.question_id === a.question_id && c.evidence_ref === a.evidence_ref))) continue;
+    if (a.source === 'objective') {
+      if (report.source !== 'runner') continue;
+      const assertions = report.checks.filter(c => c.kind === 'label' && c.required && c.scope === 'task' &&
+        c.question_id === a.question_id && c.evidence_ref === a.evidence_ref);
+      if (!assertions.length || assertions.some(c => !c.passed)) continue;
+    }
     if (a.source === 'human' && report.source !== 'human') continue;
     if (!candidates.has(a.question_id)) candidates.set(a.question_id, []);
     candidates.get(a.question_id).push({ ...a, outcome_id: annotation.event_id });
