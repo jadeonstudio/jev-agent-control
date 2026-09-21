@@ -53,7 +53,7 @@ jev-control provider laya
 jev-control shadow
 ```
 
-상태의 `ready`는 파일 수준 준비 여부이며 실제 모델 로딩·품질 합격이 아니다. worker가 런타임 버전·가중치/tokenizer/config fingerprint·실제 장치/precision을 확인한다. MPS 요청이 CPU로 떨어지면 조용히 채택하지 않고 실패로 돌린다. cold 시작 제한과 warm 추론 제한은 별개이며, idle·OFF·MCP EOF·취소 시 worker를 정리한다. 두 호스트는 각자 worker를 가질 수 있다. 공유 daemon은 추가하지 않았다.
+상태의 `ready`는 파일 수준 준비 여부이며 실제 모델 로딩·품질 합격이 아니다. worker가 런타임 버전·가중치/tokenizer/config fingerprint·실제 장치/precision을 확인한다. MPS 요청이 CPU로 떨어지면 조용히 채택하지 않고 실패로 돌린다. cold 시작 제한과 warm 추론 제한은 별개다. 드문 연구 작업은 package root의 `engine.prepare({ timeoutMs?, signal?, resident: true })`로 cycle 밖에서 명시적으로 모델을 준비하고 idle 종료를 억제할 수 있다. `resident` 기본은 prepare에서만 `true`이며, 기존 `decide()`의 60초 idle 동작은 바뀌지 않는다. 준비는 추론·채택이 아니며 heartbeat나 공유 daemon을 추가하지 않는다. 두 호스트는 각자 worker를 가질 수 있다.
 
 입력이 공식 tokenizer의 head/options/state 예산에서 잘리거나 mask token을 치환해야 하면 적용하지 않는다. Laya bulk는 한 snippet씩 평가하고, 실패·불확실·전수조사 자료를 보존한다. Laya는 checkpoint·purpose·calibrationVersion과 임계값을 명시한 `qualification`이 없으면 높은 확률을 내도 ON에서 채택하지 않는다. 임계값 복사나 `qualification` 파일 존재 자체는 성능 증명이 아니다.
 

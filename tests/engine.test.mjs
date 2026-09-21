@@ -24,6 +24,14 @@ test('OFF is zero-network, skips malformed input and keys, and writes no telemet
 test('environment kill switch overrides persistent ON', async t => {
   const f = fixture(t); f.env.JEV_DISABLE = '1'; assert.equal((await f.engine.decide(request())).reason, 'OFF'); assert.equal(f.calls(), 0);
 });
+test('package-root prepare is explicit Laya residency, without inference', async t => {
+  const f=fixture(t),providers=path.join(f.home,'providers.json');const settings={version:1,provider:'laya',laya:{python:'/bin/python3',modelPath:'/tmp/model',model:'laya/base',checkpoint:'a'.repeat(64),runtimeVersion:'0.3.4',device:'cpu'}};fs.writeFileSync(providers,JSON.stringify(settings),{mode:0o600});
+  let seen;const layaClient={status:()=>({running:false}),close:()=>{},prepare:async(...args)=>{seen=args;return{model:'laya/base'};}};
+  const engine=createDecisionEngine({home:f.home,env:f.env,layaClient});t.after(()=>engine.close());
+  assert.deepEqual(await engine.prepare({timeoutMs:500,resident:false}),{model:'laya/base'});assert.equal(seen[0].provider,'laya');assert.equal(seen[0].laya.idleTimeoutMs,60000);assert.deepEqual(seen[1],{signal:undefined,timeoutMs:500,resident:false,env:f.env});
+  settings.provider='jev';fs.writeFileSync(providers,JSON.stringify(settings));await assert.rejects(engine.prepare(),/LAYA_NOT_SELECTED/);
+  settings.provider='laya';fs.writeFileSync(providers,JSON.stringify(settings));setMode(f.home,'off',{});await assert.rejects(engine.prepare(),/OFF/);
+});
 test('SHADOW is blind and feedback records agreement, not decisions or accuracy', async t => {
   const f = fixture(t); setMode(f.home, 'shadow', {}); const r = await f.engine.decide(request());
   assert.equal(r.reason, 'SHADOW'); assert.equal(r.apply, false); assert.deepEqual(r.answers, {});

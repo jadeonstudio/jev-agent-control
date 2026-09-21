@@ -72,18 +72,38 @@ export function normalizeInference(provider, raw, request, config, settings) {
 
 /** One optional warm Python process. No shell, API keys, downloaded code, HTTP listener or automatic training. */
 export function createLayaClient({ spawnImpl = spawn } = {}) {
-  let child, starting, readyIdentity, identityKey, buffer = '', idle, decoder = new StringDecoder('utf8');
-  const pending = new Map();
+  let child, starting, readyIdentity, identityKey, buffer = '', idle, decoder = new StringDecoder('utf8'), resident = false, generation = 0;
+  const pending = new Map(), tombstones = new Map();
   let readyResolve, readyReject, startupTimer;
   function stop(code = 'LAYA_WORKER_STOPPED') {
     clearTimeout(idle); clearTimeout(startupTimer);
-    const old = child; child = null; starting = null; readyIdentity = null; buffer = ''; decoder = new StringDecoder('utf8');
+    const old = child; child = null; starting = null; readyIdentity = null; resident = false; buffer = ''; decoder = new StringDecoder('utf8');
     readyReject?.(new ControlError(code)); readyReject = null; readyResolve = null;
     for (const p of pending.values()) { clearTimeout(p.timer); p.reject(new ControlError(code)); }
     pending.clear();
+    for (const p of tombstones.values()) clearTimeout(p.timer);
+    tombstones.clear();
     if (old) { old.stdin.destroy(); old.kill('SIGTERM'); const kill = setTimeout(() => old.kill('SIGKILL'), 500); kill.unref(); }
   }
-  function armIdle(l) { clearTimeout(idle); if (!pending.size) { idle = setTimeout(() => stop(), l.idleTimeoutMs); idle.unref(); } }
+  function armIdle(l) { clearTimeout(idle); if (!resident && !pending.size && !tombstones.size) { idle = setTimeout(() => stop(), l.idleTimeoutMs); idle.unref(); } }
+  function retire(id, p, code, l, livenessMs) {
+    pending.delete(id); clearTimeout(p.timer); p.reject(new ControlError(code));
+    const timer = setTimeout(() => stop('LAYA_LIVENESS_TIMEOUT'), Math.max(1000, livenessMs));
+    timer.unref(); tombstones.set(id, { timer }); armIdle(l);
+  }
+  function awaitUntil(promise, { deadline, signal }) {
+    return new Promise((resolve, reject) => {
+      const remaining = deadline - Date.now();
+      if (remaining <= 0) { reject(new ControlError('TIMEOUT')); return; }
+      let timer, done = false;
+      const finish = (fn, value) => { if (done) return; done = true; clearTimeout(timer); signal?.removeEventListener('abort', cancelled); fn(value); };
+      const cancelled = () => finish(reject, new ControlError('CANCELLED'));
+      if (signal?.aborted) { cancelled(); return; }
+      signal?.addEventListener('abort', cancelled, { once: true });
+      timer = setTimeout(() => finish(reject, new ControlError('TIMEOUT')), remaining);
+      promise.then(value => finish(resolve, value), error => finish(reject, error));
+    });
+  }
   async function start(l, env) {
     const key = digest(l);
     if (child && identityKey !== key) stop('LAYA_CONFIG_CHANGED');
@@ -98,7 +118,7 @@ export function createLayaClient({ spawnImpl = spawn } = {}) {
     const process = spawnImpl(l.python, ['-I', script], { shell: false, stdio: ['pipe', 'pipe', 'pipe'], env: {
       ...allowedEnv, HF_HUB_OFFLINE: '1', TRANSFORMERS_OFFLINE: '1', HF_HUB_DISABLE_TELEMETRY: '1', PYTHONUNBUFFERED: '1', TOKENIZERS_PARALLELISM: 'false',
     } });
-    child = process;
+    child = process; generation++;
     process.stderr.on('data', () => {}); // Drain only. Dependency diagnostics can contain paths/data.
     process.stdin.on('error', () => { if (child === process) stop('LAYA_WORKER_IO'); });
     process.on('error', () => { if (child === process) stop('LAYA_WORKER_START'); });
@@ -114,7 +134,12 @@ export function createLayaClient({ spawnImpl = spawn } = {}) {
         if (msg.ready === true) { clearTimeout(startupTimer); readyIdentity = msg.identity; const resolve = readyResolve; readyResolve = readyReject = null; resolve?.(msg.identity); }
         else if (msg.error && !msg.id) { stop('LAYA_STARTUP_REJECTED'); return; }
         else {
-          const p = pending.get(msg.id); if (!p) { stop('LAYA_PROTOCOL_ERROR'); return; }
+          const p = pending.get(msg.id);
+          if (!p) {
+            const tombstone = tombstones.get(msg.id);
+            if (tombstone) { clearTimeout(tombstone.timer); tombstones.delete(msg.id); armIdle(l); continue; }
+            stop('LAYA_PROTOCOL_ERROR'); return;
+          }
           pending.delete(msg.id); clearTimeout(p.timer);
           if (msg.error) p.reject(new ControlError(/^[A-Z_]{1,64}$/.test(msg.error) ? msg.error : 'LAYA_ERROR'));
           else p.resolve(msg.result);
@@ -130,18 +155,31 @@ export function createLayaClient({ spawnImpl = spawn } = {}) {
     const l = settings.laya;
     if (!l) fail('LAYA_NOT_CONFIGURED');
     if (signal?.aborted) fail('CANCELLED');
-    const cancelled = () => stop('CANCELLED'); signal?.addEventListener('abort', cancelled, { once: true });
-    try {
-      clearTimeout(idle); await start(l, env);
-      if (signal?.aborted) fail('CANCELLED');
-      if (pending.size >= 4) fail('CONCURRENCY_LIMIT');
-      const id = randomUUID();
-      return await new Promise((resolve, reject) => {
-        const timer = setTimeout(() => stop('TIMEOUT'), timeoutMs);
-        pending.set(id, { resolve, reject, timer });
-        child.stdin.write(JSON.stringify({ id, state: request.state, questions: request.questions }) + '\n');
-      });
-    } finally { signal?.removeEventListener('abort', cancelled); }
+    if (!Number.isInteger(timeoutMs) || timeoutMs < 1) fail('INVALID_TIMEOUT');
+    const deadline = Date.now() + timeoutMs;
+    clearTimeout(idle); await awaitUntil(start(l, env), { deadline, signal });
+    if (signal?.aborted) fail('CANCELLED');
+    if (pending.size + tombstones.size >= 4) fail('CONCURRENCY_LIMIT');
+    const id = randomUUID();
+    return new Promise((resolve, reject) => {
+      const retireWith = code => retire(id, p, code, l, timeoutMs);
+      const p = { resolve, reject, timer: setTimeout(() => retireWith('TIMEOUT'), Math.max(1, deadline - Date.now())) };
+      const cancelled = () => retireWith('CANCELLED');
+      const settle = fn => value => { signal?.removeEventListener('abort', cancelled); fn(value); };
+      p.resolve = settle(resolve); p.reject = settle(reject);
+      signal?.addEventListener('abort', cancelled, { once: true });
+      pending.set(id, p);
+      child.stdin.write(JSON.stringify({ id, state: request.state, questions: request.questions }) + '\n');
+    });
   }
-  return Object.freeze({ infer, close: stop, status: () => ({ running: Boolean(child), ready: Boolean(readyIdentity), inFlight: pending.size }) });
+  async function prepare(settings, { timeoutMs, signal, env = process.env, resident: keepResident = true } = {}) {
+    const l = settings.laya;
+    if (!l) fail('LAYA_NOT_CONFIGURED');
+    const limit = timeoutMs ?? l.startupTimeoutMs;
+    if (!Number.isInteger(limit) || limit < 100 || limit > 180000 || typeof keepResident !== 'boolean') fail('INVALID_PREPARE');
+    const result = await awaitUntil(start(l, env), { deadline: Date.now() + limit, signal });
+    resident = keepResident; armIdle(l); return result;
+  }
+  return Object.freeze({ infer, prepare, close: stop,
+    status: () => ({ running: Boolean(child), ready: Boolean(readyIdentity), resident, inFlight: pending.size + tombstones.size, generation }) });
 }

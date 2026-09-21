@@ -40,6 +40,16 @@ export function createDecisionEngine({ home = resolveHome(), env = process.env, 
       localWorker: layaClient.status(), authorizesExecution: false };
   }
   function close() { clearInterval(monitor); monitor = null; layaClient.close(); }
+  function monitorLaya() {
+    if (!monitor) { monitor = setInterval(() => { try { if (loadConfig(home, env).mode === 'off') close(); } catch { close(); } }, 1000); monitor.unref(); }
+  }
+  async function prepare({ signal, timeoutMs, resident = true } = {}) {
+    const config = loadConfig(home, env);
+    if (env.JEV_DISABLE === '1' || config.mode === 'off') fail('OFF');
+    const settings = loadProviderConfig(home);
+    if (settings.provider !== 'laya' || !settings.laya) fail('LAYA_NOT_SELECTED');
+    monitorLaya(); return layaClient.prepare(settings, { signal, timeoutMs, resident, env });
+  }
   async function decide(input, { signal, modeLimit = 'on', onEvaluated, modelOverride, providerOverride, trace: suppliedTrace } = {}) {
     const start = performance.now();
     const result = { version: 1, id: randomUUID(), mode: 'off', apply: false, source: 'host', reason: 'OFF', answers: {},
@@ -79,10 +89,7 @@ export function createDecisionEngine({ home = resolveHome(), env = process.env, 
       calls = calls.filter(t => now() - t < 60000);
       if (calls.length >= config.maxCallsPerMinute) fail('LOCAL_RATE_LIMIT');
       calls.push(now()); inFlight++; reserved = true; result.inferenceCalls = 1; result.networkCalls = selected === 'jev' ? 1 : 0;
-      if (selected === 'laya' && !monitor) {
-        monitor = setInterval(() => { try { if (loadConfig(home, env).mode === 'off') close(); } catch { close(); } }, 1000);
-        monitor.unref();
-      }
+      if (selected === 'laya') monitorLaya();
       const raw = provider ? await provider(payload, key, { timeoutMs: config.timeoutMs, signal }) : selected === 'jev' ?
         await callTypeSafe(payload, key, { timeoutMs: config.timeoutMs, signal }) :
         await layaClient.infer(payload, settings, { timeoutMs: config.timeoutMs, signal, env });
@@ -167,7 +174,7 @@ export function createDecisionEngine({ home = resolveHome(), env = process.env, 
     return { active, comparison_id, observers: [{ provider: observer, decision_id: shadow.id, reason: shadow.reason,
       elapsedMs: shadow.elapsedMs, applied: false }], agreementIsAccuracy: false };
   }
-  return Object.freeze({ decide, status, feedback, close, compare,
+  return Object.freeze({ decide, status, feedback, close, compare, prepare,
     recordOutcome: input => training.outcome(input, { trust: 'host' }),
     recordHost: input => recordHost(training, input) });
 }

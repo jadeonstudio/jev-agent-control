@@ -76,12 +76,22 @@ test('warm worker uses one child, preserves split UTF-8, and receives no inherit
   assert.equal(r.identity.model,'laya/한글');await client.infer(request(),p,{timeoutMs:500,env:{}});assert.equal(starts,1);
   client.close();assert.ok(kills>=1);assert.equal(client.status().running,false);
 });
-test('worker cancellation and timeout settle requests and tear down the child', async t => {
-  const f=fixture(t,false),p=layaConfig(f.home);p.laya.python=process.execPath;fs.writeFileSync(path.join(f.home,'model.safetensors'),'fake');
-  const client=createLayaClient({spawnImpl:()=>{const c=new EventEmitter();c.stdin=new PassThrough();c.stdout=new PassThrough();c.stderr=new PassThrough();c.kill=()=>true;
-    c.stdin.on('data',b=>{if(JSON.parse(b.toString()).init)queueMicrotask(()=>c.stdout.write(JSON.stringify({ready:true,identity:identity(p.laya)})+'\n'));});return c;}});t.after(()=>client.close());
-  await assert.rejects(client.infer(request(),p,{timeoutMs:20,env:{}}),/TIMEOUT/);assert.equal(client.status().running,false);
-  const abort=new AbortController();const pending=client.infer(request(),p,{timeoutMs:500,env:{},signal:abort.signal});abort.abort();await assert.rejects(pending,/CANCELLED/);
+test('deadline includes startup, while a timed out request preserves the warm worker', async t => {
+  const f=fixture(t,false),p=layaConfig(f.home);p.laya.python=process.execPath;fs.writeFileSync(path.join(f.home,'model.safetensors'),'fake');let starts=0,requests=0;
+  const client=createLayaClient({spawnImpl:()=>{starts++;const c=new EventEmitter();c.stdin=new PassThrough();c.stdout=new PassThrough();c.stderr=new PassThrough();c.kill=()=>true;
+    c.stdin.on('data',b=>{const m=JSON.parse(b.toString());if(m.init)setTimeout(()=>c.stdout.write(JSON.stringify({ready:true,identity:identity(p.laya)})+'\n'),30);else{requests++;c.stdout.write(JSON.stringify({id:m.id,result:{...response(),identity:identity(p.laya)}})+'\n');}});return c;}});t.after(()=>client.close());
+  await assert.rejects(client.infer(request(),p,{timeoutMs:10,env:{}}),/TIMEOUT/);await new Promise(r=>setTimeout(r,35));
+  await client.infer(request(),p,{timeoutMs:100,env:{}});assert.equal(starts,1);assert.equal(requests,1);assert.equal(client.status().running,true);
+});
+test('cancelled request tombstones its late response without stopping other requests', async t => {
+  const f=fixture(t,false),p=layaConfig(f.home);p.laya.python=process.execPath;fs.writeFileSync(path.join(f.home,'model.safetensors'),'fake');let child;
+  const client=createLayaClient({spawnImpl:()=>{const c=child=new EventEmitter();c.stdin=new PassThrough();c.stdout=new PassThrough();c.stderr=new PassThrough();c.kill=()=>true;
+    c.stdin.on('data',b=>{const m=JSON.parse(b.toString());if(m.init)queueMicrotask(()=>c.stdout.write(JSON.stringify({ready:true,identity:identity(p.laya)})+'\n'));else if(m.state.name!=='A')queueMicrotask(()=>c.stdout.write(JSON.stringify({id:m.id,result:{...response(),identity:identity(p.laya)}})+'\n'));else setTimeout(()=>c.stdout.write(JSON.stringify({id:m.id,result:{...response(),identity:identity(p.laya)}})+'\n'),30);});return c;}});t.after(()=>client.close());
+  const a={...request(),state:{name:'A'}},b={...request(),state:{name:'B'}},c={...request(),state:{name:'C'}};
+  const timed=client.infer(a,p,{timeoutMs:10,env:{}});await new Promise(r=>setTimeout(r,2));
+  const [br,cr]=await Promise.all([client.infer(b,p,{timeoutMs:100,env:{}}),client.infer(c,p,{timeoutMs:100,env:{}})]);
+  await assert.rejects(timed,/TIMEOUT/);assert.equal(br.identity.model,p.laya.model);assert.equal(cr.identity.model,p.laya.model);await new Promise(r=>setTimeout(r,35));
+  assert.deepEqual(client.status(),{running:true,ready:true,resident:false,inFlight:0,generation:1});child.stdout.write(JSON.stringify({id:'unknown',result:{}})+'\n');assert.equal(client.status().running,false);
 });
 test('MCP exposes one bounded weak-evidence recorder and closes provider runtime', async t => {
   const f=fixture(t);const d=f.save(decision());const input=new PassThrough(),output=new PassThrough();const messages=[];
