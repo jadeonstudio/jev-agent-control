@@ -1,4 +1,4 @@
-export const VERSION = '0.2.0';
+export const VERSION = '0.3.0';
 export const SERVER_NAME = 'jev_agent_control';
 export const API_URL = 'https://api.typesafe.ai/v1/systemone';
 export const PURPOSES = Object.freeze(['route', 'select', 'retry', 'review', 'judge', 'escalate']);

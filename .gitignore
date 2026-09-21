@@ -10,3 +10,8 @@ credentials.env
 coverage/
 .DS_Store
 .jev-local/
+
+# Optional Python runtime test caches
+__pycache__/
+*.pyc
+*.pyo

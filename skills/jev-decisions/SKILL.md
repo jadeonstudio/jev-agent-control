@@ -21,3 +21,7 @@ Never send transcripts, full repositories, customer data, credentials, environme
 SHADOW hides suggestions. Record an independent baseline within five minutes using `jev_feedback` for generic choices or `jev_observe` for routing/filtering. Use only measured usage. Route agreement is NOT alternate-model accuracy. Wrong downgrades and savings require actual paired executions on isolated snapshots, including retries, cache effects and overhead. Korean task quality also needs real evaluation.
 
 No blanket per-tool judging, context deletion, compaction, automatic model switching or hidden fallback provider. Runtime inference uses TypeSafe directly, never classifier.dev.
+
+## Optional evidence capture
+
+If explicitly enabled, attach minimal `trace.task_id`, `snapshot_id`, and optionally `comparison_id` to typed requests. After work, use `jev_record` with kind=outcome and a minimal evidence object matching src/training/schema.mjs; omit unmeasured metrics and raw outputs. MCP records are always weak host_review. A baseline uses kind=host and is not ground truth. Do not turn agreement, build success, or your own confidence into a label for unrelated intent/difficulty/worker questions. Never run a CLI command pretending your judgment is a human correction or trusted runner. Do not read training raw files to influence a blind baseline.

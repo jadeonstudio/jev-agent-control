@@ -30,3 +30,7 @@ Reuse the existing TYPESAFE_API_KEY. If missing, ask the USER to run `key set` i
 `smoke` and examples are offline. `smoke --live` incurs TypeSafe usage and requires explicit authorization. Feature SHADOW also incurs API usage. No classifier.dev account/key is used. In-flight requests cannot be unsent; responses observed after OFF/policy changes are not applied. Installation preserves normal host trust/permissions and does not switch the active host model.
 
 For updates: OFF, review Git changes, fast-forward pull, full tests, reinstall the two existing skills/MCP entries, reconnect hosts. Read docs/CLASSIFIER_DESIGN.md for configuration, limitations and paired evaluation. Never claim savings or native/live success from a synthetic test.
+
+## Provider and opt-in capture controls
+
+When the user explicitly requests these actions, use the same scripts/run.mjs with `provider status|jev|laya`, `training capture status|on|off`, `dataset stats|validate|build`, or `dataset export --version HASH --format laya|canonical`. Never turn capture ON yourself, dump raw samples into chat, run training, or publish datasets. Provider selection requires prepared local configuration; do not download Python/models during a decision. Default capture is OFF.

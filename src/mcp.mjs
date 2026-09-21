@@ -1,12 +1,14 @@
 import { MAX_FRAME_BYTES, VERSION, errorCode, fail, isObject } from './constants.mjs';
+import { traceSchema } from './training/schema.mjs';
 import { decisionSchema } from './contracts.mjs';
 import { createControlLayer, observeSchema } from './control-layer.mjs';
 import { routeSchema } from './routing.mjs';
 import { filterSchema } from './filtering.mjs';
 
+const withTrace = schema => ({ ...schema, properties: { ...schema.properties, trace: traceSchema } });
 const protocolVersions = ['2024-11-05', '2025-03-26', '2025-06-18'];
 export const TOOLS = [
-  { name: 'jev_decide', description: 'One bounded batch of Choice/Noul/Score decisions. OFF never calls TypeSafe; SHADOW hides suggestions; only apply=true permits consuming an advisory result. Never grants execution permission.', inputSchema: decisionSchema,
+  { name: 'jev_decide', description: 'One bounded batch of Choice/Noul/Score decisions. OFF never invokes a provider; SHADOW hides suggestions; only apply=true permits consuming an advisory result. Never grants execution permission.', inputSchema: withTrace(decisionSchema),
     annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: false, openWorldHint: true } },
   { name: 'jev_status', description: 'Read global and per-feature Jev modes and credential readiness without exposing a secret or calling the API.',
     inputSchema: { type: 'object', properties: {}, additionalProperties: false },
@@ -17,12 +19,15 @@ export const TOOLS = [
       baselineUsage: { type: 'object', additionalProperties: false, properties: { inputTokens: { type: ['integer', 'null'], minimum: 0 }, outputTokens: { type: ['integer', 'null'], minimum: 0 } } },
       baselineElapsedMs: { type: 'number', minimum: 0 }, taskSucceeded: { type: 'boolean' },
     } }, annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false } },
-  { name: 'jev_route', description: 'Classify intent, ordered difficulty and risk with one TypeSafe call; local policy selects a configured, available target. Advisory only: cannot switch the host model or authorize execution. Feature OFF by default.', inputSchema: routeSchema,
+  { name: 'jev_route', description: 'Classify intent, ordered difficulty and risk with one selected-provider inference; local policy selects a configured, available target. Advisory only: cannot switch the host model or authorize execution. Feature OFF by default.', inputSchema: withTrace(routeSchema),
     annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: false, openWorldHint: true } },
-  { name: 'jev_filter', description: 'Prefilter bounded snippets before reading them; return IDs, never text. Keep required, uncertain, failed and exhaustive-audit items. Never deletes source or context. Feature OFF by default; use the CLI pipeline for inputs not yet in model context.', inputSchema: filterSchema,
+  { name: 'jev_filter', description: 'Prefilter bounded snippets before reading them; return IDs, never text. Keep required, uncertain, failed and exhaustive-audit items. Never deletes source or context. Feature OFF by default; use the CLI pipeline for inputs not yet in model context.', inputSchema: withTrace(filterSchema),
     annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: false, openWorldHint: true } },
   { name: 'jev_observe', description: 'After an independent baseline, compare a recent SHADOW route tier or independently labeled relevant IDs. Agreement is not task success; never fabricates cheaper-model outcomes. Five-minute, same-process lifetime.', inputSchema: observeSchema,
     annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false } },
+  { name: 'jev_record', description: 'Append a minimal host baseline or outcome only when training capture is explicitly enabled. All MCP outcomes are weak host-review evidence; cannot assert runner/human authority, read datasets, enable capture, train, or promote a model.', inputSchema: {
+    type: 'object', additionalProperties: false, required: ['kind', 'data'], properties: { kind: { type: 'string', enum: ['host', 'outcome'] }, data: { type: 'object' } },
+  }, annotations: { readOnlyHint: false, destructiveHint: false, idempotentHint: false, openWorldHint: false } },
 ];
 
 /** Minimal, version-negotiated MCP stdio tools server; no HTTP listener or sampling. */
@@ -33,7 +38,7 @@ export function startMcp(engine, { input = process.stdin, output = process.stdou
   const write = object => { if (!closed && !output.destroyed) output.write(JSON.stringify(object) + '\n'); };
   const error = (id, code, message) => write({ jsonrpc: '2.0', id, error: { code, message } });
   const result = (id, value) => write({ jsonrpc: '2.0', id, result: value });
-  const close = () => { closed = true; for (const c of pending.values()) c.abort(); pending.clear(); input.pause(); };
+  const close = () => { closed = true; for (const c of pending.values()) c.abort(); pending.clear(); engine.close?.(); input.pause(); };
   async function receive(message) {
     const hasId = isObject(message) && Object.hasOwn(message, 'id');
     const id = hasId ? message.id : null;
@@ -68,8 +73,14 @@ export function startMcp(engine, { input = process.stdin, output = process.stdou
       const args = message.params.arguments ?? {};
       let value;
       if (message.params.name === 'jev_decide') value = await engine.decide(args, { signal: controller.signal });
-      else if (message.params.name === 'jev_route') value = await layer.route(args, { signal: controller.signal });
-      else if (message.params.name === 'jev_filter') value = await layer.filter(args, { signal: controller.signal });
+      else if (message.params.name === 'jev_route') { if (!isObject(args)) fail('INVALID_REQUEST'); const { trace, ...request } = args; value = await layer.route(request, { signal: controller.signal, trace }); }
+      else if (message.params.name === 'jev_filter') { if (!isObject(args)) fail('INVALID_REQUEST'); const { trace, ...request } = args; value = await layer.filter(request, { signal: controller.signal, trace }); }
+      else if (message.params.name === 'jev_record') {
+        if (!isObject(args) || Object.keys(args).some(k => !['kind', 'data'].includes(k)) || !isObject(args.data)) fail('INVALID_REQUEST');
+        if (args.kind === 'host') value = engine.recordHost(args.data);
+        else if (args.kind === 'outcome') value = engine.recordOutcome(args.data);
+        else fail('INVALID_REQUEST');
+      }
       else if (message.params.name === 'jev_observe') value = layer.observe(args);
       else if (message.params.name === 'jev_status') {
         if (!isObject(args) || Object.keys(args).length) fail('INVALID_REQUEST');

@@ -63,6 +63,7 @@ export async function main(argv = process.argv.slice(2), env = process.env) {
   if (positionals.length > (command === 'key' ? 2 : 1)) fail('UNEXPECTED_ARGUMENTS');
   const home = resolveHome({ ...env, ...(values.home ? { JEV_HOME: values.home } : {}) });
   const engine = createDecisionEngine({ home, env });
+  try {
   if (values.help || command === 'help') {
     process.stdout.write(`jev-control ${VERSION}\n\nCommands:\n  install|uninstall [--target both|codex|claude] [--scope user|project] [--project PATH] [--dry-run]\n  off|shadow|on       Shared switch, reread on every decision\n  status|doctor      Offline diagnostics; never prints a key\n  key set|remove     Run set yourself in an interactive terminal\n  smoke [--live]     Offline by default; live needs a key and active mode\n  decide             Read one JSON request from stdin\n  metrics [--days 7] Local metadata, not inferred savings\n  mcp                Local stdio server\n\nGlobal: --home ABSOLUTE_PATH. No command accepts a key as an argument.\n`); return;
   }
@@ -73,7 +74,7 @@ export async function main(argv = process.argv.slice(2), env = process.env) {
     output(applyInstallation(plan, { dryRun: values['dry-run'] })); return;
   }
   if (['off', 'shadow', 'on'].includes(command)) {
-    if (command !== 'off' && !getCredential(home, env).key) fail('NO_API_KEY');
+    if (command !== 'off' && !engine.status().ready) fail(engine.status().provider === 'laya' ? 'LAYA_NOT_READY' : 'NO_API_KEY');
     setMode(home, command, env); output(engine.status()); return;
   }
   if (command === 'status') { output(engine.status()); return; }
@@ -104,9 +105,9 @@ export async function main(argv = process.argv.slice(2), env = process.env) {
   if (command === 'smoke') {
     if (values.live) {
       if (loadConfig(home, env).mode === 'off') fail('ENABLE_SHADOW_BEFORE_LIVE_SMOKE');
-      if (!getCredential(home, env).key) fail('NO_API_KEY');
+      if (!engine.status().ready) fail(engine.status().provider === 'laya' ? 'LAYA_NOT_READY' : 'NO_API_KEY');
       const result = await engine.decide(SMOKE_REQUEST);
-      const ok = ['ACCEPTED', 'LOW_CONFIDENCE', 'SHADOW'].includes(result.reason);
+      const ok = ['ACCEPTED', 'LOW_CONFIDENCE', 'UNQUALIFIED_PROVIDER', 'SHADOW'].includes(result.reason);
       const comparison = ok ? engine.feedback({ id: result.id, baseline: { category: 'documentation', passed: true, complexity: 0.02 } }) : null;
       output({ ok, live: true, result, comparison }); if (!ok) process.exitCode = 2;
     } else {
@@ -121,4 +122,5 @@ export async function main(argv = process.argv.slice(2), env = process.env) {
     return;
   }
   fail('UNKNOWN_COMMAND');
+  } finally { if (command !== 'mcp') engine.close(); }
 }

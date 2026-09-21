@@ -1,93 +1,126 @@
 import { createHash, randomUUID } from 'node:crypto';
 import { performance } from 'node:perf_hooks';
-import { DEFAULTS, VERSION, PURPOSES, MODES, ControlError, errorCode, fail, isObject } from './constants.mjs';
+import { DEFAULTS, VERSION, MODES, ControlError, errorCode, fail, isObject } from './constants.mjs';
 import { resolveHome, loadConfig, getCredential, appendEvent } from './storage.mjs';
-import { validateRequest, containsSensitiveData, wireRequest, normalizeResponse } from './contracts.mjs';
+import { validateRequest, containsSensitiveData, wireRequest } from './contracts.mjs';
 import { callTypeSafe } from './provider.mjs';
+import { loadProviderConfig, layaReady, createLayaClient, normalizeInference } from './inference.mjs';
+import { createTrainingStore } from './training/store.mjs';
+import { recordHost } from './training/host.mjs';
+import { CAPTURE_VERSION, digest, validateTrace } from './training/schema.mjs';
 
-/** Shared implementation for MCP, CLI and owned orchestration loops. */
-export function createDecisionEngine({ home = resolveHome(), env = process.env, provider = callTypeSafe, now = Date.now } = {}) {
-  let inFlight = 0, failures = 0, circuitUntil = 0;
-  let calls = [];
-  const pendingFeedback = new Map();
+/** Shared control; the selected inference adapter does not own permissions or training labels. */
+export function createDecisionEngine({ home = resolveHome(), env = process.env, provider, now = Date.now,
+  layaClient = createLayaClient(), training = createTrainingStore({ home }) } = {}) {
+  let inFlight = 0, calls = [], monitor;
+  const circuits = new Map(), pendingFeedback = new Map();
+  const revision = (config, settings) => createHash('sha256').update(JSON.stringify({ config, settings })).digest('hex');
   function remember(id, normalized) {
     for (const [key, value] of pendingFeedback) if (now() - value.at > 300000) pendingFeedback.delete(key);
     while (pendingFeedback.size >= 128) pendingFeedback.delete(pendingFeedback.keys().next().value);
     pendingFeedback.set(id, { at: now(), answers: normalized.answers });
   }
   function status() {
-    let config, credential = 'missing', configError = null;
-    try { config = loadConfig(home, env); } catch (e) { config = { ...DEFAULTS }; configError = errorCode(e); }
-    try { credential = getCredential(home, env).source; } catch { credential = 'invalid'; }
-    return { version: VERSION, mode: config.mode, killSwitch: env.JEV_DISABLE === '1', credential,
-      ready: !configError && !['missing', 'invalid'].includes(credential), configError,
-      model: config.model, home, telemetry: config.telemetry, inFlight, circuitOpen: now() < circuitUntil,
+    let config, credential = 'missing', configError = null, settings = { version: 1, provider: 'jev', laya: null };
+    try { config = loadConfig(home, env); settings = loadProviderConfig(home); }
+    catch (e) { config ??= { ...DEFAULTS }; configError = errorCode(e); }
+    let ready = false;
+    if (settings.provider === 'jev') {
+      try { credential = getCredential(home, env).source; } catch { credential = 'invalid'; }
+      ready = !['missing', 'invalid'].includes(credential);
+    } else { credential = 'not-required'; ready = layaReady(settings.laya); }
+    const circuit = circuits.get(settings.provider);
+    return { version: VERSION, mode: config.mode, killSwitch: env.JEV_DISABLE === '1', credential, ready: !configError && ready,
+      configError, provider: settings.provider, model: settings.provider === 'jev' ? config.model : settings.laya?.model,
+      checkpoint: settings.provider === 'laya' ? settings.laya?.checkpoint : null,
+      home, telemetry: config.telemetry, inFlight, circuitOpen: now() < (circuit?.until ?? 0),
       limits: { timeoutMs: config.timeoutMs, maxCallsPerMinute: config.maxCallsPerMinute, maxInFlight: config.maxInFlight, scope: 'per-process' },
       requestLimits: { maxInputBytes: config.maxInputBytes, maxQuestions: config.maxQuestions },
-      policyRevision: createHash('sha256').update(JSON.stringify(config)).digest('hex'),
-      authorizesExecution: false };
+      policyRevision: revision(config, settings), trainingCapture: training.status().trainingCapture,
+      localWorker: layaClient.status(), authorizesExecution: false };
   }
-  async function decide(input, { signal, modeLimit = 'on', onEvaluated, modelOverride } = {}) {
+  function close() { clearInterval(monitor); monitor = null; layaClient.close(); }
+  async function decide(input, { signal, modeLimit = 'on', onEvaluated, modelOverride, providerOverride, trace: suppliedTrace } = {}) {
     const start = performance.now();
     const result = { version: 1, id: randomUUID(), mode: 'off', apply: false, source: 'host', reason: 'OFF', answers: {},
-      usage: { inputTokens: null, outputTokens: null }, networkCalls: 0, elapsedMs: 0, authorizesExecution: false };
-    let config, request, inputBytes = 0, eligible = false, reserved = false;
+      usage: { inputTokens: null, outputTokens: null }, networkCalls: 0, inferenceCalls: 0, elapsedMs: 0, authorizesExecution: false };
+    const captureTicket = training.ticket();
+    let config, settings, request, normalized, trace = {}, key = '', inputBytes = 0, eligible = false, reserved = false, circuit;
     try {
       config = loadConfig(home, env);
       if (!MODES.includes(modeLimit)) fail('INVALID_MODE_LIMIT');
-      result.mode = config.mode === 'off' || modeLimit === 'off' ? 'off' :
-        (config.mode === 'shadow' || modeLimit === 'shadow' ? 'shadow' : 'on');
-      if (result.mode === 'off') return result;
+      result.mode = config.mode === 'off' || modeLimit === 'off' ? 'off' : (config.mode === 'shadow' || modeLimit === 'shadow' ? 'shadow' : 'on');
+      if (result.mode === 'off') { close(); return result; }
       if (signal?.aborted) fail('CANCELLED');
-      request = validateRequest(input, config);
+      settings = loadProviderConfig(home);
+      const selected = providerOverride ?? settings.provider;
+      if (!['jev', 'laya'].includes(selected)) fail('INVALID_PROVIDER_CONFIG');
+      result.provider = selected;
+      trace = validateTrace(suppliedTrace ?? (isObject(input) ? input.trace : undefined) ?? {});
+      const rawInput = isObject(input) ? Object.fromEntries(Object.entries(input).filter(([name]) => name !== 'trace')) : input;
+      request = validateRequest(rawInput, config);
       if (request.risk === 'sensitive') fail('SENSITIVE_SCOPE');
-      if (env.NODE_TLS_REJECT_UNAUTHORIZED === '0') fail('INSECURE_TLS_REFUSED');
-      const { key } = getCredential(home, env);
-      if (!key) fail('NO_API_KEY');
+      if (selected === 'jev') {
+        if (env.NODE_TLS_REJECT_UNAUTHORIZED === '0') fail('INSECURE_TLS_REFUSED');
+        key = getCredential(home, env).key; if (!key) fail('NO_API_KEY');
+        if (modelOverride !== undefined && (typeof modelOverride !== 'string' || !/^jev-\d+\.\d+\.\d+$/.test(modelOverride))) fail('INVALID_MODEL_OVERRIDE');
+      } else {
+        if (!settings.laya) fail('LAYA_NOT_CONFIGURED');
+        if (modelOverride !== undefined && modelOverride !== settings.laya.model) fail('PROVIDER_MODEL_OVERRIDE_REFUSED');
+      }
       if (containsSensitiveData(request, key)) fail('SENSITIVE_INPUT');
-      if (modelOverride !== undefined && (typeof modelOverride !== 'string' || !/^jev-\d+\.\d+\.\d+$/.test(modelOverride))) fail('INVALID_MODEL_OVERRIDE');
-      const payload = wireRequest(request, modelOverride ?? config.model);
+      const payload = wireRequest(request, selected === 'jev' ? modelOverride ?? config.model : settings.laya.model);
       inputBytes = Buffer.byteLength(JSON.stringify(payload));
       if (inputBytes > config.maxInputBytes) fail('INPUT_TOO_LARGE');
-      if (now() < circuitUntil) fail('CIRCUIT_OPEN');
+      if (!circuits.has(selected)) circuits.set(selected, { failures: 0, until: 0 });
+      circuit = circuits.get(selected);
+      if (now() < circuit.until) fail('CIRCUIT_OPEN');
       if (inFlight >= config.maxInFlight) fail('CONCURRENCY_LIMIT');
       calls = calls.filter(t => now() - t < 60000);
       if (calls.length >= config.maxCallsPerMinute) fail('LOCAL_RATE_LIMIT');
-      calls.push(now()); inFlight++; reserved = true; result.networkCalls = 1;
-      const raw = await provider(payload, key, { timeoutMs: config.timeoutMs, signal });
-      const normalized = normalizeResponse(raw, request, config);
-      failures = 0; circuitUntil = 0;
-      eligible = normalized.eligible;
-      result.usage = normalized.usage;
-      result.model = normalized.model;
-      if (modelOverride && normalized.model !== modelOverride) fail('MODEL_VERSION_MISMATCH');
-      // Read the shared switch again; a decision sent before OFF may not be applied afterwards.
-      const current = loadConfig(home, env);
+      calls.push(now()); inFlight++; reserved = true; result.inferenceCalls = 1; result.networkCalls = selected === 'jev' ? 1 : 0;
+      if (selected === 'laya' && !monitor) {
+        monitor = setInterval(() => { try { if (loadConfig(home, env).mode === 'off') close(); } catch { close(); } }, 1000);
+        monitor.unref();
+      }
+      const raw = provider ? await provider(payload, key, { timeoutMs: config.timeoutMs, signal }) : selected === 'jev' ?
+        await callTypeSafe(payload, key, { timeoutMs: config.timeoutMs, signal }) :
+        await layaClient.infer(payload, settings, { timeoutMs: config.timeoutMs, signal, env });
+      const n = normalizeInference(selected, raw, request, config, settings);
+      circuit.failures = 0; circuit.until = 0;
+      eligible = n.eligible; result.usage = n.usage; result.model = n.model; result.provenance = n.provenance;
+      if (selected === 'jev' && modelOverride && n.model !== modelOverride) fail('MODEL_VERSION_MISMATCH');
+      const current = loadConfig(home, env), currentSettings = loadProviderConfig(home);
       if (signal?.aborted) fail('CANCELLED');
       if (current.mode !== config.mode) fail('MODE_CHANGED');
       if (JSON.stringify(current) !== JSON.stringify(config)) fail('POLICY_CHANGED');
-      remember(result.id, normalized);
-      // Trusted in-process observer only; never part of the MCP request schema.
-      onEvaluated?.(structuredClone(normalized));
-      if (result.mode === 'shadow') { result.reason = 'SHADOW'; }
-      else if (!eligible) { result.reason = 'LOW_CONFIDENCE'; }
-      else { result.apply = true; result.source = 'jev'; result.reason = 'ACCEPTED'; result.answers = normalized.answers; }
+      if (JSON.stringify(currentSettings) !== JSON.stringify(settings)) fail('PROVIDER_CHANGED');
+      remember(result.id, n); normalized = n;
+      onEvaluated?.(structuredClone(n));
+      if (result.mode === 'shadow') result.reason = 'SHADOW';
+      else if (!eligible) result.reason = n.qualified === false ? 'UNQUALIFIED_PROVIDER' : 'LOW_CONFIDENCE';
+      else { result.apply = true; result.source = selected; result.reason = 'ACCEPTED'; result.answers = n.answers; }
     } catch (e) {
       result.reason = errorCode(e);
-      if (reserved && !['CANCELLED', 'MODE_CHANGED', 'POLICY_CHANGED'].includes(result.reason)) {
-        if (++failures >= config.circuitFailureThreshold) circuitUntil = now() + config.circuitCooldownMs;
+      if (reserved && circuit && !['CANCELLED', 'MODE_CHANGED', 'POLICY_CHANGED', 'PROVIDER_CHANGED'].includes(result.reason)) {
+        if (++circuit.failures >= config.circuitFailureThreshold) circuit.until = now() + config.circuitCooldownMs;
       }
     } finally {
       if (reserved) inFlight--;
       result.elapsedMs = Math.round((performance.now() - start) * 1000) / 1000;
+      if (normalized && ['ACCEPTED', 'LOW_CONFIDENCE', 'UNQUALIFIED_PROVIDER', 'SHADOW'].includes(result.reason)) {
+        const captured = training.decision({ decision_id: result.id, trace, arm: result.mode === 'shadow' ? 'shadow' : 'active',
+          request, request_hash: digest(request), provenance: normalized.provenance, answers: normalized.answers,
+          mode: result.mode, apply: result.apply, latency_ms: result.elapsedMs, usage: result.usage,
+          inference_calls: result.inferenceCalls, network_calls: result.networkCalls, capture_policy_version: CAPTURE_VERSION }, { secret: key, expectedTicket: captureTicket });
+        result.trainingCapture = { stored: captured.stored, reason: captured.reason ?? null };
+      }
       if (config?.telemetry && result.mode !== 'off') {
-        result.telemetryStored = appendEvent(home, {
-          kind: 'decision', at: new Date().toISOString(), id: result.id, mode: result.mode,
-          model: result.model ?? null,
-          purpose: request?.purpose ?? 'unknown', reason: result.reason, apply: result.apply, eligible,
-          inputBytes, questionCount: request ? Object.keys(request.questions).length : 0,
-          networkCalls: result.networkCalls, elapsedMs: result.elapsedMs, usage: result.usage,
-        });
+        result.telemetryStored = appendEvent(home, { kind: 'decision', at: new Date().toISOString(), id: result.id, mode: result.mode,
+          captureStored: result.trainingCapture?.stored ?? null, captureReason: result.trainingCapture?.reason ?? null,
+          provider: result.provider ?? null, model: result.model ?? null, purpose: request?.purpose ?? 'unknown',
+          reason: result.reason, apply: result.apply, eligible, inputBytes, questionCount: request ? Object.keys(request.questions).length : 0,
+          networkCalls: result.networkCalls, inferenceCalls: result.inferenceCalls, elapsedMs: result.elapsedMs, usage: result.usage });
       }
     }
     return result;
@@ -103,16 +136,12 @@ export function createDecisionEngine({ home = resolveHome(), env = process.env, 
     for (const name of names) {
       const expected = saved.answers[name].value, actual = input.baseline[name];
       if (typeof actual !== typeof expected || (typeof actual === 'number' && !Number.isFinite(actual))) fail('INVALID_FEEDBACK');
-      if (typeof expected === 'number' ? Math.abs(expected - actual) <= 0.05 : expected === actual) matched++;
+      if (typeof expected === 'number' ? Math.abs(expected - actual) <= .05 : expected === actual) matched++;
     }
     const usage = { inputTokens: null, outputTokens: null };
     if (input.baselineUsage !== undefined) {
       if (!isObject(input.baselineUsage) || Object.keys(input.baselineUsage).some(k => !Object.hasOwn(usage, k))) fail('INVALID_FEEDBACK');
-      for (const k of Object.keys(usage)) {
-        const v = input.baselineUsage[k];
-        if (v !== undefined && v !== null && (!Number.isSafeInteger(v) || v < 0)) fail('INVALID_FEEDBACK');
-        usage[k] = v ?? null;
-      }
+      for (const k of Object.keys(usage)) { const v = input.baselineUsage[k]; if (v != null && (!Number.isSafeInteger(v) || v < 0)) fail('INVALID_FEEDBACK'); usage[k] = v ?? null; }
     }
     if (input.baselineElapsedMs !== undefined && (!Number.isFinite(input.baselineElapsedMs) || input.baselineElapsedMs < 0 || input.baselineElapsedMs > 86400000)) fail('INVALID_FEEDBACK');
     if (input.taskSucceeded !== undefined && typeof input.taskSucceeded !== 'boolean') fail('INVALID_FEEDBACK');
@@ -120,13 +149,28 @@ export function createDecisionEngine({ home = resolveHome(), env = process.env, 
     const event = { kind: 'feedback', at: new Date().toISOString(), id: input.id, matched, total: names.length, baselineUsage: usage,
       baselineElapsedMs: input.baselineElapsedMs ?? null, taskSucceeded: input.taskSucceeded ?? null };
     const telemetryStored = config.telemetry && config.mode !== 'off' ? appendEvent(home, event) : false;
-    pendingFeedback.delete(input.id);
-    return { matched, total: names.length, agreementOnly: true, telemetryStored };
+    pendingFeedback.delete(input.id); return { matched, total: names.length, agreementOnly: true, telemetryStored };
   }
-  return Object.freeze({ decide, status, feedback });
+  async function compare(input, { remoteConsent = false, signal } = {}) {
+    const initial = status();
+    if (initial.mode === 'off') return { active: await decide(input, { signal }), observers: [], agreementIsAccuracy: false };
+    if (!remoteConsent) fail('EXPLICIT_REMOTE_COMPARISON_CONSENT_REQUIRED');
+    const comparison_id = randomUUID();
+    const trace = { ...validateTrace(input?.trace ?? {}), comparison_id };
+    const snapshot = structuredClone(input);
+    const active = await decide(snapshot, { signal, trace });
+    const observer = initial.provider === 'jev' ? 'laya' : 'jev';
+    const shadow = await decide(snapshot, { signal, trace, modeLimit: 'shadow', providerOverride: observer });
+    if (status().policyRevision !== initial.policyRevision || signal?.aborted) {
+      active.apply = false; active.source = 'host'; active.answers = {}; active.reason = 'COMPARISON_CONTEXT_CHANGED';
+    }
+    return { active, comparison_id, observers: [{ provider: observer, decision_id: shadow.id, reason: shadow.reason,
+      elapsedMs: shadow.elapsedMs, applied: false }], agreementIsAccuracy: false };
+  }
+  return Object.freeze({ decide, status, feedback, close, compare,
+    recordOutcome: input => training.outcome(input, { trust: 'host' }),
+    recordHost: input => recordHost(training, input) });
 }
-
-/** This replaces a host-model decision call; merely adding an MCP tool does not. */
 export async function decideOrDelegate(engine, request, { use, delegate, signal } = {}) {
   if (typeof use !== 'function' || typeof delegate !== 'function') throw new ControlError('HANDLERS_REQUIRED');
   const decision = await engine.decide(request, { signal });
