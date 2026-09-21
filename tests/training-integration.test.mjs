@@ -83,6 +83,12 @@ test('deadline includes startup, while a timed out request preserves the warm wo
   await assert.rejects(client.infer(request(),p,{timeoutMs:10,env:{}}),/TIMEOUT/);await new Promise(r=>setTimeout(r,35));
   await client.infer(request(),p,{timeoutMs:100,env:{}});assert.equal(starts,1);assert.equal(requests,1);assert.equal(client.status().running,true);
 });
+test('pre-aborted preparation never spawns, and an expired startup handles its later failure', async t => {
+  const f=fixture(t,false),p=layaConfig(f.home);p.laya.python=process.execPath;fs.writeFileSync(path.join(f.home,'model.safetensors'),'fake');let starts=0;
+  const client=createLayaClient({spawnImpl:()=>{starts++;const c=new EventEmitter();c.stdin=new PassThrough();c.stdout=new PassThrough();c.stderr=new PassThrough();c.kill=()=>true;setTimeout(()=>c.emit('error',new Error('late startup failure')),20);return c;}});t.after(()=>client.close());
+  const abort=new AbortController();abort.abort();await assert.rejects(client.prepare(p,{signal:abort.signal,env:{}}),/CANCELLED/);assert.equal(starts,0);
+  await assert.rejects(client.infer(request(),p,{timeoutMs:1,env:{}}),/TIMEOUT/);await new Promise(r=>setTimeout(r,25));
+});
 test('cancelled request tombstones its late response without stopping other requests', async t => {
   const f=fixture(t,false),p=layaConfig(f.home);p.laya.python=process.execPath;fs.writeFileSync(path.join(f.home,'model.safetensors'),'fake');let child;
   const client=createLayaClient({spawnImpl:()=>{const c=child=new EventEmitter();c.stdin=new PassThrough();c.stdout=new PassThrough();c.stderr=new PassThrough();c.kill=()=>true;
@@ -92,6 +98,13 @@ test('cancelled request tombstones its late response without stopping other requ
   const [br,cr]=await Promise.all([client.infer(b,p,{timeoutMs:100,env:{}}),client.infer(c,p,{timeoutMs:100,env:{}})]);
   await assert.rejects(timed,/TIMEOUT/);assert.equal(br.identity.model,p.laya.model);assert.equal(cr.identity.model,p.laya.model);await new Promise(r=>setTimeout(r,35));
   assert.deepEqual(client.status(),{running:true,ready:true,resident:false,inFlight:0,generation:1});child.stdout.write(JSON.stringify({id:'unknown',result:{}})+'\n');assert.equal(client.status().running,false);
+});
+test('a short timed-out request does not consume a longer pending request liveness budget', async t => {
+  const f=fixture(t,false),p=layaConfig(f.home);p.laya.python=process.execPath;fs.writeFileSync(path.join(f.home,'model.safetensors'),'fake');
+  const client=createLayaClient({spawnImpl:()=>{const c=new EventEmitter();c.stdin=new PassThrough();c.stdout=new PassThrough();c.stderr=new PassThrough();c.kill=()=>true;
+    c.stdin.on('data',b=>{const m=JSON.parse(b.toString());if(m.init)queueMicrotask(()=>c.stdout.write(JSON.stringify({ready:true,identity:identity(p.laya)})+'\n'));else if(m.state.name==='B')setTimeout(()=>c.stdout.write(JSON.stringify({id:m.id,result:{...response(),identity:identity(p.laya)}})+'\n'),1050);});return c;}});t.after(()=>client.close());
+  const a=client.infer({...request(),state:{name:'A'}},p,{timeoutMs:20,env:{}});await new Promise(r=>setTimeout(r,2));
+  const b=client.infer({...request(),state:{name:'B'}},p,{timeoutMs:1500,env:{}});await assert.rejects(a,/TIMEOUT/);assert.equal((await b).identity.model,p.laya.model);
 });
 test('MCP exposes one bounded weak-evidence recorder and closes provider runtime', async t => {
   const f=fixture(t);const d=f.save(decision());const input=new PassThrough(),output=new PassThrough();const messages=[];

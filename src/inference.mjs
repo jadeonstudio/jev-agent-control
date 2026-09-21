@@ -88,20 +88,25 @@ export function createLayaClient({ spawnImpl = spawn } = {}) {
   function armIdle(l) { clearTimeout(idle); if (!resident && !pending.size && !tombstones.size) { idle = setTimeout(() => stop(), l.idleTimeoutMs); idle.unref(); } }
   function retire(id, p, code, l, livenessMs) {
     pending.delete(id); clearTimeout(p.timer); p.reject(new ControlError(code));
-    const timer = setTimeout(() => stop('LAYA_LIVENESS_TIMEOUT'), Math.max(1000, livenessMs));
+    const expire = () => {
+      const tombstone = tombstones.get(id); if (!tombstone) return;
+      if (pending.size) { tombstone.timer = setTimeout(expire, 100); tombstone.timer.unref(); return; }
+      stop('LAYA_LIVENESS_TIMEOUT');
+    };
+    const timer = setTimeout(expire, Math.max(1000, livenessMs));
     timer.unref(); tombstones.set(id, { timer }); armIdle(l);
   }
   function awaitUntil(promise, { deadline, signal }) {
     return new Promise((resolve, reject) => {
-      const remaining = deadline - Date.now();
-      if (remaining <= 0) { reject(new ControlError('TIMEOUT')); return; }
       let timer, done = false;
       const finish = (fn, value) => { if (done) return; done = true; clearTimeout(timer); signal?.removeEventListener('abort', cancelled); fn(value); };
       const cancelled = () => finish(reject, new ControlError('CANCELLED'));
+      promise.then(value => finish(resolve, value), error => finish(reject, error));
+      const remaining = deadline - Date.now();
+      if (remaining <= 0) { finish(reject, new ControlError('TIMEOUT')); return; }
       if (signal?.aborted) { cancelled(); return; }
       signal?.addEventListener('abort', cancelled, { once: true });
       timer = setTimeout(() => finish(reject, new ControlError('TIMEOUT')), remaining);
-      promise.then(value => finish(resolve, value), error => finish(reject, error));
     });
   }
   async function start(l, env) {
@@ -131,7 +136,7 @@ export function createLayaClient({ spawnImpl = spawn } = {}) {
       while ((end = buffer.indexOf('\n')) >= 0) {
         const line = buffer.slice(0, end); buffer = buffer.slice(end + 1);
         let msg; try { msg = JSON.parse(line); } catch { stop('LAYA_PROTOCOL_ERROR'); return; }
-        if (msg.ready === true) { clearTimeout(startupTimer); readyIdentity = msg.identity; const resolve = readyResolve; readyResolve = readyReject = null; resolve?.(msg.identity); }
+        if (msg.ready === true) { clearTimeout(startupTimer); readyIdentity = msg.identity; const resolve = readyResolve; readyResolve = readyReject = null; resolve?.(msg.identity); armIdle(l); }
         else if (msg.error && !msg.id) { stop('LAYA_STARTUP_REJECTED'); return; }
         else {
           const p = pending.get(msg.id);
@@ -157,7 +162,7 @@ export function createLayaClient({ spawnImpl = spawn } = {}) {
     if (signal?.aborted) fail('CANCELLED');
     if (!Number.isInteger(timeoutMs) || timeoutMs < 1) fail('INVALID_TIMEOUT');
     const deadline = Date.now() + timeoutMs;
-    clearTimeout(idle); await awaitUntil(start(l, env), { deadline, signal });
+    clearTimeout(idle); await awaitUntil(start(l, env), { deadline, signal }); clearTimeout(idle);
     if (signal?.aborted) fail('CANCELLED');
     if (pending.size + tombstones.size >= 4) fail('CONCURRENCY_LIMIT');
     const id = randomUUID();
@@ -175,6 +180,7 @@ export function createLayaClient({ spawnImpl = spawn } = {}) {
   async function prepare(settings, { timeoutMs, signal, env = process.env, resident: keepResident = true } = {}) {
     const l = settings.laya;
     if (!l) fail('LAYA_NOT_CONFIGURED');
+    if (signal?.aborted) fail('CANCELLED');
     const limit = timeoutMs ?? l.startupTimeoutMs;
     if (!Number.isInteger(limit) || limit < 100 || limit > 180000 || typeof keepResident !== 'boolean') fail('INVALID_PREPARE');
     const result = await awaitUntil(start(l, env), { deadline: Date.now() + limit, signal });
