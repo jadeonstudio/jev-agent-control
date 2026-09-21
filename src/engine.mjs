@@ -1,6 +1,6 @@
-import { randomUUID } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 import { performance } from 'node:perf_hooks';
-import { DEFAULTS, VERSION, PURPOSES, ControlError, errorCode, fail, isObject } from './constants.mjs';
+import { DEFAULTS, VERSION, PURPOSES, MODES, ControlError, errorCode, fail, isObject } from './constants.mjs';
 import { resolveHome, loadConfig, getCredential, appendEvent } from './storage.mjs';
 import { validateRequest, containsSensitiveData, wireRequest, normalizeResponse } from './contracts.mjs';
 import { callTypeSafe } from './provider.mjs';
@@ -23,16 +23,21 @@ export function createDecisionEngine({ home = resolveHome(), env = process.env, 
       ready: !configError && !['missing', 'invalid'].includes(credential), configError,
       model: config.model, home, telemetry: config.telemetry, inFlight, circuitOpen: now() < circuitUntil,
       limits: { timeoutMs: config.timeoutMs, maxCallsPerMinute: config.maxCallsPerMinute, maxInFlight: config.maxInFlight, scope: 'per-process' },
+      requestLimits: { maxInputBytes: config.maxInputBytes, maxQuestions: config.maxQuestions },
+      policyRevision: createHash('sha256').update(JSON.stringify(config)).digest('hex'),
       authorizesExecution: false };
   }
-  async function decide(input, { signal } = {}) {
+  async function decide(input, { signal, modeLimit = 'on', onEvaluated, modelOverride } = {}) {
     const start = performance.now();
     const result = { version: 1, id: randomUUID(), mode: 'off', apply: false, source: 'host', reason: 'OFF', answers: {},
       usage: { inputTokens: null, outputTokens: null }, networkCalls: 0, elapsedMs: 0, authorizesExecution: false };
     let config, request, inputBytes = 0, eligible = false, reserved = false;
     try {
-      config = loadConfig(home, env); result.mode = config.mode;
-      if (config.mode === 'off') return result;
+      config = loadConfig(home, env);
+      if (!MODES.includes(modeLimit)) fail('INVALID_MODE_LIMIT');
+      result.mode = config.mode === 'off' || modeLimit === 'off' ? 'off' :
+        (config.mode === 'shadow' || modeLimit === 'shadow' ? 'shadow' : 'on');
+      if (result.mode === 'off') return result;
       if (signal?.aborted) fail('CANCELLED');
       request = validateRequest(input, config);
       if (request.risk === 'sensitive') fail('SENSITIVE_SCOPE');
@@ -40,7 +45,8 @@ export function createDecisionEngine({ home = resolveHome(), env = process.env, 
       const { key } = getCredential(home, env);
       if (!key) fail('NO_API_KEY');
       if (containsSensitiveData(request, key)) fail('SENSITIVE_INPUT');
-      const payload = wireRequest(request, config.model);
+      if (modelOverride !== undefined && (typeof modelOverride !== 'string' || !/^jev-\d+\.\d+\.\d+$/.test(modelOverride))) fail('INVALID_MODEL_OVERRIDE');
+      const payload = wireRequest(request, modelOverride ?? config.model);
       inputBytes = Buffer.byteLength(JSON.stringify(payload));
       if (inputBytes > config.maxInputBytes) fail('INPUT_TOO_LARGE');
       if (now() < circuitUntil) fail('CIRCUIT_OPEN');
@@ -53,13 +59,17 @@ export function createDecisionEngine({ home = resolveHome(), env = process.env, 
       failures = 0; circuitUntil = 0;
       eligible = normalized.eligible;
       result.usage = normalized.usage;
+      result.model = normalized.model;
+      if (modelOverride && normalized.model !== modelOverride) fail('MODEL_VERSION_MISMATCH');
       // Read the shared switch again; a decision sent before OFF may not be applied afterwards.
       const current = loadConfig(home, env);
       if (signal?.aborted) fail('CANCELLED');
       if (current.mode !== config.mode) fail('MODE_CHANGED');
       if (JSON.stringify(current) !== JSON.stringify(config)) fail('POLICY_CHANGED');
       remember(result.id, normalized);
-      if (config.mode === 'shadow') { result.reason = 'SHADOW'; }
+      // Trusted in-process observer only; never part of the MCP request schema.
+      onEvaluated?.(structuredClone(normalized));
+      if (result.mode === 'shadow') { result.reason = 'SHADOW'; }
       else if (!eligible) { result.reason = 'LOW_CONFIDENCE'; }
       else { result.apply = true; result.source = 'jev'; result.reason = 'ACCEPTED'; result.answers = normalized.answers; }
     } catch (e) {
@@ -70,9 +80,10 @@ export function createDecisionEngine({ home = resolveHome(), env = process.env, 
     } finally {
       if (reserved) inFlight--;
       result.elapsedMs = Math.round((performance.now() - start) * 1000) / 1000;
-      if (config?.telemetry && config.mode !== 'off') {
+      if (config?.telemetry && result.mode !== 'off') {
         result.telemetryStored = appendEvent(home, {
           kind: 'decision', at: new Date().toISOString(), id: result.id, mode: result.mode,
+          model: result.model ?? null,
           purpose: request?.purpose ?? 'unknown', reason: result.reason, apply: result.apply, eligible,
           inputBytes, questionCount: request ? Object.keys(request.questions).length : 0,
           networkCalls: result.networkCalls, elapsedMs: result.elapsedMs, usage: result.usage,

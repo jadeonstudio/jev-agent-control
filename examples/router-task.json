@@ -1,0 +1,15 @@
+{
+  "task": "README의 지정된 제목 오타만 수정한다. 실행 코드 변경은 없다.",
+  "host": "codex",
+  "risk": "routine",
+  "context": {
+    "complete": true,
+    "scope": "local",
+    "previousFailures": 0,
+    "highImpact": false,
+    "modelLocked": false,
+    "exhaustive": false
+  },
+  "availableModels": [],
+  "availableSkills": []
+}

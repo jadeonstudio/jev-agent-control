@@ -13,13 +13,20 @@ export function readMetrics(home, days = 7) {
     const text = readText(path.join(dir, name), { privateFile: true, maxBytes: 11 * 1024 * 1024 });
     if (Buffer.byteLength(text) >= 10 * 1024 * 1024) cappedFiles++;
     for (const line of text.split('\n').filter(Boolean)) {
-      try { const row = JSON.parse(line); if (!['decision', 'feedback'].includes(row.kind)) throw new Error(); events.push(row); }
+      try { const row = JSON.parse(line); if (!['decision', 'feedback', 'route', 'filter', 'observation'].includes(row.kind)) throw new Error(); events.push(row); }
       catch { skipped++; }
     }
   }
   const decisions = events.filter(e => e.kind === 'decision'), feedback = events.filter(e => e.kind === 'feedback');
   const latency = decisions.filter(e => e.networkCalls === 1).map(e => e.elapsedMs).filter(Number.isFinite);
   const tokens = (rows, field, key) => rows.reduce((sum, e) => sum + (Number.isSafeInteger(e[field]?.[key]) ? e[field][key] : 0), 0);
+  const featureActivity = Object.fromEntries(['route', 'filter'].map(kind => {
+    const rows = events.filter(e => e.kind === kind);
+    return [kind, { requests: rows.length, applied: rows.filter(e => e.apply).length,
+      reasons: rows.reduce((o, r) => { o[r.reason] = (o[r.reason] || 0) + 1; return o; }, Object.create(null)),
+      elapsedMs: { p50: percentile(rows.map(e => e.elapsedMs).filter(Number.isFinite), 0.5), p95: percentile(rows.map(e => e.elapsedMs).filter(Number.isFinite), 0.95) } }];
+  }));
+  const observations = events.filter(e => e.kind === 'observation');
   return { days, decisions: decisions.length, networkCalls: decisions.reduce((s, e) => s + (e.networkCalls || 0), 0),
     accepted: decisions.filter(e => e.apply).length,
     byMode: Object.fromEntries(['off', 'shadow', 'on'].map(mode => [mode, decisions.filter(e => e.mode === mode).length])),
@@ -29,6 +36,11 @@ export function readMetrics(home, days = 7) {
       missingUsageCalls: decisions.filter(e => e.networkCalls && (e.usage?.inputTokens == null || e.usage?.outputTokens == null)).length },
     baselineReportedTokens: { input: tokens(feedback, 'baselineUsage', 'inputTokens'), output: tokens(feedback, 'baselineUsage', 'outputTokens') },
     baselineAgreement: { matched: feedback.reduce((s, e) => s + (e.matched || 0), 0), total: feedback.reduce((s, e) => s + (e.total || 0), 0), isAccuracy: false },
+    featureActivity,
+    routeAgreement: { observed: observations.filter(e => e.feature === 'route').length,
+      matched: observations.filter(e => e.feature === 'route' && e.matched === true).length, isTaskAccuracy: false },
+    filterLabels: { relevant: observations.filter(e => e.feature === 'filter').reduce((n, e) => n + (e.relevant || 0), 0),
+      missed: observations.filter(e => e.feature === 'filter').reduce((n, e) => n + (e.missed || 0), 0), suppliedLabelsOnly: true },
     tokenSavings: null, costSavings: null, skippedLines: skipped, cappedFiles,
-    note: 'OFF requests are not logged. Missing usage is unknown, not zero. Host tokens and Jev tokens are not directly interchangeable. Whole-task savings require matched A/B runs. Logs are local best-effort metadata only.' };
+    note: 'OFF requests are not logged. API counts use decision events only, not wrapper events. Accepted primitives are not executed model routes. Missing usage is unknown, not zero. Host tokens and Jev tokens are not directly interchangeable. Whole-task savings require matched A/B runs. Logs are local best-effort metadata only.' };
 }

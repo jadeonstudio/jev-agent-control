@@ -1,7 +1,7 @@
 {
   "name": "jev-agent-control",
-  "version": "0.1.0",
-  "description": "A local, switchable Jev decision layer for Codex and Claude Code",
+  "version": "0.2.0",
+  "description": "A local, switchable TypeSafe decision layer with policy routing and selective filtering for Codex and Claude Code",
   "type": "module",
   "private": true,
   "engines": {
@@ -11,13 +11,17 @@
     "jev-control": "bin/jev-control.mjs"
   },
   "exports": {
-    ".": "./src/engine.mjs"
+    ".": "./src/engine.mjs",
+    "./control": "./src/control-layer.mjs",
+    "./routing": "./src/routing.mjs",
+    "./evaluation": "./src/evaluation.mjs"
   },
   "scripts": {
     "test": "node --test tests/*.test.mjs",
     "check": "node scripts/check.mjs",
     "test:live": "node bin/jev-control.mjs smoke --live",
-    "demo": "node examples/fast-path.mjs"
+    "demo": "node examples/fast-path.mjs",
+    "demo:features": "node examples/classifier-design.mjs"
   },
   "license": "MIT",
   "repository": {

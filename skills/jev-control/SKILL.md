@@ -1,21 +1,32 @@
 ---
 name: jev-control
-description: Manage the optional Jev decision layer when the user asks to enable, disable, test, inspect, or install it. Not a coding or reasoning agent.
+description: Install, inspect, test or explicitly toggle the optional shared Jev layer and its router/bulk features for Codex and Claude Code.
 ---
-# Jev controls
-Use the bundled `scripts/run.mjs`, resolved relative to this skill directory, NOT the project working directory:
+# Jev operator controls
+Resolve the bundled `scripts/run.mjs` relative to THIS skill, not the project working directory:
 
 ```sh
 node <this-skill-directory>/scripts/run.mjs status
 node <this-skill-directory>/scripts/run.mjs off
 node <this-skill-directory>/scripts/run.mjs shadow
 node <this-skill-directory>/scripts/run.mjs on
+node <this-skill-directory>/scripts/run.mjs policy init
+node <this-skill-directory>/scripts/run.mjs policy check
+node <this-skill-directory>/scripts/run.mjs router off
+node <this-skill-directory>/scripts/run.mjs router shadow
+node <this-skill-directory>/scripts/run.mjs router on
+node <this-skill-directory>/scripts/run.mjs bulk off
+node <this-skill-directory>/scripts/run.mjs bulk shadow
+node <this-skill-directory>/scripts/run.mjs bulk on
 node <this-skill-directory>/scripts/run.mjs doctor
 node <this-skill-directory>/scripts/run.mjs smoke
 node <this-skill-directory>/scripts/run.mjs metrics
 ```
-Ask the user to run `key set` themselves in a normal terminal when a key is missing. Never ask them to paste a key in chat. Never read, display, search, or send `credentials.env`, process environments, shell history, or host authentication files to an LLM. Never put a key in a command argument.
 
-OFF makes no API calls. SHADOW pays for TypeSafe decisions but never applies or reveals their answers to the host before an independent baseline is recorded. ON permits high-confidence advisory decisions only. Mode is shared across Codex and Claude for the same JEV_HOME; do not toggle without the user's request. An existing request cannot be unsent.
+Global mode and per-feature mode combine conservatively: either OFF disables; either SHADOW prevents application. Updating code does not enable new features. Do not toggle without the user's request. `policy init` creates safe defaults without overwriting an existing policy. Router profiles start empty; map only actually available models, reasoning levels and skills after inspecting the host's supported configuration and the user's desired policy. No invented model names or silently lowered thresholds. `policy check` validates configuration, NOT model quality or availability.
 
-`smoke` is offline. `smoke --live` sends one synthetic batch and incurs TypeSafe usage; run only when the user has authorized API testing. Installation does not grant tool permissions or bypass host trust prompts. Do not claim speedups from synthetic smoke results.
+Reuse the existing TYPESAFE_API_KEY. If missing, ask the USER to run `key set` in a normal terminal. Never request a key in chat, pass it as an argument or display/read credentials.env, process environments, host auth files, shell history or backups. The managed key file is private plaintext, not an encrypted vault.
+
+`smoke` and examples are offline. `smoke --live` incurs TypeSafe usage and requires explicit authorization. Feature SHADOW also incurs API usage. No classifier.dev account/key is used. In-flight requests cannot be unsent; responses observed after OFF/policy changes are not applied. Installation preserves normal host trust/permissions and does not switch the active host model.
+
+For updates: OFF, review Git changes, fast-forward pull, full tests, reinstall the two existing skills/MCP entries, reconnect hosts. Read docs/CLASSIFIER_DESIGN.md for configuration, limitations and paired evaluation. Never claim savings or native/live success from a synthetic test.

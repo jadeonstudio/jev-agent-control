@@ -1,0 +1,46 @@
+import { parseArgs } from 'node:util';
+import { MAX_FRAME_BYTES, fail } from './constants.mjs';
+import { resolveHome } from './storage.mjs';
+import { initializeFeaturePolicy, loadFeaturePolicy, setFeatureMode } from './feature-policy.mjs';
+import { createControlLayer } from './control-layer.mjs';
+import { evaluatePairedRuns } from './evaluation.mjs';
+
+const print = value => process.stdout.write(JSON.stringify(value, null, 2) + '\n');
+async function jsonStdin(limit = MAX_FRAME_BYTES) {
+  if (process.stdin.isTTY) fail('PIPE_JSON_TO_STDIN');
+  const chunks = []; let size = 0;
+  for await (const chunk of process.stdin) {
+    size += Buffer.byteLength(chunk); if (size > limit) fail('INPUT_TOO_LARGE'); chunks.push(Buffer.from(chunk));
+  }
+  try { return JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(Buffer.concat(chunks))); }
+  catch { fail('INVALID_JSON'); }
+}
+/** Handles only new commands. The existing CLI, key handling and installer remain unchanged. */
+export async function featureMain(argv = process.argv.slice(2), env = process.env) {
+  const peek = parseArgs({ args: argv, allowPositionals: true, strict: false, options: { home: { type: 'string' } } });
+  const command = peek.positionals[0];
+  if (!['router', 'bulk', 'route', 'filter', 'policy', 'evaluate', 'status'].includes(command)) return false;
+  if (Number(process.versions.node.split('.')[0]) < 22) fail('NODE_22_REQUIRED');
+  const { values, positionals } = parseArgs({ args: argv, allowPositionals: true, strict: true,
+    options: { home: { type: 'string' }, help: { type: 'boolean' } } });
+  if (values.help) { process.stdout.write(FEATURE_HELP); return true; }
+  const sub = positionals[1];
+  if (positionals.length > (['router', 'bulk', 'policy'].includes(command) ? 2 : 1)) fail('UNEXPECTED_ARGUMENTS');
+  const home = resolveHome({ ...env, ...(values.home ? { JEV_HOME: values.home } : {}) });
+  const layer = createControlLayer({ home, env });
+  if (command === 'router' || command === 'bulk') {
+    if (!['off', 'shadow', 'on'].includes(sub)) fail('INVALID_FEATURE_MODE');
+    setFeatureMode(home, command, sub); print(layer.status());
+  } else if (command === 'status') print(layer.status());
+  else if (command === 'policy') {
+    if (sub === 'init') print(initializeFeaturePolicy(home));
+    else if (sub === 'check') print({ valid: true, policy: loadFeaturePolicy(home), nativeTargetsVerified: false });
+    else fail('INVALID_POLICY_COMMAND');
+  } else if (command === 'route') print(await layer.route(await jsonStdin()));
+  else if (command === 'filter') {
+    const result = await layer.filter(await jsonStdin()); print(result);
+    if (!result.valid) process.exitCode = 2;
+  } else if (command === 'evaluate') print(evaluatePairedRuns(await jsonStdin(1048576)));
+  return true;
+}
+export const FEATURE_HELP = `\nClassifier-inspired features (TypeSafe API only):\n  policy init|check   Create/validate private features.json; no automatic targets\n  router off|shadow|on  Cap routing independently of the global switch\n  bulk off|shadow|on    Cap prefiltering independently of the global switch\n  route|filter       Read bounded JSON from stdin; results contain no raw text\n  evaluate           Offline paired-execution report from JSON stdin\nSee docs/CLASSIFIER_DESIGN.md for configuration, examples and limitations.\n`;
