@@ -169,14 +169,23 @@ jev-control laya status
 
 구체적인 schema·outcome 예제·보안·공식 notebook 근거: **[TRAINING_DATA.md](docs/TRAINING_DATA.md)**. 키/모델 없이 전체 흐름을 확인하려면 `node examples/training-pipeline.mjs`를 실행하세요. 이 예제는 synthetic inference와 무해한 실제 assertion이며 모델 정확도 실험이 아닙니다.
 
-### teacher 증류 + 사람 검수 (`register` 전, 한국어 route 라벨이 없을 때)
+### teacher 증류 + AI 기준 라벨 (`register` 전, 한국어 route 라벨이 없을 때)
+
+owner 결정(2026-09-23): 영어 선택지·문장 TTY 검수가 어려워 calibration/test/holdout 정답은 사람 검수 대신
+**Claude 기준 라벨**(`label_source: ai_reference`, 라벨링 모델을 `source`에 기록)로 대체했습니다. Jev teacher와
+Claude의 300문항 실측 일치율이 낮아(intent .85 / risk .68 / difficulty .38) "Laya ≈ Claude" 목표를 위해 train도
+Claude 라벨(`--role train`)로 둘 수 있습니다 — 이 경우 해당 task의 Jev teacher 표본을 **대체**합니다. 어떤 경우도
+`human`/`runner`로 기록하지 않고, qualify·compare·compare-teacher 결과는 "Claude 일치율"이며 정확도가 아닙니다.
 
 ```sh
 jev-control laya distill import --run r1 --input synthetic-tasks.jsonl   # {lang, domain?, task, group?, reviewable?} 합성 문장만; group=번역쌍 등 누출 방지 키, reviewable:false=검수 후보 제외
 jev-control laya distill import-shadow --run r1                          # 캡처된 shadow task 문장(egress 금지, 외부 전송 없음)
 jev-control laya distill label --run r1 --confirm-egress                 # 합성 문장만 Jev(TypeSafe)로 전송, 분당 50회 제한
-jev-control laya distill review --run r1 --count 200                     # TTY 전용 사람 검수, 언어별 층화, 재개 가능
-jev-control laya distill build --run r1                                  # teacher 라벨은 train만, 사람 검수는 calibration/test만
+jev-control laya distill import-reference --run r1 --input claude-labels.jsonl --source claude-sonnet-5 [--role eval|train]
+                                                                           # {lang, task, labels:{intent,difficulty(1..5),risk}}; role 기본 eval(calibration/test), train은 해당 task의 teacher 라벨을 대체
+jev-control laya distill review --run r1 --count 200                     # TTY 전용 사람 검수(선택, 있으면 최우선); 언어별 층화, 재개 가능
+jev-control laya distill build --run r1                                  # 우선순위: human(eval) > reference eval > reference train > Jev teacher(train)
+jev-control laya distill compare-teacher --run r1                        # Jev teacher vs 기준 라벨 숫자 리포트(정확도 아님); eval_reference/train_reference 분리
 jev-control laya distill status --run r1
 ```
 

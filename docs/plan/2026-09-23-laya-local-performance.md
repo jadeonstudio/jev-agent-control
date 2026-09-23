@@ -11,6 +11,7 @@ owner 요청: 이 Mac(Apple M4 Pro, GPU 16코어, 통합 메모리 24GB)에서 L
 | 판단 제공자 | Laya로 전환: SHADOW 데이터를 비용 0으로 수집. 자격이 없으므로 jev_decide 채택은 자격이 생길 때까지 멈춘다(원래 호스트 판단으로 돌아감). |
 | 학습 방식 | teacher 증류 + 사람 검수: teacher 라벨은 train split에만 허용하고, calibration·test·holdout은 owner가 검수한 라벨만 쓴다. teacher 방식·비용은 추정치와 함께 별도 승인. |
 | teacher·규모 (2026-09-23) | teacher = Jev(TypeSafe), 합성 작업 문장 3,000개(한·영 절반) + owner 검수 200개(한·영 100개씩). TypeSafe에는 합성 문장만 보내고, 실제 spawn 문장은 외부로 보내지 않는다. teacher 라벨은 train split에만, 검수 라벨은 calibration·test·holdout에만 쓴다. |
+| 평가 기준 (2026-09-23 개정) | owner 목표는 "Laya가 Claude 수준으로, 훨씬 빠르게 판단"이다. owner가 영어 선택지·영어 문장 검수가 어렵다고 판단해 사람 검수 대신 **Claude 기준 라벨**(`label_source: ai_reference`, 라벨링 모델 기록)을 calibration·test·holdout 기준으로 쓴다. `human`으로 기록하지 않고, qualify·compare 결과는 "Claude 일치율"로 부르며 정확도라 하지 않는다. 실제 실행 결과(runner 등 objective 라벨)가 쌓이면 별도 기준으로 둔다. Jev teacher 라벨은 계속 train에만 쓰고, 같은 평가 세트에서 Jev와 Claude의 일치율을 먼저 재서 train 라벨 교체 여부를 정한다. |
 | Codex 관리 블록 | "작업자 spawn 전 jev_route 호출" 안내를 의미 있는 크기의 독립 작업으로 좁히고, codex exec A/B로 추가 턴 비용을 실측한 뒤 유지·제거를 정한다. |
 
 ## 리서치 요약 (출처는 세션 기록, 2026-09-23 확인)
@@ -129,6 +130,7 @@ owner 요청: 이 Mac(Apple M4 Pro, GPU 16코어, 통합 메모리 24GB)에서 L
   - [x] 나머지 2,980회(owner 승인, 추정 입력 약 3.0M·출력 약 0.37M, 약 59분): 2,977 성공·3 실패(`MALFORMED_RESPONSE`, 자동 재시도 없음). 전체 라벨 2,997, 모델 jev-1.13.0 단일, 실측 입력 2,959,268·출력 372,719 토큰, 63.4분
     - 라벨 분포(긴 999): intent edit 383·explain 165·debug 161·architecture 147·research 97·other 32·operate 14 / difficulty(0~4) 3이 456으로 최다 / risk safe 676·caution 203·high 105·unknown 15. 짧은 1,998은 intent other 498, difficulty 2가 1,212로 몰림(짧은 문장은 정보가 적어 teacher도 판단을 유보)
     - teacher 일관성(번역 쌍 304쌍의 ko·en argmax 일치): intent 0.86, risk 0.83, difficulty 0.69. 같은 작업을 언어만 바꿨을 때도 difficulty는 약 3할이 갈리므로, difficulty는 teacher 라벨 자체의 잡음이 크고 soft target과 사람 검수가 특히 중요하다. 이 수치는 teacher 자기 일관성이지 정확도가 아니다
-  - [ ] owner TTY 검수 200(긴 문장, 언어 균등, group당 1개) → build → export → Kaggle 학습(multilingual 기반, `--input-fit task-head`로 등록) → holdout·qualify·compare·promote
+  - [x] owner TTY 검수 시작 후 중단: 선택지·영어 문장 판독이 어렵다는 owner 판단으로 평가 기준을 Claude 기준 라벨로 개정(위 결정 표)
+  - [ ] Claude 기준 라벨 300개(긴 문장, ko 150·en 150, group당 1개) → Jev·Claude 일치율 측정 → train 라벨 유지/교체 결정 → build → export → Kaggle 학습(multilingual 기반, `--input-fit task-head`로 등록) → holdout·qualify·compare·promote
 - [x] L5 Codex A/B 실측(B4) 후 owner 승인으로 Codex 관리 블록에서 spawn 전 route 안내 제거, hook 기록만 유지
 - [ ] L6 설치본 반영·문서·커밋

@@ -6,12 +6,13 @@ import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { ROUTE_QUESTIONS } from '../src/routing.mjs';
 import { readDataset, exportDataset } from '../src/training/dataset.mjs';
-import { freezeHoldout, qualifyCandidate } from '../src/training/laya-lifecycle.mjs';
+import { freezeHoldout, qualifyCandidate, compareCandidate } from '../src/training/laya-lifecycle.mjs';
 import { createTrainingStore } from '../src/training/store.mjs';
 import { digest, encode } from '../src/training/schema.mjs';
 import { setMode, atomicWrite } from '../src/storage.mjs';
 import {
-  distillImport, distillImportShadow, distillLabel, distillReview, buildDistillDataset, distillStatus, runDir,
+  distillImport, distillImportReference, distillImportShadow, distillLabel, distillReview, buildDistillDataset,
+  distillCompareTeacher, distillStatus, runDir,
 } from '../src/training/laya-distill.mjs';
 
 function fixture(t) {
@@ -609,4 +610,324 @@ test('every readDataset consumer (freezeHoldout, qualify) refuses a dataset whos
     JSON.stringify({ python: '/usr/bin/python3', modelPath: home, model: 'laya/base', checkpoint, runtimeVersion: '0.3.4', device: 'cpu', precision: 'fp32' }, null, 2) + '\n');
   await assert.rejects(qualifyCandidate(home, { candidateHash: checkpoint, datasetVersion: built.dataset_version, holdoutName: 'h1',
     layaClient: { infer: async () => ({}) } }), /TEACHER_LABEL_IN_EVAL_SPLIT|HOLDOUT/);
+});
+
+// ============================== import-reference (owner decision 2026-09-23) ==============================
+
+function referenceLine(lang, task, overrides = {}) {
+  return { lang, task, labels: { intent: 'edit', difficulty: 3, risk: 'safe', ...overrides } };
+}
+
+test('distill import-reference resolves a task by the same task_id rule as import, stores label_source-ready labels, and defaults role to eval', t => {
+  const home = fixture(t);
+  distillImport(home, { run: 'run1', inputFile: writeInputFile(t, [{ lang: 'en', task: 'Add a retry to the fetch call' }]) });
+  const r = distillImportReference(home, { run: 'run1', source: 'claude-sonnet-5',
+    inputFile: writeInputFile(t, [referenceLine('en', 'Add a retry to the fetch call')]) });
+  assert.equal(r.added, 1);
+  assert.equal(r.role, 'eval');
+  const lines = fs.readFileSync(path.join(runDir(home, 'run1'), 'reference.jsonl'), 'utf8').trim().split('\n').map(JSON.parse);
+  assert.equal(lines.length, 1);
+  assert.equal(lines[0].source, 'claude-sonnet-5');
+  assert.equal(lines[0].role, 'eval');
+  assert.equal(lines[0].labels.intent, 'edit');
+  assert.equal(lines[0].labels.risk, 'safe');
+  assert.equal(lines[0].labels.difficulty, 2); // human-facing 3 (1..5) stored 0-based like review
+});
+
+test('distill import-reference accepts --role train and stores it', t => {
+  const home = fixture(t);
+  distillImport(home, { run: 'run1', inputFile: writeInputFile(t, [{ lang: 'ko', task: '테스트를 추가해줘' }]) });
+  const r = distillImportReference(home, { run: 'run1', source: 'claude-sonnet-5', role: 'train',
+    inputFile: writeInputFile(t, [referenceLine('ko', '테스트를 추가해줘')]) });
+  assert.equal(r.role, 'train');
+  const lines = fs.readFileSync(path.join(runDir(home, 'run1'), 'reference.jsonl'), 'utf8').trim().split('\n').map(JSON.parse);
+  assert.equal(lines[0].role, 'train');
+});
+
+test('distill import-reference rejects an invalid role', t => {
+  const home = fixture(t);
+  distillImport(home, { run: 'run1', inputFile: writeInputFile(t, [{ lang: 'en', task: 'x task' }]) });
+  assert.throws(() => distillImportReference(home, { run: 'run1', source: 'claude-sonnet-5', role: 'bogus',
+    inputFile: writeInputFile(t, [referenceLine('en', 'x task')]) }), /INVALID_DISTILL_REFERENCE_ROLE/);
+});
+
+test('distill import-reference validates --source against a safe model-id pattern', t => {
+  const home = fixture(t);
+  distillImport(home, { run: 'run1', inputFile: writeInputFile(t, [{ lang: 'en', task: 'x task' }]) });
+  const file = writeInputFile(t, [referenceLine('en', 'x task')]);
+  assert.throws(() => distillImportReference(home, { run: 'run1', source: 'has a space', inputFile: file }), /INVALID_DISTILL_REFERENCE_SOURCE/);
+  assert.throws(() => distillImportReference(home, { run: 'run1', source: '../etc/passwd', inputFile: file }), /INVALID_DISTILL_REFERENCE_SOURCE/);
+  assert.throws(() => distillImportReference(home, { run: 'run1', source: '', inputFile: file }), /INVALID_DISTILL_REFERENCE_SOURCE/);
+  const r = distillImportReference(home, { run: 'run1', source: 'claude-opus-4.6:20261001', inputFile: file });
+  assert.equal(r.added, 1);
+});
+
+test('distill import-reference validates labels against ROUTE_QUESTIONS (bad choice key, out-of-range difficulty)', t => {
+  const home = fixture(t);
+  distillImport(home, { run: 'run1', inputFile: writeInputFile(t, [{ lang: 'en', task: 'x task' }]) });
+  assert.throws(() => distillImportReference(home, { run: 'run1', source: 'claude-sonnet-5',
+    inputFile: writeInputFile(t, [referenceLine('en', 'x task', { intent: 'not-a-real-intent' })]) }), /INVALID_DISTILL_REFERENCE_LINE/);
+  assert.throws(() => distillImportReference(home, { run: 'run1', source: 'claude-sonnet-5',
+    inputFile: writeInputFile(t, [referenceLine('en', 'x task', { difficulty: 0 })]) }), /INVALID_DISTILL_REFERENCE_LINE/);
+  assert.throws(() => distillImportReference(home, { run: 'run1', source: 'claude-sonnet-5',
+    inputFile: writeInputFile(t, [referenceLine('en', 'x task', { difficulty: 6 })]) }), /INVALID_DISTILL_REFERENCE_LINE/);
+});
+
+test('distill import-reference fails the WHOLE import with DISTILL_REFERENCE_UNKNOWN_TASK before writing anything, when any task is unresolved', t => {
+  const home = fixture(t);
+  distillImport(home, { run: 'run1', inputFile: writeInputFile(t, [{ lang: 'en', task: 'a known imported task' }]) });
+  const file = writeInputFile(t, [
+    referenceLine('en', 'a known imported task'),
+    referenceLine('en', 'a task that was never imported'),
+  ]);
+  assert.throws(() => distillImportReference(home, { run: 'run1', source: 'claude-sonnet-5', inputFile: file }), /DISTILL_REFERENCE_UNKNOWN_TASK/);
+  const refPath = path.join(runDir(home, 'run1'), 'reference.jsonl');
+  assert.equal(fs.existsSync(refPath), false); // nothing written, not even the resolvable line
+});
+
+test('distill import-reference skips a duplicate task_id already in reference.jsonl and counts it', t => {
+  const home = fixture(t);
+  distillImport(home, { run: 'run1', inputFile: writeInputFile(t, [{ lang: 'en', task: 'dup task' }]) });
+  const file = writeInputFile(t, [referenceLine('en', 'dup task')]);
+  const r1 = distillImportReference(home, { run: 'run1', source: 'claude-sonnet-5', inputFile: file });
+  assert.equal(r1.added, 1);
+  const r2 = distillImportReference(home, { run: 'run1', source: 'claude-sonnet-5', inputFile: file });
+  assert.equal(r2.added, 0);
+  assert.equal(r2.skippedDuplicate, 1);
+});
+
+// ============================== build: reference precedence ==============================
+
+test('build: a reference eval label alone (no teacher label needed) grounds calibration/test with label_source ai_reference and a one-hot target', async t => {
+  const home = fixture(t);
+  const file = writeInputFile(t, [
+    { lang: 'ko', task: '작업 A' }, { lang: 'en', task: 'task B' },
+  ]);
+  distillImport(home, { run: 'run1', inputFile: file });
+  distillImportReference(home, { run: 'run1', source: 'claude-sonnet-5', inputFile: writeInputFile(t, [
+    referenceLine('ko', '작업 A'), referenceLine('en', 'task B'),
+  ]) });
+  const built = buildDistillDataset(home, { run: 'run1' });
+  const store = createTrainingStore({ home });
+  const { samples } = readDataset(store, built.dataset_version);
+  assert.ok(samples.length > 0);
+  assert.ok(samples.every(s => s.label_source === 'ai_reference'));
+  assert.ok(samples.every(s => s.split === 'calibration' || s.split === 'test'));
+  assert.ok(samples.every(s => s.label_confidence === 1));
+  for (const s of samples) {
+    const sum = Object.values(s.target.probabilities).reduce((a, b) => a + b, 0);
+    assert.equal(sum, 1);
+    assert.equal(Object.values(s.target.probabilities).filter(v => v === 1).length, 1); // one-hot, not soft
+  }
+});
+
+test('build: a role:train reference label REPLACES the Jev-teacher sample for that task (teacher label never emitted)', async t => {
+  const home = labeledFixture(t, 2); // 1 ko + 1 en
+  const tasks = fs.readFileSync(path.join(runDir(home, 'run1'), 'tasks.jsonl'), 'utf8').trim().split('\n').map(JSON.parse);
+  const target = tasks[0];
+  await distillLabel(home, { run: 'run1', confirmEgress: true, key: 'k', provider: async () => teacherRaw('jev-1.13.0', { intent: 'debug', difficulty: 4, risk: 'high' }), sleepImpl: async () => {} });
+  distillImportReference(home, { run: 'run1', source: 'claude-sonnet-5', role: 'train', inputFile: writeInputFile(t, [
+    referenceLine(target.lang, target.task, { intent: 'edit', difficulty: 1, risk: 'safe' }),
+  ]) });
+  const built = buildDistillDataset(home, { run: 'run1' });
+  const store = createTrainingStore({ home });
+  const { samples } = readDataset(store, built.dataset_version);
+  const targetSamples = samples.filter(s => s.raw_refs.distill.task_id === target.task_id);
+  assert.ok(targetSamples.length > 0);
+  assert.ok(targetSamples.every(s => s.label_source === 'ai_reference'));
+  assert.ok(targetSamples.every(s => s.split === 'train'));
+  const intentSample = targetSamples.find(s => s.question_id === 'intent');
+  assert.equal(intentSample.target.value, 'edit'); // the Claude train label, not the teacher's 'debug'
+});
+
+test('build precedence: human review wins over a role:eval reference label for the same task', async t => {
+  const home = labeledFixture(t, 2);
+  const tasks = fs.readFileSync(path.join(runDir(home, 'run1'), 'tasks.jsonl'), 'utf8').trim().split('\n').map(JSON.parse);
+  const target = tasks[0];
+  await distillLabel(home, { run: 'run1', confirmEgress: true, key: 'k', provider: async () => teacherRaw('jev-1.13.0'), sleepImpl: async () => {} });
+  distillImportReference(home, { run: 'run1', source: 'claude-sonnet-5', inputFile: writeInputFile(t, [
+    referenceLine(target.lang, target.task, { intent: 'research', difficulty: 5, risk: 'unknown' }),
+  ]) });
+  // Bypass the TTY review flow to record a human label directly (same technique as the existing group-leak test).
+  fs.writeFileSync(path.join(runDir(home, 'run1'), 'review.jsonl'),
+    JSON.stringify({ task_id: target.task_id, labels: { intent: 'edit', difficulty: 0, risk: 'safe' }, reviewer: 'human-tty', at: new Date().toISOString() }) + '\n', { mode: 0o600 });
+  const built = buildDistillDataset(home, { run: 'run1' });
+  const store = createTrainingStore({ home });
+  const { samples } = readDataset(store, built.dataset_version);
+  const targetSamples = samples.filter(s => s.raw_refs.distill.task_id === target.task_id);
+  assert.ok(targetSamples.every(s => s.label_source === 'human'));
+  const intentSample = targetSamples.find(s => s.question_id === 'intent');
+  assert.equal(intentSample.target.value, 'edit'); // human label, not the reference's 'research'
+});
+
+test('build: a train-role reference/teacher task is excluded from train when its group has an eval member (human OR eval reference)', async t => {
+  const home = fixture(t);
+  const file = writeInputFile(t, [
+    { lang: 'ko', task: '이 문서를 요약해줘', group: 'pairA' },
+    { lang: 'en', task: 'Summarize this document', group: 'pairA' },
+  ]);
+  distillImport(home, { run: 'run1', inputFile: file });
+  const tasks = fs.readFileSync(path.join(runDir(home, 'run1'), 'tasks.jsonl'), 'utf8').trim().split('\n').map(JSON.parse);
+  const koTask = tasks.find(t => t.lang === 'ko'), enTask = tasks.find(t => t.lang === 'en');
+  await distillLabel(home, { run: 'run1', confirmEgress: true, key: 'k', provider: async () => teacherRaw('jev-1.13.0'), sleepImpl: async () => {} });
+  // ko member gets an eval-role reference label (an eval-grounding member); en sibling only has a teacher label.
+  distillImportReference(home, { run: 'run1', source: 'claude-sonnet-5', inputFile: writeInputFile(t, [referenceLine('ko', koTask.task)]) });
+  const built = buildDistillDataset(home, { run: 'run1' });
+  const store = createTrainingStore({ home });
+  const { samples } = readDataset(store, built.dataset_version);
+  assert.ok(!samples.some(s => s.raw_refs.distill.task_id === enTask.task_id)); // teacher-labeled sibling excluded (group leak)
+  assert.ok(samples.some(s => s.raw_refs.distill.task_id === koTask.task_id && s.label_source === 'ai_reference'));
+  const manifest = JSON.parse(fs.readFileSync(built.manifest, 'utf8'));
+  assert.equal(manifest.counts.excluded_group_leak, 1);
+});
+
+test('manifest counts.label_source_by_split breaks ai_reference/human/teacher out per split', async t => {
+  const home = labeledFixture(t, 4); // 2 ko + 2 en
+  const tasks = fs.readFileSync(path.join(runDir(home, 'run1'), 'tasks.jsonl'), 'utf8').trim().split('\n').map(JSON.parse);
+  await distillLabel(home, { run: 'run1', confirmEgress: true, key: 'k', provider: async () => teacherRaw('jev-1.13.0'), sleepImpl: async () => {} });
+  distillImportReference(home, { run: 'run1', source: 'claude-sonnet-5', inputFile: writeInputFile(t, [
+    referenceLine(tasks[0].lang, tasks[0].task), // role:eval -> calibration or test
+  ]) });
+  distillImportReference(home, { run: 'run1', source: 'claude-sonnet-5', role: 'train', inputFile: writeInputFile(t, [
+    referenceLine(tasks[1].lang, tasks[1].task), // role:train -> train, replaces teacher
+  ]) });
+  const built = buildDistillDataset(home, { run: 'run1' });
+  const manifest = JSON.parse(fs.readFileSync(built.manifest, 'utf8'));
+  assert.ok(manifest.counts.label_source_by_split.train.ai_reference >= 1);
+  assert.ok(manifest.counts.label_source_by_split.train.teacher >= 1);
+  const evalAiRef = (manifest.counts.label_source_by_split.calibration?.ai_reference ?? 0) + (manifest.counts.label_source_by_split.test?.ai_reference ?? 0);
+  assert.ok(evalAiRef >= 1);
+});
+
+// ============================== compare-teacher ==============================
+
+test('distill compare-teacher reports eval_reference and train_reference separately with agreement/confusion/per-lang/difficulty stats', async t => {
+  const home = fixture(t);
+  const file = writeInputFile(t, [
+    { lang: 'ko', task: '작업 1' }, { lang: 'en', task: 'task 2' }, { lang: 'en', task: 'task 3' },
+  ]);
+  distillImport(home, { run: 'run1', inputFile: file });
+  const tasks = fs.readFileSync(path.join(runDir(home, 'run1'), 'tasks.jsonl'), 'utf8').trim().split('\n').map(JSON.parse);
+  await distillLabel(home, { run: 'run1', confirmEgress: true, key: 'k', provider: async () => teacherRaw('jev-1.13.0', { intent: 'edit', difficulty: 1, risk: 'safe' }), sleepImpl: async () => {} });
+  const [t1, t2, t3] = tasks;
+  // t1: eval reference that AGREES with teacher; t2: train reference that DISAGREES; t3: no reference (excluded from report).
+  // teacherRaw picks difficulty 0-based (=1); referenceLine's difficulty is 1..5 human-facing, stored (n-1).
+  // t1: input difficulty 2 -> stored 1, matching the teacher's stored 1 exactly (agreement).
+  distillImportReference(home, { run: 'run1', source: 'claude-sonnet-5', inputFile: writeInputFile(t, [referenceLine(t1.lang, t1.task, { intent: 'edit', difficulty: 2, risk: 'safe' })]) });
+  // t2: input difficulty 5 -> stored 4, vs teacher's stored 1: |1-4|=3 (disagreement).
+  distillImportReference(home, { run: 'run1', source: 'claude-sonnet-5', role: 'train', inputFile: writeInputFile(t, [referenceLine(t2.lang, t2.task, { intent: 'debug', difficulty: 5, risk: 'high' })]) });
+  const report = distillCompareTeacher(home, { run: 'run1' });
+  assert.equal(report.eval_reference.compared, 1);
+  assert.equal(report.train_reference.compared, 1);
+  assert.equal(report.eval_reference.questions.intent.agreement.count, 1);
+  assert.equal(report.eval_reference.questions.intent.agreement.rate, 1);
+  assert.equal(report.train_reference.questions.intent.agreement.count, 0);
+  assert.equal(report.train_reference.questions.intent.agreement.rate, 0);
+  // confusion matrix: teacher's argmax key -> reference key -> count
+  assert.equal(report.train_reference.questions.intent.confusion.edit.debug, 1);
+  // difficulty: teacher picked 1 (0-based), reference picked 5->4 (0-based); |0-4|=4
+  assert.equal(report.train_reference.questions.difficulty.mean_absolute_difference, 3);
+  assert.equal(report.train_reference.questions.difficulty.within_one.count, 0);
+  assert.equal(report.eval_reference.questions.difficulty.mean_absolute_difference, 0);
+  assert.equal(report.eval_reference.questions.difficulty.within_one.rate, 1);
+  // per-language rates present
+  assert.ok(Object.hasOwn(report.eval_reference.questions.intent.by_lang, t1.lang));
+});
+
+// ============================== status: reference_labels ==============================
+
+test('distill status reports reference_labels total and by role', t => {
+  const home = fixture(t);
+  const file = writeInputFile(t, [{ lang: 'en', task: 'task A' }, { lang: 'en', task: 'task B' }]);
+  distillImport(home, { run: 'run1', inputFile: file });
+  distillImportReference(home, { run: 'run1', source: 'claude-sonnet-5', inputFile: writeInputFile(t, [referenceLine('en', 'task A')]) });
+  distillImportReference(home, { run: 'run1', source: 'claude-sonnet-5', role: 'train', inputFile: writeInputFile(t, [referenceLine('en', 'task B')]) });
+  const status = distillStatus(home, { run: 'run1' });
+  assert.equal(status.reference_labels, 2);
+  assert.equal(status.reference_labels_by_role.eval, 1);
+  assert.equal(status.reference_labels_by_role.train, 1);
+});
+
+// ============================== holdout / qualify / compare over ai_reference ==============================
+
+// Generic fake worker: answers ANY single-question ROUTE_QUESTIONS-shaped request (choice/score)
+// with a fixed high-confidence pick, so qualify/compare can run end to end without a real model.
+function genericFakeLayaClient() {
+  return {
+    status: () => ({ running: false }), close: () => {}, prepare: async () => ({}),
+    async infer(payload, settings) {
+      const laya = settings.laya;
+      const [qid, q] = Object.entries(payload.questions)[0];
+      let answer;
+      if (q.type === 'choice') {
+        const keys = Object.keys(q.criteria);
+        const other = keys.length > 1 ? .1 / (keys.length - 1) : 0;
+        answer = { type: 'choice', choice: keys[0], confidence: .9, probabilities: Object.fromEntries(keys.map((k, i) => [k, i === 0 ? .9 : other])) };
+      } else if (q.type === 'score') {
+        const n = q.criteria.length;
+        // Sharply concentrated on index 0 so the expected value (sum k*p_k) stays within the
+        // 0.05 tolerance of the reported score=0 (contracts.mjs normalizeResponse).
+        const other = n > 1 ? .001 / (n - 1) : 0;
+        answer = { type: 'score', score: 0, confidence: .9, probabilities: Object.fromEntries(Array.from({ length: n }, (_, i) => [String(i), i === 0 ? 1 - other * (n - 1) : other])) };
+      } else {
+        answer = { type: 'noul', noul: .9 };
+      }
+      return { identity: { model: laya.model, checkpoint: laya.checkpoint, runtime_version: laya.runtimeVersion, device: laya.device,
+        precision: laya.precision === 'fp16' ? 'torch.float16' : 'torch.float32' },
+        answers: { [qid]: answer }, usage: { input_tokens: 5, output_tokens: 0 } };
+    },
+  };
+}
+function writeCandidate(home, checkpoint) {
+  fs.mkdirSync(path.join(home, 'laya', 'candidates'), { recursive: true, mode: 0o700 });
+  atomicWrite(path.join(home, 'laya', 'candidates', `${checkpoint}.json`),
+    JSON.stringify({ python: '/usr/bin/python3', modelPath: home, model: 'laya/base', checkpoint, runtimeVersion: '0.3.4', device: 'cpu', precision: 'fp32' }, null, 2) + '\n');
+}
+
+test('laya holdout freeze accepts ai_reference samples from the test split', async t => {
+  const home = fixture(t);
+  const file = writeInputFile(t, [{ lang: 'ko', task: '작업 A' }, { lang: 'en', task: 'task B' }]);
+  distillImport(home, { run: 'run1', inputFile: file });
+  distillImportReference(home, { run: 'run1', source: 'claude-sonnet-5', inputFile: writeInputFile(t, [referenceLine('ko', '작업 A'), referenceLine('en', 'task B')]) });
+  const built = buildDistillDataset(home, { run: 'run1' });
+  const store = createTrainingStore({ home });
+  const holdout = freezeHoldout(home, { datasetVersion: built.dataset_version, name: 'ref-holdout', store });
+  assert.ok(holdout.sample_count > 0);
+  const holdoutLines = fs.readFileSync(path.join(home, 'laya', 'holdouts', 'ref-holdout.jsonl'), 'utf8').trim().split('\n').map(JSON.parse);
+  assert.ok(holdoutLines.some(l => l.label_source === 'ai_reference'));
+});
+
+test('qualify reports evaluation_label_sources and metric_semantics:agreement-with-ai-reference when the dataset carries ai_reference eval labels', async t => {
+  const home = fixture(t);
+  const file = writeInputFile(t, [{ lang: 'ko', task: '작업 A' }, { lang: 'en', task: 'task B' }, { lang: 'en', task: 'task C' }]);
+  distillImport(home, { run: 'run1', inputFile: file });
+  distillImportReference(home, { run: 'run1', source: 'claude-sonnet-5', inputFile: writeInputFile(t, [
+    referenceLine('ko', '작업 A'), referenceLine('en', 'task B'), referenceLine('en', 'task C'),
+  ]) });
+  const built = buildDistillDataset(home, { run: 'run1' });
+  const store = createTrainingStore({ home });
+  const holdout = freezeHoldout(home, { datasetVersion: built.dataset_version, name: 'q-holdout', store });
+  assert.ok(holdout.sample_count > 0);
+  const checkpoint = 'b'.repeat(64);
+  writeCandidate(home, checkpoint);
+  const result = await qualifyCandidate(home, { candidateHash: checkpoint, datasetVersion: built.dataset_version, holdoutName: 'q-holdout',
+    layaClient: genericFakeLayaClient(), targetAccuracy: 0.5, minCoverage: 0.01, minCalibration: 1, minTest: 1, minLowerBound: 0 });
+  assert.equal(result.metric_semantics, 'agreement-with-ai-reference');
+  assert.ok(result.evaluation_label_sources.ai_reference > 0);
+});
+
+test('compare reports evaluation_label_sources and metric_semantics over the same holdout it evaluates', async t => {
+  const home = fixture(t);
+  const file = writeInputFile(t, [{ lang: 'ko', task: '작업 A' }, { lang: 'en', task: 'task B' }]);
+  distillImport(home, { run: 'run1', inputFile: file });
+  distillImportReference(home, { run: 'run1', source: 'claude-sonnet-5', inputFile: writeInputFile(t, [referenceLine('ko', '작업 A'), referenceLine('en', 'task B')]) });
+  const built = buildDistillDataset(home, { run: 'run1' });
+  const store = createTrainingStore({ home });
+  const holdout = freezeHoldout(home, { datasetVersion: built.dataset_version, name: 'c-holdout', store });
+  assert.ok(holdout.sample_count > 0);
+  const checkpoint = 'c'.repeat(64);
+  writeCandidate(home, checkpoint);
+  const cmp = await compareCandidate(home, { candidateHash: checkpoint, holdoutName: 'c-holdout', layaClient: genericFakeLayaClient(), noActiveBaseline: true });
+  assert.equal(cmp.metric_semantics, 'agreement-with-ai-reference');
+  assert.ok(cmp.evaluation_label_sources.ai_reference > 0);
 });

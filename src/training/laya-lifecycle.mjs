@@ -147,7 +147,16 @@ async function inferOne(layaClient, laya, sample, { timeoutMs = 30000, env = pro
   const metric = sample.question.type === 'noul' ? Math.max(answer.probabilityTrue, 1 - answer.probabilityTrue)
     : sample.question.type === 'choice' ? Math.min(answer.confidence, answer.selectedProbability)
     : answer.confidence;
-  return { purpose: sample.purpose, correct, metric };
+  return { purpose: sample.purpose, correct, metric, label_source: sample.label_source };
+}
+// When any evaluated sample carries an 'ai_reference' label (owner decision 2026-09-23), the metric
+// this checkpoint is scored against is agreement with that reference model, never "accuracy" — see
+// docs/TRAINING_DATA.md §7 and docs/plan/2026-09-23-laya-local-performance.md.
+function labelSourceSummary(records) {
+  const counts = {};
+  for (const r of records) counts[r.label_source] = (counts[r.label_source] ?? 0) + 1;
+  const metricSemantics = Object.hasOwn(counts, 'ai_reference') ? 'agreement-with-ai-reference' : 'accuracy';
+  return { evaluation_label_sources: counts, metric_semantics: metricSemantics };
 }
 async function inferAll(layaClient, laya, samples, opts) {
   const out = [];
@@ -206,9 +215,12 @@ export async function qualifyCandidate(home, { candidateHash, datasetVersion, ho
   const { samples } = readDataset(s, datasetVersion);
   const { manifest: holdoutManifest, samples: holdoutSamples } = readHoldout(home, holdoutName);
   const opts = { timeoutMs, env, signal };
-  const calibrationByPurpose = groupByPurpose(await inferAll(layaClient, laya, samples.filter(x => x.split === 'calibration'), opts));
-  const testByPurpose = groupByPurpose(await inferAll(layaClient, laya, samples.filter(x => x.split === 'test'), opts));
-  const holdoutByPurpose = groupByPurpose(await inferAll(layaClient, laya, holdoutSamples, opts));
+  const calibrationRecords = await inferAll(layaClient, laya, samples.filter(x => x.split === 'calibration'), opts);
+  const testRecords = await inferAll(layaClient, laya, samples.filter(x => x.split === 'test'), opts);
+  const holdoutRecords = await inferAll(layaClient, laya, holdoutSamples, opts);
+  const calibrationByPurpose = groupByPurpose(calibrationRecords);
+  const testByPurpose = groupByPurpose(testRecords);
+  const holdoutByPurpose = groupByPurpose(holdoutRecords);
   const evidence = {}, qualifiedPurposes = [];
   let globalThreshold = null;
   for (const purpose of PURPOSES) {
@@ -231,7 +243,8 @@ export async function qualifyCandidate(home, { candidateHash, datasetVersion, ho
   const result = { checkpoint: candidateHash, qualified: qualifiedPurposes.length > 0, purposes: qualifiedPurposes,
     minConfidence: globalThreshold ?? 1, minChoiceProbability: globalThreshold ?? 1, noulCertainty: globalThreshold ?? 1,
     calibrationVersion, dataset_version: datasetVersion, holdout: holdoutManifest.name, holdout_sha256: holdoutManifest.sha256,
-    precision: laya.precision ?? 'fp32', params, evidence, generated_at: new Date().toISOString() };
+    precision: laya.precision ?? 'fp32', params, evidence, generated_at: new Date().toISOString(),
+    ...labelSourceSummary([...calibrationRecords, ...testRecords, ...holdoutRecords]) };
   ensureDir(layaRoot(home), true); ensureDir(qualificationsDir(home), true);
   atomicWrite(path.join(qualificationsDir(home), `${candidateHash}.json`), JSON.stringify(result, null, 2) + '\n');
   return result;
@@ -267,7 +280,8 @@ export async function compareCandidate(home, { candidateHash, holdoutName, layaC
     for (const purpose of PURPOSES) purposes[purpose].active = side(activeByPurpose[purpose] || [], active.qualification, purpose);
   }
   const report = { active: active?.checkpoint ?? null, candidate: candidateHash, holdout: holdoutManifest.name,
-    holdout_sha256: holdoutManifest.sha256, purposes, generated_at: new Date().toISOString() };
+    holdout_sha256: holdoutManifest.sha256, purposes, generated_at: new Date().toISOString(),
+    ...labelSourceSummary(holdoutSamples) };
   ensureDir(layaRoot(home), true); ensureDir(comparisonsDir(home), true);
   const file = path.join(comparisonsDir(home), `${active?.checkpoint ?? 'none'}__${candidateHash}__${holdoutManifest.name}.json`);
   atomicWrite(file, JSON.stringify(report, null, 2) + '\n');

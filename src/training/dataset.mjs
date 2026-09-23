@@ -123,7 +123,10 @@ export function readDataset(store, version) {
     // verified assertion (see laya-distill.mjs / TRAINING_DATA.md §7): it may only ground TRAIN samples.
     if (s.label_source === 'teacher' && s.split !== 'train') fail('TEACHER_LABEL_IN_EVAL_SPLIT');
     if (!Number.isFinite(s.label_confidence) || s.label_confidence < EVALUATION_POLICY.minLabelConfidence || s.label_confidence > 1 ||
-        !['objective', 'human', 'mixed_independent', 'teacher'].includes(s.label_source)) fail('INVALID_CANONICAL_DATASET');
+        // 'ai_reference' (owner decision 2026-09-23, docs/TRAINING_DATA.md §7): an AI-reference-model
+        // label (e.g. Claude), recorded with the labeling model in provenance, never as 'human'; it
+        // may ground ANY split (unlike 'teacher', which is restricted to train just below).
+        !['objective', 'human', 'mixed_independent', 'teacher', 'ai_reference'].includes(s.label_source)) fail('INVALID_CANONICAL_DATASET');
     if (s.raw_refs.distill !== undefined) {
       only(s.raw_refs, ['distill'], ['distill']);
       only(s.raw_refs.distill, ['run', 'task_id'], ['run', 'task_id']);

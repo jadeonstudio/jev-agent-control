@@ -5,7 +5,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { noSymlinks, ensureDir, readText } from '../storage.mjs';
-import { ID, fail, errorCode } from '../constants.mjs';
+import { ID, fail, errorCode, ControlError } from '../constants.mjs';
 import { validateRequest, wireRequest, normalizeResponse, containsSensitiveData } from '../contracts.mjs';
 import { callTypeSafe } from '../provider.mjs';
 import { getCredential, loadConfig } from '../storage.mjs';
@@ -20,6 +20,16 @@ import { EVALUATION_POLICY } from './evaluate.mjs';
 export const FIXED_ROUTE_CONTEXT = Object.freeze({ complete: true, scope: 'local', previousFailures: 0, highImpact: false, modelLocked: false, exhaustive: false });
 export const TEACHER_LABEL_CONFIDENCE = EVALUATION_POLICY.minLabelConfidence; // trust-in-source floor for unreviewed teacher output, not the model's own probability
 const MIN_CALL_INTERVAL_MS = 1200; // <=50 calls/minute
+// Owner decision (2026-09-23, docs/plan/2026-09-23-laya-local-performance.md "평가 기준"): Claude
+// (or another reviewer-model) reference labels replace human TTY review for calibration/test/holdout
+// (role:'eval') because owner-run TTY review of English options/sentences proved unworkable. A
+// measured Jev-vs-Claude agreement gap (intent .85 / risk .68 / difficulty .38 on 300 tasks) means
+// the owner's "Laya ~= Claude" goal also needs Claude labels grounding TRAIN (role:'train'): those
+// REPLACE the Jev teacher sample for that task rather than adding to it. Never recorded as 'human'
+// or 'runner'; always 'ai_reference' with the labeling model recorded as the source. Results against
+// role:'eval' or role:'train' ai_reference labels are "Claude agreement", never "accuracy".
+const MODEL_SOURCE_RE = /^[A-Za-z0-9][A-Za-z0-9._:-]{0,63}$/;
+const REFERENCE_ROLES = ['eval', 'train'];
 
 export function validateRunName(run) { if (typeof run !== 'string' || !ID.test(run)) fail('INVALID_DISTILL_RUN'); }
 
@@ -72,6 +82,7 @@ const tasksFile = dir => path.join(dir, 'tasks.jsonl');
 const teacherFile = dir => path.join(dir, 'teacher.jsonl');
 const teacherFailuresFile = dir => path.join(dir, 'teacher-failures.jsonl');
 const reviewFile = dir => path.join(dir, 'review.jsonl');
+const referenceFile = dir => path.join(dir, 'reference.jsonl');
 
 function normalizeTaskText(s) { return s.trim().replace(/\s+/g, ' '); }
 // No dependency on locale/ICU: a same-user local heuristic, adequate for splitting an owner-authored ko/en corpus.
@@ -147,6 +158,67 @@ export function distillImportShadow(home, { run, trainingStore } = {}) {
       added++;
     }
     return { run, scannedDecisions, added, skippedSensitive, skippedDuplicate };
+  });
+}
+
+// --- import-reference (owner/AI-reference labels for eval or train grounding) ---
+// Input labels use the human-facing 1..5 difficulty scale (like `distill review`'s typed input);
+// stored/validated as the internal 0-based score value.
+function normalizeReferenceLabels(labels) {
+  only(labels, Object.keys(ROUTE_QUESTIONS), Object.keys(ROUTE_QUESTIONS));
+  const out = {};
+  for (const [qid, q] of Object.entries(ROUTE_QUESTIONS)) {
+    const raw = labels[qid];
+    let value = raw;
+    if (q.type === 'score') {
+      if (!Number.isInteger(raw) || raw < 1 || raw > q.criteria.length) fail('INVALID_DISTILL_REFERENCE_LINE');
+      value = raw - 1;
+    }
+    try { validateTarget(q, value); } catch { fail('INVALID_DISTILL_REFERENCE_LINE'); }
+    out[qid] = value;
+  }
+  return out;
+}
+export function distillImportReference(home, { run, inputFile, source, role = 'eval', readFileImpl = (f) => fs.readFileSync(f, 'utf8') } = {}) {
+  validateRunName(run);
+  if (typeof inputFile !== 'string' || !inputFile) fail('DISTILL_INPUT_REQUIRED');
+  if (typeof source !== 'string' || !MODEL_SOURCE_RE.test(source)) fail('INVALID_DISTILL_REFERENCE_SOURCE');
+  if (!REFERENCE_ROLES.includes(role)) fail('INVALID_DISTILL_REFERENCE_ROLE');
+  const dir = ensureRunDir(home, run);
+  return withRunLock(dir, () => {
+    const raw = readFileImpl(inputFile);
+    if (Buffer.byteLength(raw) > 64 * 1024 * 1024) fail('DISTILL_INPUT_TOO_LARGE');
+    const tasksById = new Map(readPrivateJsonl(tasksFile(dir)).map(t => [t.task_id, t]));
+    const file = referenceFile(dir);
+    const existing = new Set(readPrivateJsonl(file).map(l => l.task_id));
+    let total = 0, unknownCount = 0;
+    const parsedItems = [];
+    for (const line of raw.split('\n')) {
+      const trimmed = line.trim();
+      if (!trimmed) continue;
+      total++;
+      let parsed;
+      try { parsed = JSON.parse(trimmed); } catch { fail('INVALID_DISTILL_REFERENCE_LINE'); }
+      only(parsed, ['lang', 'task', 'labels'], ['lang', 'task', 'labels']);
+      if (!['ko', 'en'].includes(parsed.lang)) fail('INVALID_DISTILL_REFERENCE_LINE');
+      if (typeof parsed.task !== 'string' || !parsed.task.trim()) fail('INVALID_DISTILL_REFERENCE_LINE');
+      const labels = normalizeReferenceLabels(parsed.labels);
+      // Same task_id rule as `import`, so a reference line resolves to the exact same imported task.
+      const task_id = digest({ lang: parsed.lang, text: normalizeTaskText(parsed.task) });
+      if (!tasksById.has(task_id)) { unknownCount++; continue; }
+      parsedItems.push({ task_id, labels });
+    }
+    // Fail the whole import (nothing written) rather than silently skipping unresolved tasks, so an
+    // operator notices a typo'd/stale input file instead of quietly losing reference labels.
+    if (unknownCount > 0) { const e = new ControlError('DISTILL_REFERENCE_UNKNOWN_TASK'); e.unknownCount = unknownCount; throw e; }
+    let added = 0, skippedDuplicate = 0;
+    for (const item of parsedItems) {
+      if (existing.has(item.task_id)) { skippedDuplicate++; continue; }
+      existing.add(item.task_id);
+      appendPrivateJsonl(file, { task_id: item.task_id, labels: item.labels, source, role, at: new Date().toISOString() });
+      added++;
+    }
+    return { run, total, added, skippedDuplicate, unknown: unknownCount, source, role };
   });
 }
 
@@ -303,34 +375,47 @@ function teacherProvenance(model) {
   return { provider: 'jev', model, model_version: model, checkpoint: model, runtime_version: 'systemone-v1', preprocessing_version: 'wire-request-v1', confidence_semantics: 'reported-statistic' };
 }
 const HOST_REVIEW_PROVENANCE = Object.freeze({ provider: 'host', model: 'human-review', model_version: 'human-review', checkpoint: 'human-review', runtime_version: 'host-reviewed', preprocessing_version: 'wire-request-v1', confidence_semantics: 'none' });
+// Same provenance SHAPE for a role:'eval' or role:'train' reference label; only `model`/`model_version`/`checkpoint`
+// (the labeling model recorded at import time) differ between reference lines.
+function aiReferenceProvenance(source) {
+  return { provider: 'host', model: source, model_version: source, checkpoint: source, runtime_version: 'ai-reference', preprocessing_version: 'wire-request-v1', confidence_semantics: 'none' };
+}
 
 export function buildDistillDataset(home, { run, trainingStore } = {}) {
   validateRunName(run);
   const dir = ensureRunDir(home, run);
   const store = trainingStore ?? createTrainingStore({ home });
-  const { tasks, teacherById, reviewById } = withRunLock(dir, () => ({
+  const { tasks, teacherById, reviewById, referenceById } = withRunLock(dir, () => ({
     tasks: readPrivateJsonl(tasksFile(dir)),
     teacherById: new Map(readPrivateJsonl(teacherFile(dir)).map(l => [l.task_id, l])),
     reviewById: new Map(readPrivateJsonl(reviewFile(dir)).map(l => [l.task_id, l])),
+    referenceById: new Map(readPrivateJsonl(referenceFile(dir)).map(l => [l.task_id, l])),
   }));
   return store.lock(() => {
     const snapshot_id = digest(`distill-run:${run}`);
     const samples = [];
     // Group leak prevention: a `group` (e.g. shared by a ko/en translation pair of the same
-    // underlying task) that has ANY human-reviewed member must never also ground train via a
-    // teacher label on another member — that would leak eval content into train.
+    // underlying task) that has ANY eval-grounding member (human review OR a role:'eval' reference
+    // label) must never also ground train via a teacher/role:'train' label on another member —
+    // that would leak eval content into train.
     const reviewedGroupKeys = new Set();
-    for (const task of tasks) if (reviewById.has(task.task_id)) reviewedGroupKeys.add(task.group ?? task.task_id);
+    for (const task of tasks) {
+      if (reviewById.has(task.task_id)) reviewedGroupKeys.add(task.group ?? task.task_id);
+      const ref = referenceById.get(task.task_id);
+      if (ref && ref.role === 'eval') reviewedGroupKeys.add(task.group ?? task.task_id);
+    }
     let excludedGroupLeak = 0;
     for (const task of [...tasks].sort((a, b) => a.task_id.localeCompare(b.task_id))) {
       const teacher = teacherById.get(task.task_id);
       const reviewed = reviewById.get(task.task_id);
+      const reference = referenceById.get(task.task_id);
       const groupKey = task.group ?? task.task_id;
       // Namespaced so a `group` name can never collide with a bare task_id's own digest; kept
       // byte-identical to the pre-group formula (digest({distill_task: task_id})) when task.group
       // is unset, so ungrouped runs produce the exact same dataset_version/data as before.
       const group_id = task.group ? digest({ distill_group: groupKey }) : digest({ distill_task: task.task_id });
       let split, provenance, labelSource, labelConfidence, valueFor, probsFor;
+      // Precedence per task: human (eval) > reference eval > reference train > Jev teacher (train).
       if (reviewed) {
         // Deterministic 50/50 calibration/test on the GROUP key's hash (not the task's own id), so
         // every reviewed member of one group lands in the same split. For an ungrouped task the
@@ -340,6 +425,20 @@ export function buildDistillDataset(home, { run, trainingStore } = {}) {
         provenance = teacher ? teacherProvenance(teacher.model) : HOST_REVIEW_PROVENANCE;
         labelSource = 'human'; labelConfidence = 1;
         valueFor = qid => reviewed.labels[qid];
+        probsFor = (q, value) => targetDistribution(q, value);
+      } else if (reference && reference.role === 'eval') {
+        const splitSeed = task.group ? group_id : task.task_id;
+        split = parseInt(splitSeed.slice(0, 8), 16) % 2 === 0 ? 'calibration' : 'test';
+        provenance = aiReferenceProvenance(reference.source);
+        labelSource = 'ai_reference'; labelConfidence = 1;
+        valueFor = qid => reference.labels[qid];
+        probsFor = (q, value) => targetDistribution(q, value);
+      } else if (reference && reference.role === 'train') {
+        if (reviewedGroupKeys.has(groupKey)) { excludedGroupLeak++; continue; } // a train-role reference never grounds train when a group sibling is in eval
+        split = 'train';
+        provenance = aiReferenceProvenance(reference.source);
+        labelSource = 'ai_reference'; labelConfidence = 1;
+        valueFor = qid => reference.labels[qid];
         probsFor = (q, value) => targetDistribution(q, value);
       } else if (teacher && task.egress === 'allowed') {
         if (reviewedGroupKeys.has(groupKey)) { excludedGroupLeak++; continue; } // teacher label never grounds train when a group sibling is in eval
@@ -370,17 +469,19 @@ export function buildDistillDataset(home, { run, trainingStore } = {}) {
     const data = samples.map(encode).join('\n') + (samples.length ? '\n' : '');
     const data_sha256 = digest(data);
     const version = digest({ kind: 'distill', run, data_sha256 });
-    const counts = { split: {}, lang: {}, label_source: {}, excluded_group_leak: excludedGroupLeak };
+    const counts = { split: {}, lang: {}, label_source: {}, label_source_by_split: {}, excluded_group_leak: excludedGroupLeak };
     for (const s of samples) {
       counts.split[s.split] = (counts.split[s.split] ?? 0) + 1;
       counts.label_source[s.label_source] = (counts.label_source[s.label_source] ?? 0) + 1;
+      const bySplit = (counts.label_source_by_split[s.split] ??= {});
+      bySplit[s.label_source] = (bySplit[s.label_source] ?? 0) + 1;
     }
-    for (const task of tasks) if (teacherById.has(task.task_id) || reviewById.has(task.task_id)) counts.lang[task.lang] = (counts.lang[task.lang] ?? 0) + 1;
+    for (const task of tasks) if (teacherById.has(task.task_id) || reviewById.has(task.task_id) || referenceById.has(task.task_id)) counts.lang[task.lang] = (counts.lang[task.lang] ?? 0) + 1;
     const teacherModels = [...new Set([...teacherById.values()].map(l => l.model))];
     const manifest = { schema_version: 1, dataset_version: version, kind: 'distill', run, generated_at: new Date().toISOString(),
       sample_count: samples.length, data_sha256, evaluation_policy_version: POLICY_VERSION,
       teacher_model: teacherModels.length <= 1 ? (teacherModels[0] ?? null) : teacherModels, counts,
-      policy: 'teacher labels ground only the train split; calibration/test/holdout accept human review only; only synthetic tasks are ever sent to the remote teacher' };
+      policy: 'precedence per task: human (eval) > reference eval (ai_reference) > reference train (ai_reference, replaces teacher) > Jev teacher (train); only synthetic tasks are ever sent to the remote teacher' };
     const manifestPath = path.join(store.root, 'manifests', `${version}.json`);
     const previous = readText(manifestPath, { optional: true, privateFile: true, maxBytes: 1048576 });
     store.writeDerived(`datasets/${version}/canonical.jsonl`, data);
@@ -398,11 +499,72 @@ export function distillStatus(home, { run } = {}) {
   const teacherLines = readPrivateJsonl(teacherFile(dir));
   const failures = readPrivateJsonl(teacherFailuresFile(dir));
   const reviewLines = readPrivateJsonl(reviewFile(dir));
+  const referenceLines = readPrivateJsonl(referenceFile(dir));
   const bySourceLang = {};
   for (const t of tasks) { const k = `${t.source}:${t.lang}`; bySourceLang[k] = (bySourceLang[k] ?? 0) + 1; }
   const usage = teacherLines.reduce((acc, l) => ({ inputTokens: acc.inputTokens + (l.usage?.inputTokens ?? 0), outputTokens: acc.outputTokens + (l.usage?.outputTokens ?? 0) }), { inputTokens: 0, outputTokens: 0 });
   const groups = new Set(tasks.map(t => t.group ?? t.task_id)).size;
   const reviewable = tasks.filter(t => t.reviewable !== false).length;
+  const referenceByRole = {};
+  for (const l of referenceLines) referenceByRole[l.role] = (referenceByRole[l.role] ?? 0) + 1;
   return { run, tasks: tasks.length, tasks_by_source_lang: bySourceLang, teacher_labels: teacherLines.length,
-    teacher_label_failures: failures.length, reviewed: reviewLines.length, teacher_usage: usage, groups, reviewable };
+    teacher_label_failures: failures.length, reviewed: reviewLines.length, teacher_usage: usage, groups, reviewable,
+    reference_labels: referenceLines.length, reference_labels_by_role: referenceByRole };
+}
+
+// --- compare-teacher (numbers-only Jev teacher vs reference-label report) ---
+function teacherArgmax(teacher, qid, q) {
+  const top = argmax(teacher.answers[qid].probabilities);
+  return q.type === 'score' ? Number(top) : top;
+}
+function questionAgreementReport(pairs, q) {
+  const n = pairs.length;
+  const agreementCount = pairs.filter(p => p.teacherValue === p.referenceValue).length;
+  const confusion = {};
+  for (const p of pairs) {
+    const t = String(p.teacherValue);
+    (confusion[t] ??= {});
+    confusion[t][String(p.referenceValue)] = (confusion[t][String(p.referenceValue)] ?? 0) + 1;
+  }
+  const byLang = {};
+  for (const lang of ['ko', 'en']) {
+    const subset = pairs.filter(p => p.lang === lang);
+    const agree = subset.filter(p => p.teacherValue === p.referenceValue).length;
+    byLang[lang] = { n: subset.length, agreement_rate: subset.length ? agree / subset.length : null };
+  }
+  const report = { n, agreement: { count: agreementCount, rate: n ? agreementCount / n : null }, confusion, by_lang: byLang };
+  if (q.type === 'score') {
+    const diffs = pairs.map(p => Math.abs(Number(p.teacherValue) - Number(p.referenceValue)));
+    report.mean_absolute_difference = diffs.length ? diffs.reduce((a, b) => a + b, 0) / diffs.length : null;
+    const within1 = diffs.filter(d => d <= 1).length;
+    report.within_one = { count: within1, rate: diffs.length ? within1 / diffs.length : null };
+  }
+  return report;
+}
+/** Numbers-only Jev-teacher-vs-reference-label agreement report (never accuracy: teacher is not
+ * ground truth — see TRAINING_DATA.md §7). Reports role:'eval' and role:'train' reference lines
+ * SEPARATELY, since (per the owner's 2026-09-23 measurement) they ground different splits. */
+export function distillCompareTeacher(home, { run } = {}) {
+  validateRunName(run);
+  const dir = runDir(home, run);
+  const tasksById = new Map(readPrivateJsonl(tasksFile(dir)).map(t => [t.task_id, t]));
+  const teacherById = new Map(readPrivateJsonl(teacherFile(dir)).map(l => [l.task_id, l]));
+  const referenceLines = readPrivateJsonl(referenceFile(dir));
+  const bySection = { eval_reference: [], train_reference: [] };
+  for (const r of referenceLines) {
+    const teacher = teacherById.get(r.task_id), task = tasksById.get(r.task_id);
+    if (!teacher || !task) continue; // only tasks with BOTH a teacher label and a reference label are comparable
+    const key = r.role === 'train' ? 'train_reference' : 'eval_reference';
+    bySection[key].push({ lang: task.lang, teacher, reference: r });
+  }
+  const report = { run };
+  for (const [key, items] of Object.entries(bySection)) {
+    const questions = {};
+    for (const [qid, q] of Object.entries(ROUTE_QUESTIONS)) {
+      const pairs = items.map(it => ({ lang: it.lang, teacherValue: teacherArgmax(it.teacher, qid, q), referenceValue: it.reference.labels[qid] }));
+      questions[qid] = questionAgreementReport(pairs, q);
+    }
+    report[key] = { compared: items.length, questions };
+  }
+  return report;
 }
