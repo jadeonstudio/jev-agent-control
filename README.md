@@ -23,6 +23,9 @@ node examples/classifier-design.mjs
 node examples/training-pipeline.mjs
 node bin/jev-control.mjs install --target both --dry-run
 node bin/jev-control.mjs install --target both
+# 선택: 소유 host hook + 짧은 관리 지침 블록까지 설치할 때만 (dry-run diff를 먼저 검토)
+node bin/jev-control.mjs install --target both --hooks --dry-run
+node bin/jev-control.mjs install --target both --hooks
 node bin/jev-control.mjs doctor
 ```
 
@@ -57,7 +60,9 @@ provider=laya → 공식 Python 상주 worker
 | `jev_observe` | 라우터/필터 SHADOW 비교. 일치율은 정확도가 아님 |
 | `jev_record` | 수집이 켜져 있을 때 최소 host baseline/outcome 기록. MCP outcome은 weak host_review |
 
-하위 호환을 위해 `jev_*` 이름을 유지합니다. **MCP 설치만으로 메인 모델이나 내부 reasoning이 자동 교체되지 않습니다.** 명시적 도구 호출 또는 직접 소유한 dispatcher가 필요합니다. `decideOrDelegate()` / `routeOrDelegate()`는 채택 시 baseline 판단 함수를 건너뛰지만 실제 모델 실행·권한·검증은 호스트가 담당합니다.
+하위 호환을 위해 `jev_*` 이름을 유지합니다. **MCP 설치만으로 메인 모델이나 내부 reasoning이 자동 교체되지 않습니다.** 명시적 도구 호출, 직접 소유한 dispatcher, 또는 아래 `install --hooks`로 설치한 소유 host hook이 필요합니다. `decideOrDelegate()` / `routeOrDelegate()`는 채택 시 baseline 판단 함수를 건너뛰지만 실제 모델 실행·권한·검증은 호스트가 담당합니다.
+
+`install --hooks`는 Codex `spawn_agent`/Claude `Agent` spawn 호출 앞뒤에 `jev-control hook`을 붙이고, 두 호스트의 전역 지침 파일(Claude `~/.claude/CLAUDE.md`, Codex `~/.codex/AGENTS.md` — user 범위만)에 짧은 관리 블록을 추가합니다. `--hooks` 없이 install/uninstall하면 hook·블록은 그대로 두고, `uninstall --hooks-only`는 hook과 블록만 제거합니다(MCP·스킬·shim·mode는 그대로). router가 ON이고 provider가 `jev`이면, hook이 route를 조회할 때마다 spawn description과 프롬프트 앞부분(최대 8000바이트)이 TypeSafe로 전송됩니다. Codex는 새 hook을 실행하기 전 사용자가 `/hooks`에서 직접 승인해야 하며, 설치기는 그 승인 상태(`hooks.state`)를 절대 쓰거나 읽어 우회하지 않습니다.
 
 ## Provider와 키
 
@@ -139,6 +144,9 @@ jev-control compare --live < sanitized-comparison.json
 jev-control metrics --days 7
 jev-control uninstall --target both --dry-run
 jev-control uninstall --target both
+# hook·지침 블록만 되돌릴 때 (MCP·스킬·shim·mode는 유지):
+jev-control uninstall --target both --hooks-only --dry-run
+jev-control uninstall --target both --hooks-only
 ```
 
 CI는 macOS/Linux × Node22/24에서 오프라인 JavaScript·Python 경계 테스트와 synthetic demos를 실행합니다. **실제 TypeSafe 계정, Laya 가중치/MPS, Codex/Claude native 세션, downstream 품질·사용량 절감, 실제 fine-tuning은 별도 검증 대상**입니다. 일치율이나 단가 환산만으로 품질·절감을 주장하지 않습니다.

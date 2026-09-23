@@ -7,7 +7,7 @@ import { resolveHome, setMode, getCredential, saveCredential, removeCredential, 
 import { createDecisionEngine } from './engine.mjs';
 import { createControlLayer } from './control-layer.mjs';
 import { startMcp } from './mcp.mjs';
-import { installationPlan, applyInstallation } from './installer.mjs';
+import { installationPlan, applyInstallation, describeHookStatus } from './installer.mjs';
 import { readMetrics } from './metrics.mjs';
 
 export const SMOKE_REQUEST = { purpose: 'route', risk: 'routine', state: { change: 'Documentation typo fix only; no executable code changed.', tests: { exitCode: 0 } }, questions: {
@@ -59,6 +59,7 @@ export async function main(argv = process.argv.slice(2), env = process.env) {
   const { values, positionals } = parseArgs({ args: argv, allowPositionals: true, strict: true, options: {
     home: { type: 'string' }, target: { type: 'string' }, scope: { type: 'string' }, project: { type: 'string' },
     'dry-run': { type: 'boolean' }, live: { type: 'boolean' }, days: { type: 'string' }, help: { type: 'boolean' },
+    hooks: { type: 'boolean' }, 'hooks-only': { type: 'boolean' },
   } });
   const [command = 'help', subcommand] = positionals;
   if (positionals.length > (command === 'key' ? 2 : 1)) fail('UNEXPECTED_ARGUMENTS');
@@ -66,12 +67,13 @@ export async function main(argv = process.argv.slice(2), env = process.env) {
   const engine = createDecisionEngine({ home, env });
   try {
   if (values.help || command === 'help') {
-    process.stdout.write(`jev-control ${VERSION}\n\nCommands:\n  install|uninstall [--target both|codex|claude] [--scope user|project] [--project PATH] [--dry-run]\n  off|shadow|on       Shared switch, reread on every decision\n  status|doctor      Offline diagnostics; never prints a key\n  key set|remove     Run set yourself in an interactive terminal\n  smoke [--live]     Offline by default; live needs a key and active mode\n  decide             Read one JSON request from stdin\n  metrics [--days 7] Local metadata, not inferred savings\n  hook --host codex|claude --event pre-spawn|post-spawn|subagent-start|subagent-stop\n                      Fail-open host hook executor; reads one hook JSON from stdin, never denies\n  mcp                Local stdio server\n\nGlobal: --home ABSOLUTE_PATH. No command accepts a key as an argument.\n`); return;
+    process.stdout.write(`jev-control ${VERSION}\n\nCommands:\n  install|uninstall [--target both|codex|claude] [--scope user|project] [--project PATH] [--dry-run]\n    install --hooks          Also install owned host hooks and the short managed instruction block\n    uninstall --hooks-only   Remove only owned host hooks and the instruction block (MCP/skills/shim/mode unchanged)\n  off|shadow|on       Shared switch, reread on every decision\n  status|doctor      Offline diagnostics; never prints a key\n  key set|remove     Run set yourself in an interactive terminal\n  smoke [--live]     Offline by default; live needs a key and active mode\n  decide             Read one JSON request from stdin\n  metrics [--days 7] Local metadata, not inferred savings\n  hook --host codex|claude --event pre-spawn|post-spawn|subagent-start|subagent-stop\n                      Fail-open host hook executor; reads one hook JSON from stdin, never denies\n  mcp                Local stdio server\n\nGlobal: --home ABSOLUTE_PATH. No command accepts a key as an argument.\n`); return;
   }
-  const allowed = { install: ['target', 'scope', 'project', 'dry-run'], uninstall: ['target', 'scope', 'project', 'dry-run'], smoke: ['live'], metrics: ['days'] };
+  const allowed = { install: ['target', 'scope', 'project', 'dry-run', 'hooks'], uninstall: ['target', 'scope', 'project', 'dry-run', 'hooks-only'], smoke: ['live'], metrics: ['days'] };
   if (Object.keys(values).some(k => k !== 'home' && !(allowed[command] || []).includes(k))) fail('UNEXPECTED_OPTION');
   if (command === 'install' || command === 'uninstall') {
-    const plan = installationPlan({ home, env, target: values.target || 'both', scope: values.scope || 'user', project: values.project || process.cwd(), remove: command === 'uninstall' });
+    const plan = installationPlan({ home, env, target: values.target || 'both', scope: values.scope || 'user', project: values.project || process.cwd(),
+      remove: command === 'uninstall', hooks: Boolean(values.hooks), hooksOnly: Boolean(values['hooks-only']) });
     output(applyInstallation(plan, { dryRun: values['dry-run'] })); return;
   }
   if (['off', 'shadow', 'on'].includes(command)) {
@@ -84,7 +86,8 @@ export async function main(argv = process.argv.slice(2), env = process.env) {
     const clients = { codex: executableFound('codex', env), claude: executableFound('claude', env) };
     const routerWarnings = createControlLayer({ home, env, engine }).status().features.router.warnings ?? [];
     output({ ...status, node: process.versions.node, platform: process.platform, clients,
-      checksPerformed: ['local-config', 'credential-readiness', 'client-path'], checksNotPerformed: ['native-client-e2e', 'live-api'],
+      hooks: describeHookStatus({ home, env }),
+      checksPerformed: ['local-config', 'credential-readiness', 'client-path'], checksNotPerformed: ['native-client-e2e', 'live-api', 'native-hook-execution'],
       warnings: [status.credential === 'missing' ? 'Configure a key locally before shadow/on.' : null,
         !clients.codex && !clients.claude ? 'No host CLI found in PATH; MCP config can still be prepared.' : null,
         env.JEV_DISABLE === '1' ? 'JEV_DISABLE=1 overrides persistent mode. Restart inherited processes after changing environment.' : null,
