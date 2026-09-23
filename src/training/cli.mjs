@@ -10,9 +10,11 @@ import { allowRunner, removeRunner, listRunners, verifyRunner } from './runner.m
 import { correctDecision } from './correct.mjs';
 import { selectProvider } from '../inference.mjs';
 import { createDecisionEngine } from '../engine.mjs';
+import { registerCheckpoint, freezeHoldout, listHoldouts, qualifyCandidate, compareCandidate,
+  promoteCandidate, rollbackLaya, layaStatus } from './laya-lifecycle.mjs';
 
-export const TRAINING_COMMANDS = ['training', 'dataset', 'provider', 'compare', 'runner'];
-export const TRAINING_HELP = `\nProvider and offline dataset commands:\n  provider status|jev|laya       Select an explicitly configured provider; no download\n  training capture status|on|off  Content capture is OFF by default and separate from telemetry\n  training min-labels [N]        Minimum strong labels per purpose for dataset build; changing it requires a TTY\n  training outcome|host          Read minimal evidence/baseline JSON from stdin; outcome is always weak host_review\n  training correct --decision ID Interactive TTY-only human correction; never accepted from a pipe\n  training evaluate              Append derived evaluations without changing raw evidence\n  runner allow --name N --timeout-ms MS [--cwd DIR] [--purpose P --question Q --pass-label V --fail-label V] [--replace] -- ARGV...\n                                  TTY-only pre-registration; an agent later selects only the name\n  runner list|remove --name N    Show or remove a registered pre-approved check\n  runner verify --decision ID --check N  Run the pre-registered check and record its own source:'runner' outcome\n  dataset stats|validate|build [--allow-small]\n  dataset export --version HASH [--format laya|canonical]\n  compare --live                 Explicitly authorize Jev/Laya comparison; only one active arm\nNo command trains, promotes a model, reads keys into output, or uploads a dataset.\n`;
+export const TRAINING_COMMANDS = ['training', 'dataset', 'provider', 'compare', 'runner', 'laya'];
+export const TRAINING_HELP = `\nProvider and offline dataset commands:\n  provider status|jev|laya       Select an explicitly configured provider; no download\n  training capture status|on|off  Content capture is OFF by default and separate from telemetry\n  training min-labels [N]        Minimum strong labels per purpose for dataset build; changing it requires a TTY\n  training outcome|host          Read minimal evidence/baseline JSON from stdin; outcome is always weak host_review\n  training correct --decision ID Interactive TTY-only human correction; never accepted from a pipe\n  training evaluate              Append derived evaluations without changing raw evidence\n  runner allow --name N --timeout-ms MS [--cwd DIR] [--purpose P --question Q --pass-label V --fail-label V] [--replace] -- ARGV...\n                                  TTY-only pre-registration; an agent later selects only the name\n  runner list|remove --name N    Show or remove a registered pre-approved check\n  runner verify --decision ID --check N  Run the pre-registered check and record its own source:'runner' outcome\n  dataset stats|validate|build [--allow-small]\n  dataset export --version HASH [--format laya|canonical]\n  compare --live                 Explicitly authorize Jev/Laya comparison; only one active arm\n  laya register --checkpoint DIR [--model NAME] [--device cpu|mps|cuda]  Copy and fingerprint a prepared local checkpoint\n  laya holdout freeze --dataset HASH [--name ID]  Freeze the dataset's test split as an immutable regression holdout\n  laya holdout list              List holdout metadata only (no sample content)\n  laya qualify --candidate HASH --dataset HASH --holdout ID [--target-accuracy N] [--min-coverage N] [--min-calibration N] [--min-test N] [--min-lower-bound N]\n                                  Calibrate a conservative acceptance threshold and check it on test+holdout\n  laya compare --candidate HASH --holdout ID [--no-active-baseline]  Shadow-compare the candidate against the active checkpoint\n  laya promote --candidate HASH --holdout ID [--max-regression N]  Explicit operator promotion; requires qualification + non-regressing comparison\n  laya rollback                  Restore the laya block active immediately before the last promote/rollback\n  laya status                    Active checkpoint, candidates, qualification state, holdout metadata\nNo command trains, promotes a model, reads keys into output, or uploads a dataset.\n`;
 const output = x => process.stdout.write(JSON.stringify(x, null, 2) + '\n');
 async function stdin() {
   if (process.stdin.isTTY) fail('PIPE_JSON_TO_STDIN');
@@ -29,13 +31,13 @@ function splitDoubleDash(argv) {
   const at = argv.indexOf('--');
   return at === -1 ? { head: argv, rest: null } : { head: argv.slice(0, at), rest: argv.slice(at + 1) };
 }
-function parseFlags(head, allowed) {
+function parseFlags(head, allowed, boolFlags = ['replace']) {
   const out = {};
   for (let i = 0; i < head.length; i++) {
     const token = head[i];
     if (!token.startsWith('--')) fail('INVALID_RUNNER_ARGS');
     const name = token.slice(2);
-    if (name === 'replace') { out.replace = true; continue; }
+    if (boolFlags.includes(name)) { out[name] = true; continue; }
     if (!allowed.includes(name)) fail('UNEXPECTED_OPTION');
     const value = head[++i];
     if (value === undefined) fail('INVALID_RUNNER_ARGS');
@@ -89,8 +91,56 @@ async function runnerMain(argv, env) {
   }
   fail('INVALID_TRAINING_COMMAND');
 }
+function layaHome(flags, env) { return resolveHome({ ...env, ...(flags.home ? { JEV_HOME: flags.home } : {}) }); }
+async function layaMain(argv, env) {
+  const sub = argv[0];
+  if (sub === 'register') {
+    const flags = parseFlags(argv.slice(1), ['home', 'checkpoint', 'model', 'device'], []);
+    if (!flags.checkpoint) fail('LAYA_CHECKPOINT_PATH_REQUIRED');
+    output(registerCheckpoint(layaHome(flags, env), { checkpointDir: flags.checkpoint, model: flags.model, device: flags.device })); return;
+  }
+  if (sub === 'holdout') {
+    const action = argv[1];
+    if (action === 'freeze') {
+      const flags = parseFlags(argv.slice(2), ['home', 'dataset', 'name'], []);
+      if (!flags.dataset) fail('DATASET_VERSION_REQUIRED');
+      output(freezeHoldout(layaHome(flags, env), { datasetVersion: flags.dataset, name: flags.name })); return;
+    }
+    if (action === 'list') { const flags = parseFlags(argv.slice(2), ['home'], []); output(listHoldouts(layaHome(flags, env))); return; }
+    fail('INVALID_TRAINING_COMMAND');
+  }
+  if (sub === 'qualify') {
+    const flags = parseFlags(argv.slice(1),
+      ['home', 'candidate', 'dataset', 'holdout', 'target-accuracy', 'min-coverage', 'min-calibration', 'min-test', 'min-lower-bound'], []);
+    if (!flags.candidate || !flags.dataset || !flags.holdout) fail('LAYA_QUALIFY_ARGS_REQUIRED');
+    const opts = { candidateHash: flags.candidate, datasetVersion: flags.dataset, holdoutName: flags.holdout };
+    if (flags['target-accuracy'] !== undefined) opts.targetAccuracy = Number(flags['target-accuracy']);
+    if (flags['min-coverage'] !== undefined) opts.minCoverage = Number(flags['min-coverage']);
+    if (flags['min-calibration'] !== undefined) opts.minCalibration = Number(flags['min-calibration']);
+    if (flags['min-test'] !== undefined) opts.minTest = Number(flags['min-test']);
+    if (flags['min-lower-bound'] !== undefined) opts.minLowerBound = Number(flags['min-lower-bound']);
+    output(await qualifyCandidate(layaHome(flags, env), opts)); return;
+  }
+  if (sub === 'compare') {
+    const flags = parseFlags(argv.slice(1), ['home', 'candidate', 'holdout'], ['no-active-baseline']);
+    if (!flags.candidate || !flags.holdout) fail('LAYA_COMPARE_ARGS_REQUIRED');
+    output(await compareCandidate(layaHome(flags, env), { candidateHash: flags.candidate, holdoutName: flags.holdout,
+      noActiveBaseline: Boolean(flags['no-active-baseline']) })); return;
+  }
+  if (sub === 'promote') {
+    const flags = parseFlags(argv.slice(1), ['home', 'candidate', 'holdout', 'max-regression'], []);
+    if (!flags.candidate || !flags.holdout) fail('LAYA_PROMOTE_ARGS_REQUIRED');
+    const opts = { candidateHash: flags.candidate, holdoutName: flags.holdout };
+    if (flags['max-regression'] !== undefined) opts.maxRegression = Number(flags['max-regression']);
+    output(promoteCandidate(layaHome(flags, env), opts)); return;
+  }
+  if (sub === 'rollback') { const flags = parseFlags(argv.slice(1), ['home'], []); output(rollbackLaya(layaHome(flags, env))); return; }
+  if (sub === 'status') { const flags = parseFlags(argv.slice(1), ['home'], []); output(layaStatus(layaHome(flags, env))); return; }
+  fail('INVALID_TRAINING_COMMAND');
+}
 export async function trainingMain(argv, env = process.env) {
   if (argv[0] === 'runner') { await runnerMain(argv.slice(1), env); return; }
+  if (argv[0] === 'laya') { await layaMain(argv.slice(1), env); return; }
   const { values, positionals } = parseArgs({ args: argv, allowPositionals: true, strict: true, options: {
     home: { type: 'string' }, version: { type: 'string' }, format: { type: 'string' }, live: { type: 'boolean' }, help: { type: 'boolean' },
     decision: { type: 'string' }, 'allow-small': { type: 'boolean' },

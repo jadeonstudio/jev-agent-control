@@ -4,7 +4,7 @@ Codex / Claude Code가 같은 **선택적 판단 제어 계층**을 사용하는
 
 **Node.js 22+ · macOS/Linux/WSL · Node 런타임 의존 패키지 0개 · 추론 기본 OFF · Training Capture 기본 OFF**
 
-Jev 전용 사용에는 Python이 필요하지 않습니다. Laya는 별도로 준비한 공식 Python 런타임과 로컬 모델이 필요합니다. classifier.dev 서비스·SDK·프록시를 호출하지 않습니다. 온라인 학습, 자동 provider cascade, 자동 모델 다운로드·업데이트·promotion은 없습니다.
+Jev 전용 사용에는 Python이 필요하지 않습니다. Laya는 별도로 준비한 공식 Python 런타임과 로컬 모델이 필요합니다. classifier.dev 서비스·SDK·프록시를 호출하지 않습니다. 온라인 학습, 자동 provider cascade, 자동 모델 다운로드·업데이트는 없습니다. Laya checkpoint 교체는 오직 명시적인 `jev-control laya qualify`/`compare`/`promote` 호출로만 일어나며, 학습 실행 코드 자체는 이 저장소에 없습니다(별도 `training/laya-kit/`).
 
 > 설치를 요청받은 에이전트는 [AGENTS.md](AGENTS.md)를 먼저 읽으세요. 기존 branch·미커밋 변경·설정을 보존하고, 키를 채팅으로 요청하거나 출력하지 않습니다. URL만으로 권한 없는 다른 컴퓨터에 설치되는 구조는 아닙니다.
 
@@ -48,6 +48,8 @@ provider=laya → 공식 Python 상주 worker
 명시적 수집 동의가 있으면 최소 Decision 저장
                 ↓
 별도 Outcome → Evaluation → Dataset → Laya export
+                ↓
+(별도 키트로 오프라인 학습) → laya register → holdout freeze → qualify → compare → promote → rollback
 ```
 
 | MCP 도구 | 역할 |
@@ -125,7 +127,22 @@ capture OFF이면 content-bearing training data를 새로 쓰지 않습니다. O
 
 민감한 원문·키·환경 전체·저장소 전체·대화 전체를 저장하지 않습니다. Operational telemetry는 별도로 계속 content-free입니다. 패턴 검사는 완전한 DLP가 아니므로 호출자가 최소화·비식별화해야 하며 export 전 사람이 재검토해야 합니다.
 
-내부 canonical dataset과 공식 Laya의 `state / questions / gold` JSON-string export는 분리돼 있습니다. 모델·정책·데이터셋 버전, 원본 참조, 필터 규칙, 목적별/제공자별 분포, 중복 제거 및 task 단위 train/calibration/test 분리를 기록합니다. 학습 실행·업로드·모델 promotion은 하지 않습니다.
+내부 canonical dataset과 공식 Laya의 `state / questions / gold` JSON-string export는 분리돼 있습니다. 모델·정책·데이터셋 버전, 원본 참조, 필터 규칙, 목적별/제공자별 분포, 중복 제거 및 task 단위 train/calibration/test 분리를 기록합니다. 이 저장소는 학습 실행이나 업로드를 하지 않으며, export 이후의 실제 fine-tuning은 별도 `training/laya-kit/`으로 분리돼 있습니다.
+
+### Laya checkpoint 수명주기 (명시적 operator 호출만)
+
+```sh
+jev-control laya register --checkpoint /absolute/prepared-checkpoint --model laya/my-checkpoint --device mps
+jev-control laya holdout freeze --dataset <dataset-hash> --name shared-v1
+jev-control laya holdout list
+jev-control laya qualify --candidate <checkpoint-hash> --dataset <dataset-hash> --holdout shared-v1
+jev-control laya compare --candidate <checkpoint-hash> --holdout shared-v1
+jev-control laya promote --candidate <checkpoint-hash> --holdout shared-v1
+jev-control laya rollback
+jev-control laya status
+```
+
+`register`는 준비된 로컬 checkpoint를 fingerprint(오프라인, `workers/laya_worker.py --fingerprint`)하고 `JEV_HOME/laya/checkpoints/`로 복사할 뿐 `providers.json`은 바꾸지 않습니다. `holdout freeze`는 데이터셋의 test split을 불변 회귀 holdout으로 고정합니다(모든 checkpoint 버전이 같은 holdout을 공유). `qualify`는 calibration split에서 purpose별 보수적 임계값을 찾고 test+holdout에서 Wilson 하한까지 확인해 자격 여부를 기록합니다. `compare`는 후보와 현재 활성 checkpoint를 같은 holdout으로 비교합니다. `promote`는 자격·비교 보고·무회귀 조건을 모두 만족할 때만 `providers.json`의 laya 블록을 원자적으로 교체하고(`provider` 선택은 바꾸지 않음) 직전 블록을 `JEV_HOME/laya/history.jsonl`에 남깁니다. `rollback`은 그 직전 블록으로 되돌립니다. 무엇도 학습을 시작하거나 promote를 자동 호출하지 않습니다.
 
 구체적인 schema·outcome 예제·보안·공식 notebook 근거: **[TRAINING_DATA.md](docs/TRAINING_DATA.md)**. 키/모델 없이 전체 흐름을 확인하려면 `node examples/training-pipeline.mjs`를 실행하세요. 이 예제는 synthetic inference와 무해한 실제 assertion이며 모델 정확도 실험이 아닙니다.
 

@@ -132,7 +132,10 @@ owner가 개정을 승인했다. P0 커밋에서 `AGENTS.md`를 개정했다: �
 - metrics: 추천 분포, 위임 사유 분포, 추천-실제 불일치, 강한/약한 라벨 수, 호출당 지연·비용 실측.
 - ON 전환 기준 사전 등록(최소 표본, 추천 추종 시 실패율 비악화, 에스컬레이션 비증가). 전환은 owner 승인.
 
-### P5. Laya 성장 루프 (G3) — 미착수
+### P5. Laya 성장 루프 (G3) — 국소 검증됨(합성 checkpoint·가짜 worker), 실제 가중치·학습 미실행
+- P5b 학습 키트(63915a6): `training/laya-kit/`(공식 notebook 42626c3 기반, export 입력, 검사 스크립트, NOTICE, 한국어 가이드). 공식 notebook 근거로 학습 루프는 약 4–6분(지시서의 4–6시간은 오류). 패키지 버전 일부·전체 소요·Kaggle 할당·MPS 가능성은 UNKNOWN. MPS spike는 수행하지 않았다.
+- P5a 수명주기: `jev-control laya register|holdout freeze|list|qualify|compare|promote|rollback|status`. 메인 검토에서 네 결함을 고쳤다. ① rollback을 연속 호출하면 되돌린 checkpoint가 게이트 없이 재적용됨 → promote 스택 방식 + `ROLLBACK_STATE_MISMATCH`. ② qualify와 compare의 holdout 불일치 허용 → `QUALIFICATION_HOLDOUT_MISMATCH`. ③ 자격 없는 활성과 서로 다른 임계값의 coverage를 비교하고 raw 망각 검사가 없음 → raw/selective 분리. ④ promote가 쓰는 calibrationVersion(144자)이 로더 80자 제한을 넘어 승격 즉시 providers.json이 무효가 되고, 검증 복제본과 오류 삼킴 때문에 드러나지 않음 → `validateProviderConfig` 공유, 오류 전파. 워커는 테스트를 구현 뒤에 작성했다고 보고했으며, 위 결함은 메인이 RED를 먼저 확인하고 고쳤다. 테스트 312/312.
+- 트리거: `TRAINING_CANDIDATE_READY`(P4, a0b2162)는 알림만 한다.
 - `training/laya-kit/`: export 파일로 학습하도록 고친 공식 notebook 스크립트, Kaggle T4×2 가이드, 버전·해시 고정. 클라우드 실행은 owner 승인.
 - (선택) MPS 단일 장치 spike go/no-go.
 - `laya register` / `laya qualify` / `laya promote` / `laya rollback`.

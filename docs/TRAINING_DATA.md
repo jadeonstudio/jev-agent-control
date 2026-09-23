@@ -157,6 +157,32 @@ Laya export는 [공식 학습 노트북](https://github.com/NandhaKishorM/laya/b
 
 Exporter는 canonical 형식과 분리돼 있으며, 학습 실행 코드는 없다. 공식 notebook을 실행할 때 기본 공개 dataset loader 대신 export 파일을 명시적으로 로드하고, tokenizer admission을 다시 확인해야 한다. calibration/test 파일을 train에 합치면 안 된다. 공식 runtime/모델은 Apache-2.0이며 독립 export 코드의 MIT와 별도로 upstream LICENSE/NOTICE 및 수집 데이터·teacher output 이용 권리를 검토한다.
 
+## 6. Laya checkpoint 수명주기 (`src/training/laya-lifecycle.mjs`, `jev-control laya ...`)
+
+이 저장소는 학습 실행 코드를 갖지 않는다. 오프라인 fine-tuning은 `training/laya-kit/`의 별도 키트로 수행하고, 그 결과물(로컬에 준비된 checkpoint 폴더)을 아래 경로로 넘긴다. 모든 단계는 operator가 CLI로 직접 호출해야 하며 자동 학습·자동 승격은 없다.
+
+```text
+(별도 laya-kit 오프라인 학습) → laya register → laya holdout freeze → laya qualify → laya compare → laya promote → laya rollback
+```
+
+산출물은 모두 `JEV_HOME/laya/` 아래(디렉터리 0700 / 파일 0600, symlink·bare-Git 경로 거부)에 있으며 `providers.json`과 분리돼 있다:
+
+```text
+$JEV_HOME/laya/checkpoints/<fingerprint>/         # register가 복사한 관리 대상 checkpoint 사본
+$JEV_HOME/laya/candidates/<fingerprint>.json      # {python, modelPath, model, checkpoint, runtimeVersion, device}
+$JEV_HOME/laya/holdouts/<name>.jsonl               # 고정 회귀 holdout 샘플(불변, 재생성 거부)
+$JEV_HOME/laya/holdouts/<name>.json                # holdout manifest(dataset_version, sample_count, sha256)
+$JEV_HOME/laya/qualifications/<fingerprint>.json  # 제안 qualification + calibration/test/holdout 근거(카운트·지표만, 원문 state 없음)
+$JEV_HOME/laya/comparisons/<active>__<candidate>__<holdout>.json  # 활성 checkpoint 대비 shadow 비교 보고
+$JEV_HOME/laya/history.jsonl                       # promote/rollback이 있을 때마다 이전 laya 블록을 남기는 append-only 로그
+```
+
+`register`는 절대 경로 checkpoint 디렉터리를 symlink 없이 검증하고, `python -I workers/laya_worker.py --fingerprint <dir>`(오프라인, 파일 해시만, 추론 없음)로 지문을 계산한 뒤 관리 폴더로 복사한다. 이미 같은 fingerprint의 사본이 있으면 재계산해 일치를 확인하고 재사용한다. `providers.json`은 건드리지 않는다.
+
+`qualify`는 데이터셋의 calibration split에서 purpose별로 격자(0.50–0.99, 0.01 단위)를 탐색해 selective accuracy와 coverage 기준을 만족하는 가장 낮은 임계값을 찾는다. choice 질문은 confidence와 selected probability를 모두, noul 질문은 `max(p, 1-p)`(certainty)를, score 질문은 confidence를 그 임계값과 비교한다. qualification 스키마는 전역 임계값 하나(`minConfidence`/`minChoiceProbability`/`noulCertainty`)만 갖고 있으므로, 자격을 통과한 purpose들의 임계값 중 최댓값(가장 보수적인 값)을 세 필드 모두에 동일하게 적용한다. 자격 여부는 test split과 고정 holdout 모두에서 표본 수(`minTest`)·selective accuracy(`targetAccuracy`)·Wilson 95% 신뢰구간 하한(`minLowerBound`)을 만족해야 확정된다.
+
+`compare`는 후보와 현재 `providers.json`의 활성 laya checkpoint(없으면 `--no-active-baseline` 명시 필요)를 같은 고정 holdout으로 각각 추론해 purpose별로 두 값을 기록한다. `raw`는 임계값 없이 모든 답을 채점한 정확도이고, `selective`는 그 checkpoint가 자격을 받은 purpose에서만 자기 임계값으로 채점한 정확도·coverage다. `promote`는 다음을 모두 만족할 때만 `providers.json`의 laya 블록을 원자적으로 교체한다: 후보 qualification이 `qualified:true`이고 비교와 **같은 holdout**으로 만들어졌을 것(`QUALIFICATION_HOLDOUT_MISMATCH`), 같은 holdout의 비교 보고가 현재 활성 checkpoint 기준으로 존재할 것, 자격 purpose마다 후보의 `raw` 정확도가 활성보다 `maxRegression`(기본 0.02) 넘게 나쁘지 않을 것(망각 검사), 활성도 그 purpose 자격이 있으면 `selective` 정확도·coverage도 같은 허용치 안일 것. 자격 없는 활성(예: 첫 fine-tune 전 base)과는 서로 다른 임계값의 coverage를 비교하지 않는다. 쓰기 전에 결과 설정을 런타임 로더와 같은 `validateProviderConfig`로 검증한다. `provider`(jev/laya) 선택 자체는 바꾸지 않는다. 조건을 하나라도 어기면 `PROMOTION_REFUSED`와 위반 목록을 반환하고 아무것도 쓰지 않는다. `rollback`은 promote를 스택처럼 하나씩 되돌린다. 이미 되돌린 checkpoint를 다시 적용하지 않으므로 rollback이 게이트 없는 재승격이 되지 않는다. 현재 `providers.json`의 checkpoint가 마지막 promote가 설치한 것과 다르면 `ROLLBACK_STATE_MISMATCH`로 거부하고, 되돌릴 promote가 없으면 거부한다.
+
 ## 검증 후에만 다음 단계
 
 Jev 실API, 실제 공식 Laya 가중치/MPS, Codex/Claude native 세션과 대표 한국어 업무의 품질·calibration은 offline fixture 테스트와 다르다. 별도로 실제 runtime smoke → blind shadow → 격리 paired downstream 실행 → 검증된 좁은 purpose만 ON 순서로 검증한다. 학습은 충분한 검증 라벨이 쌓인 뒤 offline training → holdout 평가 → shadow → 명시적 promotion으로 수행하며 이 저장소가 자동으로 시작하지 않는다.

@@ -11,7 +11,10 @@ import { only, text, HASH, digest, fraction } from './training/schema.mjs';
 
 export function loadProviderConfig(home) {
   const source = readText(path.join(home, 'providers.json'), { optional: true, privateFile: true, maxBytes: 8192 });
-  const c = source === null ? { version: 1, provider: 'jev', laya: null } : JSON.parse(source);
+  return validateProviderConfig(source === null ? { version: 1, provider: 'jev', laya: null } : JSON.parse(source));
+}
+/** The single providers.json contract; the Laya lifecycle validates what it writes with this same function. */
+export function validateProviderConfig(c) {
   only(c, ['version', 'provider', 'laya'], ['version', 'provider']);
   if (c.version !== 1 || !['jev', 'laya'].includes(c.provider)) fail('INVALID_PROVIDER_CONFIG');
   c.laya ??= null;
