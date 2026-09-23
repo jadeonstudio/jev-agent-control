@@ -97,15 +97,18 @@ function hookFileFor(host, scope, userHome, projectRoot, env) {
 function blockFileFor(host, userHome, env) {
   return host === 'codex' ? path.join(env.CODEX_HOME || path.join(userHome, '.codex'), 'AGENTS.md') : path.join(userHome, '.claude', 'CLAUDE.md');
 }
-/** Best-effort, non-parsing check for a Codex `[hooks.state]` trust entry naming our hooks.json path. No TOML parser exists here (see AGENTS.md/SECURITY.md: zero runtime deps), so this never reports content, only presence. */
-export function codexTrustStatus(configText, hooksFile) {
-  if (!configText) return 'trust-entry-absent';
-  const idx = configText.indexOf('[hooks.state]');
-  if (idx === -1) return 'trust-entry-absent';
-  const nextHeader = configText.indexOf('\n[', idx + 1);
-  const section = configText.slice(idx, nextHeader === -1 ? undefined : nextHeader);
-  return section.includes(hooksFile) ? 'trust-entry-present-unverified' : 'trust-entry-absent';
+/** Best-effort, non-parsing check for Codex trust entries. Codex writes one `[hooks.state."<hooks.json>:<event>:<group>:<handler>"]`
+ * table per trusted handler; only the header lines naming OUR groups' positions are matched. Values are never read or verified
+ * (the hash scheme is unofficial) and no TOML parser exists here (zero runtime deps). */
+export function codexTrustStatus(configText, hooksFile, ownedKeys = []) {
+  if (!configText || !ownedKeys.length) return 'trust-entry-absent';
+  const headers = new Set();
+  for (const m of configText.matchAll(/^\[hooks\.state\."([^"\n]+)"\]\s*$/gm)) headers.add(m[1]);
+  const present = ownedKeys.filter(k => headers.has(`${hooksFile}:${k}`)).length;
+  if (!present) return 'trust-entry-absent';
+  return present === ownedKeys.length ? 'trust-entry-present-unverified' : 'trust-entry-partial-unverified';
 }
+const snakeEvent = key => key.replace(/([a-z])([A-Z])/g, '$1_$2').toLowerCase();
 function readRecordedValue(home, key) {
   const file = path.join(home, 'installations', `${hash(key)}.json`);
   const text = readText(file, { optional: true, privateFile: true });
@@ -122,12 +125,15 @@ export function describeHookStatus({ home, env = process.env, scope = 'user', pr
     const text = readText(hookFile, { optional: true });
     let json = {};
     try { json = text ? JSON.parse(text) : {}; } catch { json = null; }
-    const events = {};
+    const events = {}, ownedKeys = [];
     for (const def of HOOK_EVENTS_BY_HOST[host]) {
       const recorded = readRecordedValue(home, `${hookFile}::hooks::${def.key}`);
       if (recorded === undefined) { events[def.key] = 'missing'; continue; }
       const arr = isObject(json) && Array.isArray(json.hooks?.[def.key]) ? json.hooks[def.key] : [];
-      events[def.key] = arr.some(g => sameJson(g, recorded)) ? 'installed' : 'changed';
+      const index = arr.findIndex(g => sameJson(g, recorded));
+      events[def.key] = index !== -1 ? 'installed' : 'changed';
+      // Each owned group has exactly one handler, so its trust key is <event>:<group index>:0.
+      if (index !== -1) ownedKeys.push(`${snakeEvent(def.key)}:${index}:0`);
     }
     let instructionBlockStatus = 'not-applicable';
     if (scope === 'user') {
@@ -137,7 +143,7 @@ export function describeHookStatus({ home, env = process.env, scope = 'user', pr
       else { const blockText = readText(blockFile, { optional: true }); instructionBlockStatus = blockText && blockText.includes(recordedBlock) ? 'installed' : 'changed'; }
     }
     const entry = { file: hookFile, events, instructionBlock: instructionBlockStatus };
-    if (host === 'codex') entry.trust = codexTrustStatus(readText(path.join(env.CODEX_HOME || path.join(userHome, '.codex'), 'config.toml'), { optional: true }), hookFile);
+    if (host === 'codex') entry.trust = codexTrustStatus(readText(path.join(env.CODEX_HOME || path.join(userHome, '.codex'), 'config.toml'), { optional: true }), hookFile, ownedKeys);
     result[host] = entry;
   }
   return result;

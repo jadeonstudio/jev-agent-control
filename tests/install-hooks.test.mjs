@@ -257,3 +257,24 @@ test('CLI accepts --no-skills for install and uninstall only', t => {
   assert.equal(run(['install', '--target', 'claude', '--no-skills', '--dry-run']).status, 0);
   assert.notEqual(run(['status', '--no-skills']).status, 0);
 });
+
+test('Codex trust status reads per-hook [hooks.state."<file>:<event>:<group>:<handler>"] headers for our own groups', t => {
+  const f = setup(t);
+  const hooksFile = codexHooks(f.env);
+  fs.mkdirSync(f.env.CODEX_HOME, { recursive: true });
+  // One foreign PreToolUse group first, so our group lands at index 1 there and index 0 elsewhere.
+  atomicWrite(hooksFile, JSON.stringify({ hooks: { PreToolUse: [{ matcher: 'Bash', hooks: [{ type: 'command', command: 'foreign' }] }] } }, null, 2) + '\n');
+  f.install({ target: 'codex', hooks: true });
+  const config = path.join(f.env.CODEX_HOME, 'config.toml');
+  const base = fs.readFileSync(config, 'utf8');
+  const entry = key => `\n[hooks]\n[hooks.state]\n\n[hooks.state."${hooksFile}:${key}"]\ntrusted_hash = "sha256:00"\n`;
+  const status = () => describeHookStatus({ home: f.home, env: f.env, scope: 'user', project: f.user }).codex.trust;
+  assert.equal(status(), 'trust-entry-absent');
+  // A trust entry for the FOREIGN group only does not count as ours.
+  fs.writeFileSync(config, base + entry('pre_tool_use:0:0'));
+  assert.equal(status(), 'trust-entry-absent');
+  fs.writeFileSync(config, base + entry('pre_tool_use:1:0'));
+  assert.equal(status(), 'trust-entry-partial-unverified');
+  fs.writeFileSync(config, base + entry('pre_tool_use:1:0') + `\n[hooks.state."${hooksFile}:subagent_start:0:0"]\ntrusted_hash = "sha256:00"\n[hooks.state."${hooksFile}:subagent_stop:0:0"]\ntrusted_hash = "sha256:00"\n`);
+  assert.equal(status(), 'trust-entry-present-unverified');
+});
