@@ -58,11 +58,11 @@ owner가 개정을 승인했다. P0 커밋에서 `AGENTS.md`를 개정했다: �
 
 상태 표기: 미착수 / 진행 중 / 국소 검증됨 / 동작 검증됨 / 완료 / 보류(승인 대기)
 
-### P0. 기준선과 실측 — 부분 완료 (Codex 확정, Claude 네이티브 실측은 CLI 인증 만료로 차단)
+### P0. 기준선과 실측 — 완료 (Codex 역할 우선·Claude 재작성 네이티브 확정, Codex hook 재작성 네이티브 확인은 P3)
 - [x] 계획 문서 작성
 - [x] Codex spawn 모델 우선순위 실측 — 역할 TOML 우선 확정 (R1)
 - [~] Codex PreToolUse updatedInput agent_type 재작성 — 공식 문서 근거 확보, 네이티브 확인은 P3 (R2)
-- [ ] Claude PreToolUse(matcher Agent) updatedInput model 재작성 실측 — 차단(Claude CLI 인증 만료, R3)
+- [x] Claude PreToolUse(matcher Agent) updatedInput model 재작성 실측 — 적용 확정 (R3)
 - acceptance: 두 호스트에서 "역할/모델을 hook으로 바꿀 수 있는가"를 증거와 함께 확정하고 아래 실측 기록에 남긴다.
 
 ### P1. 역할 단위 라우팅 (G1) — 진행 중
@@ -136,10 +136,12 @@ owner가 개정을 승인했다. P0 커밋에서 `AGENTS.md`를 개정했다: �
 - 네이티브 실측을 지금 하려면 `--dangerously-bypass-hook-trust`가 필요하다. 이 플래그는 사용자가 일부러 미승인으로 둔 전역 hook까지 실행시킬 수 있어 쓰지 않는다. P3 설치 후 사용자가 trust한 상태에서 네이티브로 확인한다.
 - SubagentStart/Stop 입력: `agent_id`, `agent_type`, `agent_transcript_path`, `last_assistant_message`, `stop_hook_active`, 공통 `session_id`·`turn_id`·`model`. 성공/실패 필드는 없다.
 
-### R3. Claude PreToolUse(Agent) `updatedInput` model 재작성 — 차단됨
+### R3. Claude PreToolUse(Agent) `updatedInput` model 재작성 — 확정 (2026-09-23, 네이티브 실행)
 
-- 격리 폴더(project `.claude/settings.json`)에 PreToolUse(Agent)·SubagentStart·SubagentStop command hook을 두고 `claude -p --model haiku`로 실행했다.
-- 결과: `Failed to authenticate: OAuth session expired and could not be refreshed`, 비용 0. hook 발화 없음.
-- 다음 행동: owner가 터미널에서 Claude CLI 로그인을 갱신한 뒤 같은 probe를 1회 재실행한다.
-- 공식 근거(code.claude.com/docs/en/hooks, sub-agents, 2026-09-23): Agent `tool_input`은 `prompt`·`description`·`subagent_type`·`model`. `updatedInput`은 입력 전체 교체이며 `permissionDecision`(`allow`/`ask`)과 함께 쓰는 형식이다. 모델 해석 순서는 호출 `model` > 역할 frontmatter `model` > `CLAUDE_CODE_SUBAGENT_MODEL` > 메인 모델. project `.claude/settings.json` hook은 `claude -p`에서도 실행된다. SubagentStop에도 성공/실패 필드는 없다.
-- 비공식: anthropics/claude-code#95769가 PreToolUse 재작성 안정성 한계를 보고했다. 네이티브 실측 전까지 Claude ON 재작성은 UNKNOWN이다.
+- 환경: Claude Code 2.1.237, 격리 폴더 project `.claude/settings.json`에 PreToolUse(matcher `Agent`)·SubagentStart·SubagentStop command hook. `claude -p --model haiku`.
+- 호출: Agent `{subagent_type:"general-purpose", model:"haiku"}`. hook이 `{"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"allow","updatedInput":{...,"model":"sonnet"}}}`를 반환.
+- 증거: 서브에이전트 transcript `.../subagents/agent-a9971e1f76d6c4384.jsonl`의 assistant `model = claude-sonnet-5`. 세션 `modelUsage`에 `claude-sonnet-5`(output 4 tokens)가 추가로 잡힘. 요청값 haiku가 아닌 재작성 값이 적용됐다.
+- 결론: **Claude는 PreToolUse `updatedInput`으로 서브에이전트 model을 바꿀 수 있다.** 1회 실측이며, 비공식 이슈(anthropics/claude-code#95769)가 말한 불안정성은 이번에 재현되지 않았다. P3 ON 모드는 계속 실측으로 감시한다.
+- 연결 키 실측: PreToolUse에는 `tool_use_id`가 있고 `agent_id`는 없다. SubagentStart/Stop에는 `agent_id`가 있고 `tool_use_id`는 없다. 부모 transcript의 Agent tool_result(`toolUseResult`)에 `agentId`·`resolvedModel`이 있으므로, PostToolUse(Agent)의 tool_response로 `tool_use_id ↔ agent_id`를 잇는다. 공통 `session_id`·`prompt_id`도 있다.
+- SubagentStop 입력 키: `agent_id`, `agent_type`, `agent_transcript_path`, `last_assistant_message`, `stop_hook_active`, `effort`, `background_tasks`, `session_crons` 등. 성공/실패 필드는 없다.
+- 사용량: 총 $0.2029(list 기준 환산값, 실제 청구 방식은 확인 불가). haiku 메인 + sonnet 서브 1턴.
