@@ -143,6 +143,20 @@ owner 요청: 이 Mac(Apple M4 Pro, GPU 16코어, 통합 메모리 24GB)에서 L
   - [x] 라벨링 에이전트가 긴 파일을 한 번에 출력해 잘린 텍스트로 판단한 사례 확인. 한 part 비교에서 부분 vs 전체 읽기 일치 intent 0.94 / difficulty 0.86 / risk 0.90. 평가 300은 전체 읽기로 재라벨링(1·2차 대비 difficulty 0.88~0.90, risk 0.92 일치), 학습 라벨은 잡음 감수(해당 part 30은 전체 읽기로 교체)
   - [x] 2차 데이터: 새 긴 문장 1,800개(18개 새 도메인, sonnet 워커, 세션 한도로 13개 워커가 중간 종료됐으나 점검 통과분 사용) + Claude 학습 라벨. run d4 → dataset 30c025bc…: train 13,053 / calibration 423 / test 477 (평가 문장은 1차와 동일)
   - [x] 학습 키트: epoch별 calibration 일치율로 최고 epoch 선택(5d57aa3), 자체 평가 label 키·정수 확률 오류 수정
-  - [~] 2차 로컬 학습(d4) → register → holdout freeze → qualify → compare(english 대비) → 조건 충족 시 promote·서버 재시작
+  - [~] 2차 로컬 학습(d4): 2026-09-24 00:22 1 epoch 완료(3,618s, ~1.11s/step, MPS ~10GB, 여유 메모리 26~42%), calib 일치율 choice 0.762 / score 0.582 / mean 0.672. owner 지시로 epoch 2 중반에 중단(다음 날 처음부터 재실행). 남은 순서: 학습 → register → holdout freeze → qualify → compare(english 대비) → 조건 충족 시 promote·서버 재시작
+
+### 재개 절차 (2026-09-24)
+
+상태: 전역 SHADOW, provider laya(english zero-shot 활성), 설치본 = origin/main. 데이터는 JEV_HOME에 영구 보관: run `d4`(문장 4,796, Claude 라벨 eval 300 / train 4,351), dataset·export `30c025bc5ffd1d87f7342bf39ee66f29742cd478d530a8418253f74c0736e421`. 1차 후보 `f15827a4…`와 holdout `d3k-claude-test`(d3k dataset test split)는 등록돼 있다. 2차는 d4 dataset의 test split으로 새 holdout을 만든다(평가 문장은 1차와 동일).
+
+```sh
+X=~/.local/share/jev-agent-control/training/exports/30c025bc5ffd1d87f7342bf39ee66f29742cd478d530a8418253f74c0736e421/laya
+OUT=~/.local/share/laya/training-runs/d4   # /private/tmp는 재부팅 시 지워지므로 영구 경로 사용
+PYTHONUNBUFFERED=1 ~/.local/share/laya/.venv/bin/python -u training/laya-kit/train_from_export.py \
+  --export-dir $X --model-dir ~/.local/share/laya/models/multilingual/multilingual \
+  --output-dir $OUT --local --device mps --batch-size 4 > $OUT.log 2>&1   # 약 4시간, 최고 epoch 자동 선택
+```
+
+이후: 추론 파일(model.safetensors, encoder/, tokenizer/, rl_agent_config.json)만 별도 폴더로 복사 → `laya register --checkpoint <폴더> --python ~/.local/share/laya/.venv/bin/python --model laya/multilingual-d4 --device mps --precision fp16 --input-fit task-head` → `laya holdout freeze --dataset 30c025bc… --name d4-claude-test` → `laya qualify` → `laya compare`(활성 english 대비, 입력 거부는 판단 불가로 집계) → 조건 충족 시 `laya promote` → 상주 서버 재시작(`launchctl kickstart -k gui/$(id -u)/com.jev-agent-control.laya`, 권한 제한 시 owner 실행).
 - [x] L5 Codex A/B 실측(B4) 후 owner 승인으로 Codex 관리 블록에서 spawn 전 route 안내 제거, hook 기록만 유지
 - [ ] L6 설치본 반영·문서·커밋
