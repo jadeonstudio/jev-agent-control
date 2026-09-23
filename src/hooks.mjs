@@ -166,7 +166,11 @@ async function preSpawn(host, input, ctx) {
     return { output: null, telemetry: { reason: 'ROLE_NOT_ROUTABLE', original_role: info.originalRole } };
   }
   const annotation = parseContextAnnotation(info.promptText);
-  if (!annotation) return { output: null, telemetry: { reason: 'NO_CONTEXT_ANNOTATION', original_role: info.originalRole } };
+  if (!annotation) {
+    // Content-free form only: codex-cli 0.154.0 sends spawn_agent.message as an opaque Fernet-like token the hook cannot read.
+    const promptForm = /^gAAAA[A-Za-z0-9_\-=]+$/.test(info.promptText) ? 'opaque' : 'plain';
+    return { output: null, telemetry: { reason: 'NO_CONTEXT_ANNOTATION', original_role: info.originalRole, prompt_form: promptForm } };
+  }
   const taskText = truncateUtf8(`${info.description}\n${info.promptText}`, 8000);
   const routeInput = { task: taskText, host, risk: 'routine',
     context: { complete: annotation.complete, scope: annotation.scope, previousFailures: annotation.previousFailures,
@@ -226,7 +230,8 @@ function logHookEvent({ home, layer, host, event, telemetry, applied, elapsedMs 
     appendEvent(home, { kind: 'hook', at: new Date().toISOString(), host, event, reason: telemetry?.reason ?? null,
       mode, applied: Boolean(applied), original_role: telemetry?.original_role ?? null,
       recommended_role: telemetry?.recommended_role ?? null, decision_id: telemetry?.decision_id ?? null, elapsedMs,
-      ...(telemetry?.tool_name !== undefined ? { tool_name: telemetry.tool_name } : {}) });
+      ...(telemetry?.tool_name !== undefined ? { tool_name: telemetry.tool_name } : {}),
+      ...(telemetry?.prompt_form !== undefined ? { prompt_form: telemetry.prompt_form } : {}) });
   } catch { /* observability cannot become an availability dependency */ }
 }
 /** Pure-ish dispatcher: takes an already-parsed hook payload, never throws, only ever logs a content-free event. */

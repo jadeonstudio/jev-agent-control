@@ -360,3 +360,15 @@ test('pre-spawn with an unexpected tool_name records a sanitized tool_name for d
   assert.equal(ev[0].reason, 'INVALID_HOOK_INPUT'); assert.equal(ev[0].tool_name, null);
   assert.equal(ev[1].tool_name, 'collab.spawn');
 });
+
+test('NO_CONTEXT_ANNOTATION records only the prompt form (plain/opaque), never content', async t => {
+  const s = setup({ provider: p => response(p, { intent: 'edit', difficulty: [1, 0, 0, 0, 0] }) }); t.after(s.cleanup);
+  installFixtureRoles(s.home, 'codex');
+  // codex-cli 0.154.0 passes spawn_agent.message as an opaque Fernet-like token (measured 2026-09-23).
+  await processHookEvent({ host: 'codex', event: 'pre-spawn', input: codexInput({ tool_name: 'agentsspawn_agent', tool_input: { message: 'gAAAAABqSECRETtokenAbc_-=' } }), home: s.home, env: s.env, layer: s.layer });
+  await processHookEvent({ host: 'codex', event: 'pre-spawn', input: codexInput({ tool_name: 'agentsspawn_agent', tool_input: { message: 'plain text SECRET_MARKER' } }), home: s.home, env: s.env, layer: s.layer });
+  const ev = readEvents(s.home).filter(e => e.kind === 'hook');
+  assert.deepEqual(ev.map(e => [e.reason, e.prompt_form]), [['NO_CONTEXT_ANNOTATION', 'opaque'], ['NO_CONTEXT_ANNOTATION', 'plain']]);
+  assert.equal(JSON.stringify(ev).includes('SECRET'), false);
+  assert.equal(s.calls.length, 0);
+});
