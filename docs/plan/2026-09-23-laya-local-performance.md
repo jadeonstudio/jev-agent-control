@@ -7,6 +7,9 @@ owner 요청: 이 Mac(Apple M4 Pro, GPU 16코어, 통합 메모리 24GB)에서 L
 | 결정 | 내용 |
 |---|---|
 | 상주 서버 | 로그인 시 자동 시작(사용자 launchd 에이전트) + JEV_HOME 안 Unix 소켓(0600, 네트워크 포트 없음). 일정 시간 쓰지 않으면 모델을 내려 메모리 반환. 서버가 없거나 모델이 내려가 있으면 hook은 기다리지 않고 즉시 통과. 설치·제거는 dry-run 후 승인. 기존 계약("공유 daemon 없음")을 이 결정으로 개정한다. |
+| 실적용 (2차) | 전부 적용: 설치본 갱신, Codex 블록 교체, english checkpoint 등록 + providers.json FP16·MPS, launchd 에이전트 설치·bootstrap. 전역 쓰기는 dry-run을 보이며 진행. |
+| 판단 제공자 | Laya로 전환: SHADOW 데이터를 비용 0으로 수집. 자격이 없으므로 jev_decide 채택은 자격이 생길 때까지 멈춘다(원래 호스트 판단으로 돌아감). |
+| 학습 방식 | teacher 증류 + 사람 검수: teacher 라벨은 train split에만 허용하고, calibration·test·holdout은 owner가 검수한 라벨만 쓴다. teacher 방식·비용은 추정치와 함께 별도 승인. |
 | Codex 관리 블록 | "작업자 spawn 전 jev_route 호출" 안내를 의미 있는 크기의 독립 작업으로 좁히고, codex exec A/B로 추가 턴 비용을 실측한 뒤 유지·제거를 정한다. |
 
 ## 리서치 요약 (출처는 세션 기록, 2026-09-23 확인)
