@@ -16,16 +16,18 @@ export function outsideGit(target) {
     const parent = path.dirname(dir); if (parent === dir) return; dir = parent;
   }
 }
+export const DEFAULT_MIN_STRONG_LABELS_PER_PURPOSE = 100;
 export function createTrainingStore({ home = resolveHome(), now = () => new Date().toISOString() } = {}) {
   const root = path.join(home, 'training'), settings = path.join(home, 'training.json');
   function config() {
-    const raw = readText(settings, { optional: true, privateFile: true, maxBytes: 1024 });
-    if (raw === null) return { version: 1, trainingCapture: false };
+    const raw = readText(settings, { optional: true, privateFile: true, maxBytes: 2048 });
+    if (raw === null) return { version: 1, trainingCapture: false, minStrongLabelsPerPurpose: DEFAULT_MIN_STRONG_LABELS_PER_PURPOSE };
     let c; try { c = JSON.parse(raw); } catch { fail('INVALID_TRAINING_CONFIG'); }
-    only(c, ['version', 'trainingCapture', 'generation'], ['version', 'trainingCapture']);
+    only(c, ['version', 'trainingCapture', 'generation', 'minStrongLabelsPerPurpose'], ['version', 'trainingCapture']);
     if (c.generation !== undefined && !UUID.test(c.generation)) fail('INVALID_TRAINING_CONFIG');
     if (c.version !== 1 || typeof c.trainingCapture !== 'boolean') fail('INVALID_TRAINING_CONFIG');
-    return c;
+    if (c.minStrongLabelsPerPurpose !== undefined && (!Number.isInteger(c.minStrongLabelsPerPurpose) || c.minStrongLabelsPerPurpose < 1 || c.minStrongLabelsPerPurpose > 100000)) fail('INVALID_TRAINING_CONFIG');
+    return { minStrongLabelsPerPurpose: DEFAULT_MIN_STRONG_LABELS_PER_PURPOSE, ...c };
   }
   function ticket() { try { const c = config(); return c.trainingCapture ? (c.generation ?? 'legacy-enabled') : null; } catch { return null; } }
   function status() {
@@ -43,8 +45,20 @@ export function createTrainingStore({ home = resolveHome(), now = () => new Date
   function setCapture(enabled) {
     if (typeof enabled !== 'boolean') fail('INVALID_TRAINING_CONFIG');
     return lock(() => {
-      const old = readText(settings, { optional: true, privateFile: true, maxBytes: 1024 });
-      atomicWrite(settings, encode({ version: 1, trainingCapture: enabled, generation: randomUUID() }) + '\n', { expected: old });
+      const old = readText(settings, { optional: true, privateFile: true, maxBytes: 2048 });
+      let base; try { base = old === null ? {} : JSON.parse(old); } catch { fail('INVALID_TRAINING_CONFIG'); }
+      only(base, ['version', 'trainingCapture', 'generation', 'minStrongLabelsPerPurpose'], []);
+      atomicWrite(settings, encode({ version: 1, ...base, trainingCapture: enabled, generation: randomUUID() }) + '\n', { expected: old });
+      return status();
+    });
+  }
+  function setMinLabels(count) {
+    if (!Number.isInteger(count) || count < 1 || count > 100000) fail('INVALID_TRAINING_CONFIG');
+    return lock(() => {
+      const old = readText(settings, { optional: true, privateFile: true, maxBytes: 2048 });
+      let base; try { base = old === null ? { version: 1, trainingCapture: false } : JSON.parse(old); } catch { fail('INVALID_TRAINING_CONFIG'); }
+      only(base, ['version', 'trainingCapture', 'generation', 'minStrongLabelsPerPurpose'], ['version', 'trainingCapture']);
+      atomicWrite(settings, encode({ ...base, minStrongLabelsPerPurpose: count }) + '\n', { expected: old });
       return status();
     });
   }
@@ -133,5 +147,5 @@ export function createTrainingStore({ home = resolveHome(), now = () => new Date
     if (old !== null) { if (old !== contents) fail('IMMUTABLE_DATASET_CONFLICT'); return file; }
     atomicWrite(file, contents, { expected: null }); return file;
   }
-  return Object.freeze({ root, home, status, config, ticket, setCapture, lock, scan, scanUnlocked, appendUnlocked, decision, outcome, writeDerived });
+  return Object.freeze({ root, home, status, config, ticket, setCapture, setMinLabels, lock, scan, scanUnlocked, appendUnlocked, decision, outcome, writeDerived });
 }

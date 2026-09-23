@@ -16,7 +16,7 @@ import { readMetrics } from '../src/metrics.mjs';
 import { digest } from '../src/training/schema.mjs';
 import { buildDataset, readDataset, exportDataset } from '../src/training/dataset.mjs';
 import { evaluateDecision, pairedPreferences } from '../src/training/evaluate.mjs';
-import { fixture, request, response, trace, decision, outcome, layaConfig, KEY } from './training-helpers.mjs';
+import { fixture, request, response, trace, decision, outcome, layaConfig, KEY, splitFor, stateForSplit, fillerRequest } from './training-helpers.mjs';
 const ROOT = fileURLToPath(new URL('../', import.meta.url));
 const cli = (f, args, input) => spawnSync(process.execPath, [path.join(ROOT, 'bin/jev-control.mjs'), ...args], {
   input, encoding: 'utf8', timeout: 8000, env: { ...process.env, HOME: f.home, JEV_HOME: f.home, TYPESAFE_API_KEY: '', JEV_DISABLE: '0' },
@@ -125,9 +125,17 @@ test('Score and Noul supervised exports preserve label order without invented fr
   const o=outcome(d,{executed:false,executed_answers:{},metrics:{},source:'human',checks:[],labels:[
     {question_id:'flag',value:false,source:'human',label_confidence:1,evidence_ref:'sha256:'+'a'.repeat(64)},
     {question_id:'depth',value:1,source:'human',label_confidence:1,evidence_ref:'sha256:'+'a'.repeat(64)},]});f.store.outcome(o);
-  const b=buildDataset(f.store);assert.equal(b.sample_count,2);const samples=readDataset(f.store,b.dataset_version).samples;
+  // Both samples share one request_hash, so they always land in the same split; fill the
+  // other two so the laya export (which refuses an empty split) can be exercised too.
+  let cursor=0;
+  for (const split of ['train','calibration','test'].filter(s=>s!==splitFor(d.request_hash))) {
+    const i=stateForSplit(fillerRequest,split,cursor);cursor=i+1;
+    const filler=decision();filler.request=fillerRequest(i);filler.request_hash=digest(filler.request);
+    f.save(filler);f.store.outcome(outcome(filler));
+  }
+  const b=buildDataset(f.store);assert.equal(b.sample_count,4);const samples=readDataset(f.store,b.dataset_version).samples;
   assert.deepEqual(samples.find(s=>s.question_id==='flag').target.probabilities,{false:1,true:0});
-  assert.deepEqual(samples.find(s=>s.question_id==='depth').target.probabilities,{0:0,1:1,2:0});assert.equal(exportDataset(f.store,b.dataset_version).samples,2);
+  assert.deepEqual(samples.find(s=>s.question_id==='depth').target.probabilities,{0:0,1:1,2:0});assert.equal(exportDataset(f.store,b.dataset_version).samples,4);
 });
 test('routing preference requires separately executed comparable alternatives, not shadow guesses', t => {
   const d1=decision(),d2=decision();d2.trace=d1.trace;d2.answers.worker={type:'choice',value:'strong',confidence:.99,selectedProbability:.99,probabilities:{light:.01,strong:.99}};

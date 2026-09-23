@@ -78,6 +78,8 @@ $JEV_HOME/training/
   datasets/<dataset-version>/preferences.jsonl
   manifests/<dataset-version>.json
   exports/<dataset-version>/laya/{train,calibration,test}.jsonl
+$JEV_HOME/runner.json          # 0600, TTY로 사전 등록한 검증 명령(argv, purpose, 라벨 매핑). 결과가 아니라 등록 내용만 담는다.
+$JEV_HOME/links/<key-hash>.json  # 0700/0600, tool_use_id/agent_id -> decision_id 최소 인덱스, 30일 보존
 ```
 
 JSONL 동시 append 대신 **이벤트별 불변 JSON 파일**을 사용한다. 디렉터리 0700 / 파일 0600, 작업 트리·bare Git 저장소 내부 및 symlink 경로를 거부한다. UUID, checksum, O_EXCL, fsync 및 공유 쓰기 lock으로 중복/충돌을 확인한다. lock 충돌은 명시적 실패로 반환하며 몰래 성공 처리하거나 이전 lock을 훔치지 않는다. 프로세스 중단 후 `.lock`이 남으면 모든 writer 종료를 확인하고 해당 빈 lock 디렉터리만 수동 복구한다. 원본이나 백업 전체를 에이전트에 출력하지 않는다.
@@ -92,21 +94,39 @@ decision 요청에 `trace.task_id`(UUID), `trace.snapshot_id`(저장소·검증 
 
 일반 MCP/CLI `decide`는 질문별 canonical 값, 확률, 모델의 confidence 통계와 그 의미, provider, 모델/체크포인트/전처리 버전, 시각·지연·사용량을 분리 기록한다. router가 반환한 tier는 Jev가 추정한 intent/difficulty/risk와 다르다. **라우팅이 성공했다고 분류 feature를 정답 처리하면 안 된다.** 해당 질문별 독립 라벨이나 실제 비교 실행이 필요하다.
 
-실제 runner는 `src/training/store.mjs`의 `outcome()` 또는 `training outcome` stdin으로 결과를 남긴다. 실측 아닌 시간·토큰은 생략한다. `checks`에는 실제 결과를 보관한 내용의 `sha256:...` 참조를 넣고 원본 출력 자체는 저장하지 않는다. 이 참조는 상관관계/무결성 단서이지, 외부에서 자동 검증한 전자 서명이 아니다.
+실제로 소유한 runner를 in-process로 통합했다면 `src/training/store.mjs`의 `outcome()`을 직접 호출해 `source:'runner'`로 기록할 수 있다(예: AEGIS처럼 jev와 같은 프로세스에서 도는 실행기). 그 외 CLI/MCP 경로는 아래처럼 나뉜다. 실측 아닌 시간·토큰은 생략한다. `checks`에는 실제 결과를 보관한 내용의 `sha256:...` 참조를 넣고 원본 출력 자체는 저장하지 않는다. 이 참조는 상관관계/무결성 단서이지, 외부에서 자동 검증한 전자 서명이 아니다.
+
+**(2026-09-23 owner 결정) `jev-control training outcome`의 stdin JSON은 비신뢰 입력이다.** 비TTY 에이전트도 이 명령을 파이프로 호출할 수 있어, `MCP jev_record`와 동일하게 **항상 `trust:'host'`로 강제해 `source:'host_review'`로 낮춘다.** 호출자가 `source:'runner'`나 `source:'human'`, objective/human label을 stdin에 적어도 그대로 저장되지 않는다. 이 CLI는 호스트가 사후에 관찰한 약한 근거를 남기는 용도로만 쓴다.
 
 ```sh
-jev-control training outcome < sanitized-outcome.json
+jev-control training outcome < host-review-outcome.json   # 항상 source:'host_review'
 jev-control training host < sanitized-host-baseline.json
 jev-control training evaluate
 jev-control dataset stats
 jev-control dataset validate
-jev-control dataset build
+jev-control dataset build [--allow-small]
 jev-control dataset export --version <출력된 hash> --format laya
 ```
 
+강한(`objective`/`human`) 라벨은 아래 세 경로에서만 생긴다. 세 경로 모두 호출자가 라벨 값이나 실행 결과를 직접 주입할 수 없다.
+
+1. **직접 소유한 in-process runner** — `store.outcome()`을 코드에서 직접 호출.
+2. **`jev-control runner allow`/`runner verify`** — TTY에서 사람이 `runner allow --name N --timeout-ms MS [--purpose P --question Q --pass-label V --fail-label V] -- ARGV...`로 명령을 사전 등록한다(이름을 다시 입력해 재확인). 에이전트는 이후 `jev-control runner verify --decision <id> --check N`로 **등록된 이름만** 고른다. jev가 등록된 argv를 `child_process.spawn(argv[0], argv.slice(1), {shell:false, stdio:'ignore'})`로 직접 실행하고 종료 코드로 `source:'runner'` outcome을 기록한다. 명령의 stdout/stderr는 절대 저장하지 않는다. `question_id`가 등록돼 있으면 정상 종료한 경우에만 종료 코드 0/그 외를 각각 `pass_label`/`fail_label`에 매핑해 `kind:'label'` 객관 라벨도 함께 남긴다. 시간 초과·실행 실패·시그널 종료는 실패한 command check만 남기고 라벨은 만들지 않는다. 명령 환경에서 `TYPESAFE_API_KEY`는 제거한다. `purpose`가 등록돼 있으면 decision의 실제 purpose와 일치해야 하고, **route purpose에는 라벨(`question_id`) 등록 자체를 거부한다** — route 질문은 intent/difficulty/risk이며 명령 성공/실패의 정답이 아니기 때문이다(아래 참고). `runner remove --name`으로 제거, `runner list`로 목록 확인.
+3. **`jev-control training correct --decision <id>`** — TTY 전용 대화형 사람 교정. decision의 purpose/최소화된 state/질문별 후보를 보여주고 사람이 고른 값만 `source:'human'` 라벨로 남긴다.
+
+`runner allow`/`remove`와 `training correct`는 모두 stdin·stdout이 TTY가 아니면 `HUMAN_TTY_REQUIRED`로 거부한다. **TTY 검사는 동일 OS 사용자 안에서의 "로컬에서 직접 조작했다"는 신호일 뿐, 사람임을 증명하지 않는다.** PTY에 붙어 도는 코딩 에이전트도 TTY를 가지므로, 이는 SECURITY.md가 명시한 동일 OS 사용자 위협 모델 밖의 경계와 같다.
+
 정확한 입력 필드는 `src/training/schema.mjs`, 실행 가능한 전체 예제는 `examples/training-pipeline.mjs`다. 예제는 synthetic inference와 실제 무해한 Node assertion으로 연결만 검증하며 모델 정확도 벤치마크가 아니다.
 
-`jev_record` MCP 도구는 `{kind:"outcome"|"host",data:{...}}`를 받는다. MCP에서 전달한 outcome은 무조건 **host_review**로 낮추고, objective/human을 사칭하는 label도 weak source로 바꾼다. 강한 evidence는 별도 신뢰한 runner 또는 사용자의 명시적 correction 경로에서만 입력한다. Terminal 권한이 있는 동일 OS 사용자는 어떤 파일도 위조할 수 있으므로 이 구분을 적대적인 로컬 사용자에 대한 보안 경계로 오해하면 안 된다. 스킬은 자동으로 capture를 켜거나 자신의 주장을 human/runner로 제출하지 않는다.
+`jev_record` MCP 도구는 `{kind:"outcome"|"host",data:{...}}`를 받는다. MCP에서 전달한 outcome은 무조건 **host_review**로 낮추고, objective/human을 사칭하는 label도 weak source로 바꾼다. Terminal 권한이 있는 동일 OS 사용자는 어떤 파일도 위조할 수 있으므로 이 구분을 적대적인 로컬 사용자에 대한 보안 경계로 오해하면 안 된다. 스킬은 자동으로 capture를 켜거나 자신의 주장을 human/runner로 제출하지 않는다.
+
+## 3-1. 결정 ↔ 실행 연결과 SubagentStop (호스트 hook이 사용할 라이브러리)
+
+`src/training/links.mjs`의 `createLinkIndex()`는 호스트가 준 `tool_use_id`/`agent_id`를 `decision_id`에 최소 인덱스로만 연결한다(`JEV_HOME/links/`, 0700/0600, 30일 보존, 최대 10,000개, 원문·transcript 없음). Claude는 PreToolUse(Agent)의 `tool_use_id`와 PostToolUse(Agent) 결과의 `agentId`로, Codex는 SubagentStart/Stop의 `agent_id`로 연결한다(2026-09-23 P0 실측). `recordSubagentStop(store, links, {host, agent_id, status})`는 연결된 decision이 있을 때만 `source:'host_review'` outcome을 남긴다. `status:'completed'`는 성공이 아니라 `host_review:'uncertain'`으로, `'failed'`/`'interrupted'`는 `host_review:'fail'`로 기록하며 `task_succeeded`는 항상 `null`이다. 이 라이브러리는 P3에서 설치되는 host hook이 호출하며, 그 자체로는 CLI 명령을 추가하지 않는다.
+
+## 3-2. 최소 표본 게이트
+
+`training.json`의 `minStrongLabelsPerPurpose`(기본 100, `jev-control training min-labels`로 조회, `training min-labels N` 변경은 TTY에서만)는 `dataset build`가 만드는 데이터셋의 purpose별 강한 라벨 표본 수 최소 기준이다. 기준 미달 purpose가 있으면 `dataset build`는 `DATASET_TOO_SMALL`과 purpose별 실제 개수를 반환하고 아무것도 쓰지 않는다. `--allow-small`을 명시하면 진행하되 manifest에 `small_sample_override:true`와 `min_strong_labels_per_purpose`를 남긴다. 이 값은 dataset_version 해시에 포함되지 않으므로 임계값을 바꿔도 이미 만든 데이터셋의 재현성(dataset_version)에는 영향이 없다. `dataset export`는 train/calibration/test 중 하나라도 비어 있으면 `--allow-small`로도 우회할 수 없는 `EMPTY_SPLIT`으로 거부한다(canonical 포맷은 split이 없어 해당 없음).
 
 ## 4. 평가와 라벨
 

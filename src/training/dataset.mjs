@@ -25,7 +25,7 @@ function groupedSplits(samples) {
     s.split = n < 80 ? 'train' : n < 90 ? 'calibration' : 'test';
   }
 }
-export function buildDataset(store) {
+export function buildDataset(store, { allowSmall = false } = {}) {
   return store.lock(() => {
     const snapshot = store.scanUnlocked(), index = indexEvents(snapshot);
     const rows = [], candidates = [], excluded = { missingTaskSnapshot: 0, noSupportedLabel: 0, conflicts: 0, duplicates: 0, unknownProvenance: 0 };
@@ -70,6 +70,14 @@ export function buildDataset(store) {
     }
     const samples = [...unique.values()].sort((a, b) => a.sample_id.localeCompare(b.sample_id));
     groupedSplits(samples);
+    const minStrongLabelsPerPurpose = store.config().minStrongLabelsPerPurpose;
+    const purposeCounts = samples.reduce((out, s) => { out[s.purpose] = (out[s.purpose] || 0) + 1; return out; }, Object.create(null));
+    const shortfall = Object.fromEntries(Object.entries(purposeCounts).filter(([, n]) => n < minStrongLabelsPerPurpose));
+    const smallSampleOverride = Object.keys(shortfall).length > 0;
+    if (smallSampleOverride && !allowSmall) {
+      return { built: false, reason: 'DATASET_TOO_SMALL', sample_count: samples.length, purpose_counts: purposeCounts,
+        shortfall, min_strong_labels_per_purpose: minStrongLabelsPerPurpose };
+    }
     const preferences = pairedPreferences(rows);
     const data = samples.map(encode).join('\n') + (samples.length ? '\n' : '');
     const prefs = preferences.map(encode).join('\n') + (preferences.length ? '\n' : '');
@@ -84,7 +92,8 @@ export function buildDataset(store) {
       provider_distribution: providers, label_source_distribution: distribution('label_source'), split_distribution: distribution('split'),
       evaluation_policy_version: POLICY_VERSION, filter_rules: EVALUATION_POLICY, exclusions: { ...index.report, ...excluded },
       data_sha256: digest(data), preferences_sha256: digest(prefs),
-      split_rule: 'connected ALL task IDs OR identical request/state hash; deterministic 80/10/10 group split', online_learning: false };
+      split_rule: 'connected ALL task IDs OR identical request/state hash; deterministic 80/10/10 group split', online_learning: false,
+      min_strong_labels_per_purpose: minStrongLabelsPerPurpose, small_sample_override: smallSampleOverride && allowSmall };
     const manifestPath = path.join(store.root, 'manifests', `${version}.json`);
     const previous = readText(manifestPath, { optional: true, privateFile: true, maxBytes: 49152 });
     store.writeDerived(`datasets/${version}/canonical.jsonl`, data);
@@ -133,13 +142,16 @@ export function exportDataset(store, version, format = 'laya') {
     const folder = `exports/${version}/${format}`;
     const files = [];
     if (format === 'canonical') files.push(store.writeDerived(`${folder}/canonical.jsonl`, contents));
-    else for (const split of ['train', 'calibration', 'test']) {
-      const rows = samples.filter(s => s.split === split).map(s => ({
-        // These THREE values are JSON strings because the official notebook calls json.loads on each.
-        state: JSON.stringify(s.state), questions: JSON.stringify({ [s.question_id]: layaQuestion(s) }),
-        gold: JSON.stringify({ [s.question_id]: { probabilities: s.target.probabilities } }),
-      }));
-      files.push(store.writeDerived(`${folder}/${split}.jsonl`, rows.map(encode).join('\n') + (rows.length ? '\n' : '')));
+    else {
+      if (['train', 'calibration', 'test'].some(split => !samples.some(s => s.split === split))) fail('EMPTY_SPLIT');
+      for (const split of ['train', 'calibration', 'test']) {
+        const rows = samples.filter(s => s.split === split).map(s => ({
+          // These THREE values are JSON strings because the official notebook calls json.loads on each.
+          state: JSON.stringify(s.state), questions: JSON.stringify({ [s.question_id]: layaQuestion(s) }),
+          gold: JSON.stringify({ [s.question_id]: { probabilities: s.target.probabilities } }),
+        }));
+        files.push(store.writeDerived(`${folder}/${split}.jsonl`, rows.map(encode).join('\n') + (rows.length ? '\n' : '')));
+      }
     }
     files.push(store.writeDerived(`${folder}/manifest.json`, encode({ dataset_version: version,
       sample_count: manifest.sample_count, format, exporter_version: LAYA_EXPORT_VERSION,

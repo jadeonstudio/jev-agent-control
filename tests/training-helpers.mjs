@@ -35,13 +35,24 @@ export function outcome(d, changes = {}) {
 }
 export function fixture(t, capture = true) {
   const home = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'jev-training-')));
-  const store = createTrainingStore({ home }); if (capture) store.setCapture(true);
+  const store = createTrainingStore({ home });
+  // Existing tests build datasets from a handful of samples; the production default (100) is
+  // exercised by its own dedicated tests instead of every dataset test needing --allow-small.
+  if (capture) { store.setCapture(true); store.setMinLabels(1); }
   setMode(home, 'on', {}); const env = { TYPESAFE_API_KEY: KEY };
   const engine = createDecisionEngine({ home, env, provider: async () => response() });
   t.after(() => { engine.close(); fs.rmSync(home, { recursive: true, force: true }); });
   const save = d => { const result = store.decision(d); if (!result.stored) throw new Error(result.reason); return d; };
   return { home, store, engine, env, save, writeProviders: p => atomicWrite(path.join(home, 'providers.json'), JSON.stringify(p)) };
 }
+// Reproduces dataset.mjs groupedSplits() for an isolated single-sample group (no shared
+// task/request/state with any other sample): its group representative is always 'input:'+request_hash.
+export const splitFor = requestHash => { const n = parseInt(digest('input:' + requestHash).slice(0, 8), 16) % 100; return n < 80 ? 'train' : n < 90 ? 'calibration' : 'test'; };
+export function stateForSplit(buildRequest, target, start = 0) {
+  for (let i = start; i < start + 20000; i++) if (splitFor(digest(buildRequest(i))) === target) return i;
+  throw new Error('NO_DETERMINISTIC_CASE_FOUND_FOR_SPLIT_' + target);
+}
+export const fillerRequest = i => { const r = request(); r.state = { task: `filler case ${i}` }; return r; };
 export function layaConfig(home, patch = {}) {
   return { version: 1, provider: 'laya', laya: { python: '/usr/bin/python3', modelPath: home, model: 'laya/base', checkpoint: 'a'.repeat(64),
     runtimeVersion: '0.3.4', device: 'cpu', startupTimeoutMs: 1000, idleTimeoutMs: 1000, ...patch } };

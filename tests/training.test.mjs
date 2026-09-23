@@ -10,7 +10,7 @@ import { digest, encode, POLICY_VERSION, validateOutcome, safeContent } from '..
 import { evaluateDecision, evaluateStore, summarizeComparisons, indexEvents } from '../src/training/evaluate.mjs';
 import { buildDataset, readDataset, exportDataset, validateDatasetSource } from '../src/training/dataset.mjs';
 import { recordHost } from '../src/training/host.mjs';
-import { fixture, request, response, trace, decision, outcome, REF, KEY } from './training-helpers.mjs';
+import { fixture, request, response, trace, decision, outcome, REF, KEY, stateForSplit } from './training-helpers.mjs';
 const evaluation = (store, d) => { const s = store.scan(); return evaluateDecision(s.events.find(e => e.kind === 'decisions' && e.data.decision_id === d.decision_id), s.events.filter(e => e.kind === 'outcomes' && e.data.decision_id === d.decision_id)); };
 
 test('capture defaults OFF: inference and outcome create no content-bearing training files', async t => {
@@ -164,7 +164,15 @@ test('model changes and raw changes create new dataset versions, not mutable che
   assert.notEqual(a.dataset_version, b.dataset_version); assert.equal(readDataset(f.store, b.dataset_version).samples[0].provenance.length, 2);
 });
 test('Laya export has official three JSON-string columns with isolated holdouts', t => {
-  const f = fixture(t); const d = decision(); d.request.questions.worker.instructions = '담당자를 선택하세요.'; d.request_hash = digest(d.request); f.save(d); f.store.outcome(outcome(d));
+  const f = fixture(t);
+  const buildRequest = i => { const r = request(); r.state = { task: `A bounded documentation change ${i}` }; r.questions.worker.instructions = '담당자를 선택하세요.'; return r; };
+  // A laya export refuses an empty split, so exercise it with one isolated sample per split.
+  let cursor = 0;
+  for (const split of ['train', 'calibration', 'test']) {
+    const i = stateForSplit(buildRequest, split, cursor); cursor = i + 1;
+    const d = decision(); d.request = buildRequest(i); d.request_hash = digest(d.request);
+    f.save(d); f.store.outcome(outcome(d));
+  }
   const b = buildDataset(f.store), e = exportDataset(f.store, b.dataset_version);
   let count = 0;
   for (const file of e.files.filter(p => p.endsWith('.jsonl'))) for (const line of fs.readFileSync(file, 'utf8').trim().split('\n').filter(Boolean)) {
@@ -173,7 +181,7 @@ test('Laya export has official three JSON-string columns with isolated holdouts'
     const q = JSON.parse(row.questions).worker; assert.equal(JSON.parse(q.instructions)[1], '담당자를 선택하세요.');
     assert.deepEqual(JSON.parse(row.gold).worker.probabilities, { light: 1, strong: 0 }); count++;
   }
-  assert.equal(count, 1); assert.equal(e.trained, false);
+  assert.equal(count, 3); assert.equal(e.trained, false);
   assert.deepEqual(exportDataset(f.store, b.dataset_version).files, e.files);
   assert.ok(exportDataset(f.store, b.dataset_version, 'canonical').files.some(p => p.endsWith('canonical.jsonl')));
 });

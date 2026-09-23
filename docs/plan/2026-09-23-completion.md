@@ -77,7 +77,11 @@ owner가 개정을 승인했다. P0 커밋에서 `AGENTS.md`를 개정했다: �
 - 모델 ID·역할 이름은 TypeSafe로 보내지 않는다.
 - acceptance: 두 호스트 profile로 route 결과에 role이 나오고, 미보유 역할이면 `TARGET_UNAVAILABLE`로 위임. 테스트 추가.
 
-### P2. 결정↔실행 연결과 결과 기록 — 미착수
+### P2. 결정↔실행 연결과 결과 기록 — 국소 검증됨
+- 결과(2026-09-23): CLI `training outcome`을 host_review로 강제. `runner allow|list|remove|verify`(`JEV_HOME/runner.json`, TTY 등록, 셸 없는 직접 실행, 출력 미저장, `TYPESAFE_API_KEY` 제거, 정상 종료일 때만 라벨, route purpose 라벨 등록 거부). `training correct`(TTY). `src/training/links.mjs` 연결 인덱스(30일, 1만 개 상한)와 `recordSubagentStop`(completed=uncertain, failed/interrupted=fail). 최소 표본 게이트(`minStrongLabelsPerPurpose` 기본 100, 변경은 TTY, `--allow-small`은 manifest에 기록, 빈 split export 거부).
+- runner verify outcome은 `executed:false, final:true`인 독립 annotation이다. evaluate.mjs의 실행 일치·품질 판정은 `executed:true`에서만 켜지므로 검증이 "예측을 실행했다"고 주장하지 않는다.
+- 검증: 테스트 234/234, check 49 모듈, smoke, 예제 3종, Laya worker 4/4. 합성 end-to-end(judge decision → runner verify → evaluate → build → export) 강한 라벨 확인, 사칭 음성 테스트 포함.
+- 남은 것: `recordSubagentStop`은 P3 hook에서 연결된다. SubagentStop outcome을 `executed:false`로 둔 것은 P4 "추천을 따랐을 때 실패율" 측정과 함께 다시 본다.
 - hook 입력 `tool_use_id`/`agent_id` ↔ `decision_id` 최소 인덱스(원문 없음, 보존 기한).
 - `jev-control runner allow`(TTY) / `jev-control runner verify --decision <id> --check <name>`: 사전 등록 검증만 jev가 직접 실행, 종료 코드·소요 시간·명령 해시를 `source:'runner'`로 기록. 출력 원문 저장 안 함. 호출자 결과 주입 불가. (위 "설계 위험과 확정한 대응")
 - CLI `training outcome` stdin은 host_review로 강제.

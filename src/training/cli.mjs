@@ -1,15 +1,18 @@
 import { parseArgs } from 'node:util';
+import readline from 'node:readline';
 import { resolveHome } from '../storage.mjs';
 import { fail } from '../constants.mjs';
 import { createTrainingStore } from './store.mjs';
 import { recordHost } from './host.mjs';
 import { evaluateStore } from './evaluate.mjs';
 import { buildDataset, exportDataset, validateDatasetSource, datasetStats } from './dataset.mjs';
+import { allowRunner, removeRunner, listRunners, verifyRunner } from './runner.mjs';
+import { correctDecision } from './correct.mjs';
 import { selectProvider } from '../inference.mjs';
 import { createDecisionEngine } from '../engine.mjs';
 
-export const TRAINING_COMMANDS = ['training', 'dataset', 'provider', 'compare'];
-export const TRAINING_HELP = `\nProvider and offline dataset commands:\n  provider status|jev|laya       Select an explicitly configured provider; no download\n  training capture status|on|off  Content capture is OFF by default and separate from telemetry\n  training outcome|host          Read minimal evidence/baseline JSON from stdin\n  training evaluate              Append derived evaluations without changing raw evidence\n  dataset stats|validate|build    Local metadata, validation and reproducible dataset build\n  dataset export --version HASH [--format laya|canonical]\n  compare --live                 Explicitly authorize Jev/Laya comparison; only one active arm\nNo command trains, promotes a model, reads keys into output, or uploads a dataset.\n`;
+export const TRAINING_COMMANDS = ['training', 'dataset', 'provider', 'compare', 'runner'];
+export const TRAINING_HELP = `\nProvider and offline dataset commands:\n  provider status|jev|laya       Select an explicitly configured provider; no download\n  training capture status|on|off  Content capture is OFF by default and separate from telemetry\n  training min-labels [N]        Minimum strong labels per purpose for dataset build; changing it requires a TTY\n  training outcome|host          Read minimal evidence/baseline JSON from stdin; outcome is always weak host_review\n  training correct --decision ID Interactive TTY-only human correction; never accepted from a pipe\n  training evaluate              Append derived evaluations without changing raw evidence\n  runner allow --name N --timeout-ms MS [--cwd DIR] [--purpose P --question Q --pass-label V --fail-label V] [--replace] -- ARGV...\n                                  TTY-only pre-registration; an agent later selects only the name\n  runner list|remove --name N    Show or remove a registered pre-approved check\n  runner verify --decision ID --check N  Run the pre-registered check and record its own source:'runner' outcome\n  dataset stats|validate|build [--allow-small]\n  dataset export --version HASH [--format laya|canonical]\n  compare --live                 Explicitly authorize Jev/Laya comparison; only one active arm\nNo command trains, promotes a model, reads keys into output, or uploads a dataset.\n`;
 const output = x => process.stdout.write(JSON.stringify(x, null, 2) + '\n');
 async function stdin() {
   if (process.stdin.isTTY) fail('PIPE_JSON_TO_STDIN');
@@ -18,30 +21,118 @@ async function stdin() {
   try { return JSON.parse(new TextDecoder('utf-8', { fatal: true }).decode(Buffer.concat(chunks))); }
   catch { fail('INVALID_JSON'); }
 }
+async function confirmPrompt(text) {
+  const rl = readline.createInterface({ input: process.stdin, output: process.stdout, terminal: true });
+  try { return await new Promise(resolve => rl.question(text, resolve)); } finally { rl.close(); }
+}
+function splitDoubleDash(argv) {
+  const at = argv.indexOf('--');
+  return at === -1 ? { head: argv, rest: null } : { head: argv.slice(0, at), rest: argv.slice(at + 1) };
+}
+function parseFlags(head, allowed) {
+  const out = {};
+  for (let i = 0; i < head.length; i++) {
+    const token = head[i];
+    if (!token.startsWith('--')) fail('INVALID_RUNNER_ARGS');
+    const name = token.slice(2);
+    if (name === 'replace') { out.replace = true; continue; }
+    if (!allowed.includes(name)) fail('UNEXPECTED_OPTION');
+    const value = head[++i];
+    if (value === undefined) fail('INVALID_RUNNER_ARGS');
+    out[name] = value;
+  }
+  return out;
+}
+function coerceLabel(value) {
+  if (value === 'true') return true;
+  if (value === 'false') return false;
+  if (/^-?\d+$/.test(value)) return Number(value);
+  return value;
+}
+function runnerHome(flags, env) { return resolveHome({ ...env, ...(flags.home ? { JEV_HOME: flags.home } : {}) }); }
+async function runnerMain(argv, env) {
+  const sub = argv[0];
+  const tty = { isStdinTTY: Boolean(process.stdin.isTTY), isStdoutTTY: Boolean(process.stdout.isTTY), prompt: confirmPrompt };
+  if (sub === 'list') {
+    const { head, rest } = splitDoubleDash(argv.slice(1)); if (rest !== null) fail('UNEXPECTED_OPTION');
+    const flags = parseFlags(head, ['home']);
+    output(listRunners(runnerHome(flags, env))); return;
+  }
+  if (sub === 'allow') {
+    const { head, rest } = splitDoubleDash(argv.slice(1));
+    if (!rest || !rest.length) fail('RUNNER_ARGV_REQUIRED');
+    const flags = parseFlags(head, ['home', 'name', 'timeout-ms', 'cwd', 'purpose', 'question', 'pass-label', 'fail-label']);
+    if (!flags.name) fail('RUNNER_NAME_REQUIRED');
+    if (!flags['timeout-ms']) fail('RUNNER_TIMEOUT_REQUIRED');
+    const check = { argv: rest, timeoutMs: Number(flags['timeout-ms']) };
+    if (flags.cwd !== undefined) check.cwd = flags.cwd;
+    if (flags.purpose !== undefined) check.purpose = flags.purpose;
+    if (flags.question !== undefined) check.question_id = flags.question;
+    if (flags['pass-label'] !== undefined) check.pass_label = coerceLabel(flags['pass-label']);
+    if (flags['fail-label'] !== undefined) check.fail_label = coerceLabel(flags['fail-label']);
+    output(await allowRunner({ home: runnerHome(flags, env), name: flags.name, check, replace: Boolean(flags.replace),
+      ...tty, write: t => process.stdout.write(t) })); return;
+  }
+  if (sub === 'remove') {
+    const { head, rest } = splitDoubleDash(argv.slice(1)); if (rest !== null) fail('UNEXPECTED_OPTION');
+    const flags = parseFlags(head, ['home', 'name']);
+    if (!flags.name) fail('RUNNER_NAME_REQUIRED');
+    output(await removeRunner({ home: runnerHome(flags, env), name: flags.name, ...tty })); return;
+  }
+  if (sub === 'verify') {
+    const { head, rest } = splitDoubleDash(argv.slice(1)); if (rest !== null) fail('UNEXPECTED_OPTION');
+    const flags = parseFlags(head, ['home', 'decision', 'check']);
+    if (!flags.decision || !flags.check) fail('RUNNER_VERIFY_ARGS_REQUIRED');
+    const home = runnerHome(flags, env);
+    const store = createTrainingStore({ home });
+    output(await verifyRunner({ store, home, decisionId: flags.decision, checkName: flags.check })); return;
+  }
+  fail('INVALID_TRAINING_COMMAND');
+}
 export async function trainingMain(argv, env = process.env) {
+  if (argv[0] === 'runner') { await runnerMain(argv.slice(1), env); return; }
   const { values, positionals } = parseArgs({ args: argv, allowPositionals: true, strict: true, options: {
     home: { type: 'string' }, version: { type: 'string' }, format: { type: 'string' }, live: { type: 'boolean' }, help: { type: 'boolean' },
+    decision: { type: 'string' }, 'allow-small': { type: 'boolean' },
   } });
   const [command, sub, action] = positionals;
   if (!TRAINING_COMMANDS.includes(command) || positionals.length > 3) fail('INVALID_TRAINING_COMMAND');
   if (values.help) { process.stdout.write(TRAINING_HELP); return; }
-  const allowed = command === 'dataset' && sub === 'export' ? ['home', 'version', 'format'] : command === 'compare' ? ['home', 'live'] : ['home'];
+  const allowed = command === 'dataset' && sub === 'export' ? ['home', 'version', 'format']
+    : command === 'dataset' && sub === 'build' ? ['home', 'allow-small']
+    : command === 'compare' ? ['home', 'live']
+    : command === 'training' && sub === 'correct' ? ['home', 'decision']
+    : ['home'];
   if (Object.keys(values).some(k => !allowed.includes(k))) fail('UNEXPECTED_OPTION');
   const home = resolveHome({ ...env, ...(values.home ? { JEV_HOME: values.home } : {}) });
   const store = createTrainingStore({ home });
   if (command === 'training') {
-    if (sub === 'capture' && ['on', 'off', 'status'].includes(action)) {
+    if (sub === 'capture') {
+      if (!['on', 'off', 'status'].includes(action)) fail('INVALID_TRAINING_COMMAND');
       output(action === 'status' ? store.status() : store.setCapture(action === 'on')); return;
     }
-    if (action) fail('INVALID_TRAINING_COMMAND');
-    if (sub === 'outcome') { output(store.outcome(await stdin())); return; }
+    if (sub === 'min-labels') {
+      if (action === undefined) { output(store.status()); return; }
+      // Lowering the dataset gate is an operator decision; a piped agent may read it but not change it.
+      if (!process.stdin.isTTY || !process.stdout.isTTY) fail('HUMAN_TTY_REQUIRED');
+      output(store.setMinLabels(Number(action))); return;
+    }
+    if (sub === 'correct') {
+      if (action !== undefined) fail('INVALID_TRAINING_COMMAND');
+      if (!values.decision) fail('DECISION_ID_REQUIRED');
+      output(await correctDecision({ store, home, decisionId: values.decision,
+        isStdinTTY: Boolean(process.stdin.isTTY), isStdoutTTY: Boolean(process.stdout.isTTY),
+        prompt: confirmPrompt, write: t => process.stdout.write(t) })); return;
+    }
+    if (action !== undefined) fail('INVALID_TRAINING_COMMAND');
+    if (sub === 'outcome') { output(store.outcome(await stdin(), { trust: 'host' })); return; }
     if (sub === 'host') { output(recordHost(store, await stdin())); return; }
     if (sub === 'evaluate') { output(evaluateStore(store)); return; }
   }
   if (command === 'dataset' && !action) {
     if (sub === 'stats') { output(datasetStats(store)); return; }
     if (sub === 'validate') { const r = validateDatasetSource(store); output(r); if (!r.ok) process.exitCode = 2; return; }
-    if (sub === 'build') { output(buildDataset(store)); return; }
+    if (sub === 'build') { output(buildDataset(store, { allowSmall: Boolean(values['allow-small']) })); return; }
     if (sub === 'export') { if (!values.version) fail('DATASET_VERSION_REQUIRED'); output(exportDataset(store, values.version, values.format ?? 'laya')); return; }
   }
   if (command === 'provider' && !action) {
