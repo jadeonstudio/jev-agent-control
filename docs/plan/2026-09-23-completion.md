@@ -142,7 +142,10 @@ owner가 개정을 승인했다. P0 커밋에서 `AGENTS.md`를 개정했다: �
 - 강한 라벨 기준 수 도달 시 metrics·doctor 알림만, 자동 학습·교체 없음.
 - acceptance: 합성 checkpoint 픽스처로 register → qualify(합격·불합격) → promote → rollback, 고정 holdout 악화 시 promote 거부 음성 테스트.
 
-### P6. 문서·배포·인계 — 진행 중
+### P6. 문서·배포·인계 — 완료
+- 설치본 갱신(2026-09-23): OFF → fast-forward(f6cc01e) → 설치본 테스트 312/312·smoke·Laya worker → 재설치(Codex `--hooks`, Claude `--hooks --no-skills`, 변경 0) → doctor → owner 승인 상태인 SHADOW로 복귀.
+- doctor: 두 호스트 hook·관리 블록 installed, Codex trust `present-unverified`, `checksNotPerformed: native-client-e2e, live-api, native-hook-execution`(doctor 자체는 네이티브 확인을 하지 않는다. 네이티브 확인 기록은 P3·P4 절). Claude MCP `jev_agent_control` Connected, Codex MCP enabled.
+- 호스트 재연결: 이미 열려 있는 Codex/Claude 세션의 MCP 서버는 이전 코드를 들고 있을 수 있다. 새 세션부터 갱신본이 적용된다.
 - 인계 메모: `docs/handoff/2026-09-23-trader-aegis.md`(trader 미수정). 검증 현황: `docs/TESTING.md` 2026-09-23 절.
 - README, ARCHITECTURE, TRAINING_DATA 갱신, 사실 아닌 문장 같은 커밋에서 수정.
 - 설치본 절차대로 갱신, 두 호스트 doctor, checksNotPerformed 그대로 보고.
@@ -190,3 +193,22 @@ owner가 개정을 승인했다. P0 커밋에서 `AGENTS.md`를 개정했다: �
 - 연결 키 실측: PreToolUse에는 `tool_use_id`가 있고 `agent_id`는 없다. SubagentStart/Stop에는 `agent_id`가 있고 `tool_use_id`는 없다. 부모 transcript의 Agent tool_result(`toolUseResult`)에 `agentId`·`resolvedModel`이 있으므로, PostToolUse(Agent)의 tool_response로 `tool_use_id ↔ agent_id`를 잇는다. 공통 `session_id`·`prompt_id`도 있다.
 - SubagentStop 입력 키: `agent_id`, `agent_type`, `agent_transcript_path`, `last_assistant_message`, `stop_hook_active`, `effort`, `background_tasks`, `session_crons` 등. 성공/실패 필드는 없다.
 - 사용량: 총 $0.2029(list 기준 환산값, 실제 청구 방식은 확인 불가). haiku 메인 + sonnet 서브 1턴.
+
+## 최종 요약 (2026-09-23)
+
+| 단계 | 상태 | 주요 커밋 |
+|---|---|---|
+| P0 | 완료 | da92f5b, c91bc61 |
+| P1 | 국소 검증됨(실제 policy v2 이전·Claude profile 적용) | a2c8900 |
+| P2 | 국소 검증됨 | 515702d |
+| P3 | 동작 검증됨(두 호스트 hook 발화·원복·재적용) | d3ced84, 0b1a624, 722dc14, a5e9324, e91594f, 3b7975e, 9c90627, cfc51f8 |
+| P4 | SHADOW 운영 중, ON 기준 미충족 | a0b2162, fbae3aa |
+| P5 | 국소 검증됨(합성), 실제 학습·가중치 미실행 | 63915a6, 424d5ae |
+| P6 | 완료 | f6cc01e |
+
+목표별 "실제로 되는가"와 증거 수준:
+- **G1(역할·모델 판단)**: Claude는 hook이 맥락 표시 있는 spawn마다 TypeSafe route를 호출하는 것까지 **네이티브 세션**에서 확인했다(첫 표본은 `UNCERTAIN_DIMENSIONS`로 추천 없음). hook 재작성으로 모델이 실제 바뀌는 것은 R3에서 **네이티브** 확인했지만, jev 추천에 따른 ON 재작성은 아직 없다(SHADOW). Codex는 0.154.0이 hook에 spawn 메시지를 불투명하게 넘겨 **hook 기반 판단 불가**. 판단 품질은 **UNKNOWN**.
+- **G2(자동 경유)**: Claude는 작업자 역할 spawn 시 hook이 자동으로 jev를 거친다(**네이티브**). 단 에이전트가 맥락 표시 한 줄을 넣어야 하며, 관리 블록이 이를 안내한다(기억 의존이 한 줄로 줄었을 뿐 0은 아니다). Codex는 관리 블록 안내에 따른 명시 `jev_route` 호출에 의존한다.
+- **G3(Laya 성장)**: 데이터(강한 라벨 경로·표본 게이트·export)와 교체 수명주기(register~rollback)는 **합성** 검증만 했다. 실제 학습·qualify·promote는 수행하지 않았다. 현재 실사용 강한 라벨 0건(host_review 1건)이라 학습 후보 조건(purpose별 100)과 거리가 멀다.
+
+남은 UNKNOWN: SHADOW 표본 기반 추천 품질, Claude ON 재작성 네이티브 동작, 실제 Laya 가중치로 qualify·compare, fine-tune 실행 시간·비용(공식 notebook 기준 학습 루프 약 4–6분, 전체는 확인 불가), MPS 단일 장치 학습 가능성, 패키지 버전(laya 외), Codex 차기 버전에서 hook 메시지 가시성.
