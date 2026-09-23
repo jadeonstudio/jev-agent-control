@@ -131,6 +131,11 @@ owner 요청: 이 Mac(Apple M4 Pro, GPU 16코어, 통합 메모리 24GB)에서 L
     - 라벨 분포(긴 999): intent edit 383·explain 165·debug 161·architecture 147·research 97·other 32·operate 14 / difficulty(0~4) 3이 456으로 최다 / risk safe 676·caution 203·high 105·unknown 15. 짧은 1,998은 intent other 498, difficulty 2가 1,212로 몰림(짧은 문장은 정보가 적어 teacher도 판단을 유보)
     - teacher 일관성(번역 쌍 304쌍의 ko·en argmax 일치): intent 0.86, risk 0.83, difficulty 0.69. 같은 작업을 언어만 바꿨을 때도 difficulty는 약 3할이 갈리므로, difficulty는 teacher 라벨 자체의 잡음이 크고 soft target과 사람 검수가 특히 중요하다. 이 수치는 teacher 자기 일관성이지 정확도가 아니다
   - [x] owner TTY 검수 시작 후 중단: 선택지·영어 문장 판독이 어렵다는 owner 판단으로 평가 기준을 Claude 기준 라벨로 개정(위 결정 표)
-  - [ ] Claude 기준 라벨 300개(긴 문장, ko 150·en 150, group당 1개) → Jev·Claude 일치율 측정 → train 라벨 유지/교체 결정 → build → export → Kaggle 학습(multilingual 기반, `--input-fit task-head`로 등록) → holdout·qualify·compare·promote
+  - [x] owner 추가 지시(2026-09-23): owner가 직접 하기로 한 일(검수·Kaggle 학습·승격·서버 재시작)을 Claude가 모두 수행. Kaggle 대신 로컬 M4 Pro MPS 학습(계정·자격증명 불필요, 추가 다운로드 없음)
+  - [x] Claude 기준 라벨(Opus 워커, Jev 라벨 비공개): 평가 300(긴 문장, ko 150·en 150, group당 1개) + 학습 2,555(평가 group 형제 145개 제외). 값 오류 0
+  - [x] Jev teacher vs Claude(평가 300): intent 0.847(ko 0.88·en 0.81), risk 0.677(ko 0.76·en 0.59), difficulty 0.377(±1 이내 0.82). 학습 2,552에서는 0.709/0.594/0.38. Jev는 risk를 덜 조심스럽게(safe→Claude caution 54건), intent에 architecture를 과하게 붙임. 목표가 Claude 수준이므로 **train 라벨도 Claude로 교체** (b0e809d)
+  - [x] build(dataset 07988f22…): 전부 ai_reference, train 7,659 / calibration 423 / test 477 샘플, group 누수 제외 145, 예시 이메일 2건 제외(import·build 검사 통일, e988b85). export 검증 통과
+  - [x] 학습 키트 결함 2건 발견·수정: gradient clipping이 첫 스텝 후 꺼지던 generator 버그(a474531), 24GB에서 batch 8 스왑(약 8.5초/step) → batch 4(약 0.8초/step)
+  - [~] 로컬 학습(batch 4 × grad-accum 16, fp32, 4 epoch) → register(fp16·mps·task-head) → holdout freeze → qualify(Claude 일치율) → compare(english zero-shot 대비) → 조건 충족 시 promote·서버 재시작
 - [x] L5 Codex A/B 실측(B4) 후 owner 승인으로 Codex 관리 블록에서 spawn 전 route 안내 제거, hook 기록만 유지
 - [ ] L6 설치본 반영·문서·커밋

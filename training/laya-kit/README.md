@@ -245,7 +245,14 @@ owner 결정(2026-09-23): fine-tune 기준 checkpoint는 **multilingual**(mmBERT
   구간은 이후). 체크포인트는 `laya.agent.Agent(output_dir, device='mps')`로 즉시
   로드돼 route 형태 질문(`intent` choice)에 정상 응답했다(`predict()` 0.64초).
   `check_tokenizer_admission`도 정상 통과(0/54 truncated).
-- **예상 소요 시간 (owner 목표 규모, 투영치)**: owner 계획(`docs/plan/2026-09-23-laya-local-performance.md`)의
+- **실제 규모 실측 (2026-09-23, M4 Pro 24GB, multilingual base, 실제 증류 데이터 train 7,659행, 최대 1,024토큰)**:
+  - `--batch-size 8`(기본): 활성값이 커서 여유 메모리가 21%까지 떨어지고 스왑(약 18GB)이
+    일어나 **약 8.5초/micro-step**(4 epoch 약 9시간 투영). smoke의 0.60초는 짧은 합성 행이라
+    이 메모리 병목을 드러내지 못했다(MPS 통합 메모리는 프로세스 RSS에 잡히지 않는다).
+  - `--batch-size 4`(grad-accum 16, 유효 배치 64 동일): **약 0.72~0.88초/micro-step**,
+    1 epoch 1,915 step 약 26분, 4 epoch 약 1시간 45분(투영). **24GB 기기에서는 batch-size 4를 권장한다.**
+  - 스왑 사용량은 `sysctl vm.swapusage`로, 속도는 로그의 50 step 간격 시각으로 확인한다.
+- **예상 소요 시간 (owner 목표 규모, 투영치 -- 위 실측으로 대체됨)**: owner 계획(`docs/plan/2026-09-23-laya-local-performance.md`)의
   실제 데이터 규모는 작업 문장 약 3,000개 × 질문 3개 = **약 9,000개 학습 시퀀스**(잘림
   없다고 가정, smoke에서 실측 잘림률 0%와 일치). 공식 epochs=4, batch-size=8 기준
   micro-batch 수 = `ceil(9000/8) * 4 = 4,500`. smoke에서 잰 정상 구간 0.60초/step을 그대로
