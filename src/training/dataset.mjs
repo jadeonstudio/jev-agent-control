@@ -1,6 +1,6 @@
 import path from 'node:path';
 import { readText } from '../storage.mjs';
-import { DEFAULTS, PURPOSES, fail } from '../constants.mjs';
+import { DEFAULTS, PURPOSES, ID, fail } from '../constants.mjs';
 import { validateRequest, wireRequest } from '../contracts.mjs';
 // Canonical validation shares the inference input contract.
 import { POLICY_VERSION, HASH, encode, digest, safeContent, targetDistribution, validateTarget, validateProvenance, only, id } from './schema.mjs';
@@ -118,12 +118,28 @@ export function readDataset(store, version) {
     s.provenance.forEach(validateProvenance); s.task_ids.forEach(id); id(s.task_id);
     if (!s.task_ids.includes(s.task_id) || !s.snapshot_ids.includes(s.snapshot_id) || s.snapshot_ids.some(x => !HASH.test(x)) || !HASH.test(s.request_hash) || !HASH.test(s.group_id)) fail('INVALID_CANONICAL_DATASET');
     validateRequest({purpose:s.purpose,risk:'routine',state:s.state,questions:{[s.question_id]:s.question}}, DEFAULTS);
-    if (!Number.isFinite(s.label_confidence) || s.label_confidence < EVALUATION_POLICY.minLabelConfidence || s.label_confidence > 1 || !['objective','human','mixed_independent'].includes(s.label_source)) fail('INVALID_CANONICAL_DATASET');
-    for (const key of ['decisions','outcomes']) { if (!Array.isArray(s.raw_refs[key]) || !s.raw_refs[key].length) fail('INVALID_CANONICAL_DATASET'); s.raw_refs[key].forEach(id); }
+    if (s.schema_version !== 1 || s.evaluation_policy_version !== POLICY_VERSION || !['train', 'calibration', 'test'].includes(s.split)) fail('INVALID_CANONICAL_DATASET');
+    // A distilled teacher label is soft, self-reported supervision from an LLM call, not an independently
+    // verified assertion (see laya-distill.mjs / TRAINING_DATA.md §7): it may only ground TRAIN samples.
+    if (s.label_source === 'teacher' && s.split !== 'train') fail('TEACHER_LABEL_IN_EVAL_SPLIT');
+    if (!Number.isFinite(s.label_confidence) || s.label_confidence < EVALUATION_POLICY.minLabelConfidence || s.label_confidence > 1 ||
+        !['objective', 'human', 'mixed_independent', 'teacher'].includes(s.label_source)) fail('INVALID_CANONICAL_DATASET');
+    if (s.raw_refs.distill !== undefined) {
+      only(s.raw_refs, ['distill'], ['distill']);
+      only(s.raw_refs.distill, ['run', 'task_id'], ['run', 'task_id']);
+      if (typeof s.raw_refs.distill.run !== 'string' || !ID.test(s.raw_refs.distill.run) || !HASH.test(s.raw_refs.distill.task_id)) fail('INVALID_CANONICAL_DATASET');
+    } else {
+      for (const key of ['decisions','outcomes']) { if (!Array.isArray(s.raw_refs[key]) || !s.raw_refs[key].length) fail('INVALID_CANONICAL_DATASET'); s.raw_refs[key].forEach(id); }
+    }
     validateTarget(s.question, s.target.value);
-    if (s.schema_version !== 1 || s.evaluation_policy_version !== POLICY_VERSION ||
-        !['train', 'calibration', 'test'].includes(s.split) || encode(targetDistribution(s.question, s.target.value)) !== encode(s.target.probabilities) ||
-        s.sample_id !== digest({ request_hash: s.request_hash, question_id: s.question_id, target: s.target })) fail('INVALID_CANONICAL_DATASET');
+    if (s.label_source === 'teacher') {
+      // Soft target: sum to 1 within tolerance and cover exactly the question's option keys; not forced one-hot.
+      const keys = s.question.type === 'choice' ? Object.keys(s.question.criteria) : s.question.type === 'noul' ? ['false', 'true'] : s.question.criteria.map((_, i) => String(i));
+      only(s.target.probabilities, keys, keys);
+      const values = Object.values(s.target.probabilities);
+      if (values.some(v => typeof v !== 'number' || !Number.isFinite(v) || v < 0 || v > 1) || Math.abs(values.reduce((a, b) => a + b, 0) - 1) > 0.02) fail('INVALID_CANONICAL_DATASET');
+    } else if (encode(targetDistribution(s.question, s.target.value)) !== encode(s.target.probabilities)) fail('INVALID_CANONICAL_DATASET');
+    if (s.sample_id !== digest({ request_hash: s.request_hash, question_id: s.question_id, target: s.target })) fail('INVALID_CANONICAL_DATASET');
   }
   return { manifest, samples, contents };
 }

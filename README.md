@@ -169,6 +169,19 @@ jev-control laya status
 
 구체적인 schema·outcome 예제·보안·공식 notebook 근거: **[TRAINING_DATA.md](docs/TRAINING_DATA.md)**. 키/모델 없이 전체 흐름을 확인하려면 `node examples/training-pipeline.mjs`를 실행하세요. 이 예제는 synthetic inference와 무해한 실제 assertion이며 모델 정확도 실험이 아닙니다.
 
+### teacher 증류 + 사람 검수 (`register` 전, 한국어 route 라벨이 없을 때)
+
+```sh
+jev-control laya distill import --run r1 --input synthetic-tasks.jsonl   # {lang, domain?, task} 합성 문장만
+jev-control laya distill import-shadow --run r1                          # 캡처된 shadow task 문장(egress 금지, 외부 전송 없음)
+jev-control laya distill label --run r1 --confirm-egress                 # 합성 문장만 Jev(TypeSafe)로 전송, 분당 50회 제한
+jev-control laya distill review --run r1 --count 200                     # TTY 전용 사람 검수, 언어별 층화, 재개 가능
+jev-control laya distill build --run r1                                  # teacher 라벨은 train만, 사람 검수는 calibration/test만
+jev-control laya distill status --run r1
+```
+
+teacher = Jev(TypeSafe). teacher 라벨은 `dataset build`가 만드는 canonical dataset의 `train` split에만 들어가고, `calibration`/`test`/holdout(`laya holdout freeze`가 test split을 고정)은 owner가 검수한 라벨만 씁니다. `laya qualify`는 항상 사람 검수 split만 보므로, 자격 판정은 teacher가 아니라 사람 검수 결과에 근거합니다. 자세한 스키마·근거: **[TRAINING_DATA.md §7](docs/TRAINING_DATA.md)**.
+
 ## 검증과 제거
 
 ```sh

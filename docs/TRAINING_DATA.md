@@ -190,6 +190,36 @@ $JEV_HOME/laya/history.jsonl                       # promote/rollback이 있을 
 
 `compare`는 후보와 현재 `providers.json`의 활성 laya checkpoint(없으면 `--no-active-baseline` 명시 필요)를 같은 고정 holdout으로 각각 추론해 purpose별로 두 값을 기록한다. `raw`는 임계값 없이 모든 답을 채점한 정확도이고, `selective`는 그 checkpoint가 자격을 받은 purpose에서만 자기 임계값으로 채점한 정확도·coverage다. `promote`는 다음을 모두 만족할 때만 `providers.json`의 laya 블록을 원자적으로 교체한다: 후보 qualification이 `qualified:true`이고 비교와 **같은 holdout**으로 만들어졌을 것(`QUALIFICATION_HOLDOUT_MISMATCH`), 같은 holdout의 비교 보고가 현재 활성 checkpoint 기준으로 존재할 것, 자격 purpose마다 후보의 `raw` 정확도가 활성보다 `maxRegression`(기본 0.02) 넘게 나쁘지 않을 것(망각 검사), 활성도 그 purpose 자격이 있으면 `selective` 정확도·coverage도 같은 허용치 안일 것. 자격 없는 활성(예: 첫 fine-tune 전 base)과는 서로 다른 임계값의 coverage를 비교하지 않는다. 쓰기 전에 결과 설정을 런타임 로더와 같은 `validateProviderConfig`로 검증한다. `provider`(jev/laya) 선택 자체는 바꾸지 않는다. 조건을 하나라도 어기면 `PROMOTION_REFUSED`와 위반 목록을 반환하고 아무것도 쓰지 않는다. `rollback`은 promote를 스택처럼 하나씩 되돌린다. 이미 되돌린 checkpoint를 다시 적용하지 않으므로 rollback이 게이트 없는 재승격이 되지 않는다. 현재 `providers.json`의 checkpoint가 마지막 promote가 설치한 것과 다르면 `ROLLBACK_STATE_MISMATCH`로 거부하고, 되돌릴 promote가 없으면 거부한다.
 
+## 7. 증류(teacher) 데이터 (`src/training/laya-distill.mjs`, `jev-control laya distill ...`)
+
+**owner 결정 (2026-09-23, `docs/plan/2026-09-23-laya-local-performance.md`):** Laya 한국어 route 판단 품질이 zero-shot으로는 쓸 수 없는 수준(B3/B5 실측)이라, teacher 증류 + 사람 검수로 학습한다. teacher = Jev(TypeSafe). 합성 작업 문장 3,000개(한·영 절반)를 teacher에 보내고, 그중 owner가 검수한 200개(한·영 100개씩)만 calibration/test/holdout의 정답으로 쓴다. **teacher 라벨은 train split에만 허용하고, calibration·test·holdout은 사람 검수 라벨만 허용한다.** 근거: 공식 `LocalLLaMA/typed-decisions` 데이터셋의 gold 자체가 사람 라벨이 아니라 LLM teacher의 3회 샘플 평균 분포이고, teacher 자체 일치도(0.735)가 fine-tune 후 test 정확도(0.766)보다 낮다 — teacher는 학습 신호로는 쓸 만하지만 독립적인 정답 판정 기준은 될 수 없다. 이 한계 때문에 teacher가 만든 라벨을 평가/자격(qualify) 기준에 섞으면 "teacher의 실수를 teacher 기준으로 통과시키는" 순환 검증이 된다.
+
+**외부 전송 범위.** `distill import`로 들어온 합성 문장만 `egress:'allowed'`로 표시되고, `distill label`이 그 문장만 TypeSafe로 보낸다. 실제 spawn에서 캡처된 shadow task 문장(`distill import-shadow`, 기존 training capture의 route decision에서 가져온 `state.task`)은 `egress:'forbidden'`으로 저장되며 어떤 경로로도 teacher에 보내지지 않는다. `distill label`은 `--confirm-egress` 없이 거부되고(`EXPLICIT_REMOTE_TEACHER_CONSENT_REQUIRED`), 전역 OFF/SHADOW 모드와 무관하게 동작하는 별도의 명시 운영 배치다(일반 `decide()` 경로를 쓰지 않는다). 호출 간격은 분당 50회 이하로 스로틀하고, 동시 호출은 1개, 실패한 호출을 자동으로 재시도하지 않는다 — 실패는 `teacher-failures.jsonl`에 코드만 남고, 같은 task는 성공 라벨이 없으므로 다음 `distill label` 실행에서 자동으로 재시도 대상이 된다(재개 가능).
+
+**state 고정 context 이유.** `routeGuard`(src/routing.mjs)는 `context`가 `{complete:true, scope:'local', previousFailures:0, highImpact:false, modelLocked:false, exhaustive:false}`일 때만 모델까지 도달한다. 증류 샘플의 teacher 호출·학습 target·실제 추론 입력이 이 고정 context로 전부 일치해야 train된 모델이 실제 route 판단 입력 분포와 같은 것을 본다. `laya-distill.mjs`의 `FIXED_ROUTE_CONTEXT`가 이 값을 고정하고, `distill label`/`distill review`/`distill build` 모두 같은 헬퍼로 요청을 구성한다.
+
+**저장 위치** (`JEV_HOME/laya/distill/<run>/`, 디렉터리 0700 / 파일 0600, append-only JSONL, `noSymlinks`·`outsideGit`와 동일한 안전 규칙 재사용):
+
+```text
+tasks.jsonl             {task_id, lang, domain, task, source:'synthetic'|'shadow', egress:'allowed'|'forbidden', added_at}
+teacher.jsonl           {task_id, model, answers:{intent,difficulty,risk 각 {probabilities}}, usage, at}
+teacher-failures.jsonl  {task_id, code, at} — 실패만, 재시도는 다음 label 실행이 eligible 재계산으로 자동 수행
+review.jsonl            {task_id, labels:{intent,difficulty,risk}, reviewer:'human-tty', at}
+```
+
+**흐름 (`jev-control laya distill ...`):**
+
+1. `import --run R --input FILE.jsonl` — `{lang:'ko'|'en', domain?, task}`(task 1–2000자) 검증. `containsSensitiveData`에 걸리는 줄은 제외하고 개수만 보고한다. 정규화한 문장 텍스트의 sha256으로 `task_id`를 만들어 파일 내부·기존 저장분과 중복 제거한다. `source:'synthetic'`, `egress:'allowed'`로 저장.
+2. `import-shadow --run R` — 기존 training capture store에서 `purpose:'route'`인 decision들의 `state.task`를 가져와 같은 정규화·중복 제거·민감정보 검사를 거쳐 `source:'shadow'`, `egress:'forbidden'`으로 저장한다. 언어는 한글 포함 여부로 휴리스틱 판정한다(동일 OS 사용자용 로컬 도구이며 정밀한 언어 감지가 필요하지 않다).
+3. `label --run R --confirm-egress [--limit N]` — `egress:'allowed'`이고 아직 teacher 라벨이 없는 task만 대상으로 `callTypeSafe`를 직접 호출한다(모델은 `features.json`의 `router.expectedModel`). 진행 출력은 개수·오류 코드·누적 usage만 담고 문장 내용은 출력하지 않는다.
+4. `review --run R [--count 200]` — stdin·stdout이 TTY가 아니면 `HUMAN_TTY_REQUIRED`. teacher 라벨이 있는 task 중 task_id 해시 순으로 언어별 `count/2`개를 결정적으로 고르고, 이미 `review.jsonl`에 있는 task는 건너뛴다(중단 후 재개 가능). 질문마다 teacher 최상위 답과 확률을 보여주고, Enter는 teacher 답 수락, 유효한 라벨 입력은 override, `s`는 그 task 건너뛰기(라벨 미기록, 다음 실행에서 다시 후보), `q`는 지금까지 기록한 것만 저장하고 종료한다.
+5. `build --run R` — 표준 `datasets/<version>`(canonical.jsonl + manifest) 레이아웃으로 쓴다(같은 `training/` store를 공유하므로 `dataset export --format laya`, `laya holdout freeze`, `laya qualify`가 그대로 동작한다). 사람이 검수한 task는 task_id 해시로 결정적 50/50 calibration/test로 가고 `label_source:'human'`(soft 아님, 확정 one-hot), 검수 안 된 teacher-라벨 synthetic task는 `split:'train'`, `label_source:'teacher'`, `target.probabilities`는 teacher 분포 그대로(soft target)로 들어간다. 검수된 task는 절대 train에 들어가지 않는다(누출 방지). shadow task는 검수된 경우에만(즉 사람이 직접 라벨을 단 경우에만) human 샘플로 포함되고, 아니면 데이터셋에서 제외된다.
+6. `status --run R` — task 수(source/lang별), teacher 라벨·실패 수, 검수 수, 누적 teacher usage만 반환한다. 문장 내용은 절대 포함하지 않는다.
+
+**`readDataset`(src/training/dataset.mjs) 확장.** 기존 canonical 검증(스키마·해시·split·one-hot 정합성)은 그대로 두고 두 가지를 추가했다: (1) `label_source:'teacher'`는 `split:'train'`에서만 허용하고, train이 아닌 곳에 있으면 일반 `INVALID_CANONICAL_DATASET`이 아니라 구분되는 `TEACHER_LABEL_IN_EVAL_SPLIT`으로 거부한다 — `readDataset`을 공유하는 `freezeHoldout`/`qualifyCandidate`/`exportDataset` 모두 이 가드를 거친다. (2) `label_source:'teacher'`인 샘플의 `target.probabilities`는 정확한 one-hot 일치 대신 "질문 옵션 키와 정확히 일치 + 합이 1±0.02"만 요구한다(soft target 허용). (3) `raw_refs`는 기존 `{decisions:[...], outcomes:[...]}` 외에 `{distill:{run, task_id}}` 형태도 허용한다(증류 샘플에는 원본 decision/outcome 이벤트가 없다). 증류 샘플의 `task_id`/`snapshot_id`는 여전히 UUID/sha256 포맷 검증을 통과해야 하므로, `laya-distill.mjs`는 task 텍스트의 sha256을 UUIDv4 형태로 재인코딩해 `task_id`로 쓰고(원본 64-hex 해시는 `raw_refs.distill.task_id`에 보존), `snapshot_id`는 `digest('distill-run:'+run)`을 공유한다(코드 스냅샷이 없는 합성 데이터라 run 전체가 하나의 스냅샷이다).
+
+**한계.** teacher 자체 오류가 train 라벨에 그대로 들어간다 — 이는 설계상 감수하는 트레이드오프이며, 그래서 calibration/test/holdout을 teacher와 독립된 사람 검수로만 고정했다. `laya qualify`의 자격 판정은 항상 이 사람 검수 split만 보므로, 자격 있는 checkpoint의 판단 신뢰도는 teacher 품질이 아니라 사람 검수 결과에 근거한다.
+
 ## 검증 후에만 다음 단계
 
 Jev 실API, 실제 공식 Laya 가중치/MPS, Codex/Claude native 세션과 대표 한국어 업무의 품질·calibration은 offline fixture 테스트와 다르다. 별도로 실제 runtime smoke → blind shadow → 격리 paired downstream 실행 → 검증된 좁은 purpose만 ON 순서로 검증한다. 학습은 충분한 검증 라벨이 쌓인 뒤 offline training → holdout 평가 → shadow → 명시적 promotion으로 수행하며 이 저장소가 자동으로 시작하지 않는다.
