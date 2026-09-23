@@ -1,0 +1,145 @@
+# jev-agent-control 완성 계획 (2026-09-23)
+
+출처: trader 세션(Astra 대전)이 전달한 owner 제이드의 작업 지시서. 원본 사본은 trader 세션 scratchpad `jev-completion-prompt.md`에 있다.
+이 저장소의 `AGENTS.md`·`CLAUDE.md`·`SECURITY.md`·`docs/TRAINING_DATA.md` 안전 규칙이 이 계획보다 우선한다.
+
+## 목표
+
+```text
+Codex / Claude / 직접 만든 실행기
+  → (자동 호출: hook·dispatcher)
+  → 공통 Decision Control Layer (OFF/SHADOW/ON, 범위·예산·검증·채택)
+  → 명시적으로 선택한 provider (Jev TypeSafe API │ Laya 공식 Python 상주 worker)
+  → Decision + 모델·checkpoint 출처
+  → 별도 실제 작업 실행 (호스트 서브에이전트/역할)
+  → Outcome
+  → Evaluation (객관 측정·사람 교정 = 강한 라벨, 에이전트 자기보고 = 약한 라벨)
+  → 검증된 canonical dataset → Laya 학습 형식 export
+  → 학습 → 평가·자격 → shadow 비교 → 명시적 교체 (반복)
+```
+
+- G1: jev/laya가 "어떤 역할·모델·reasoning으로 이 작업을 맡길지"를 정한다.
+- G2: 판단이 필요한 지점에서 에이전트가 기억에 의존하지 않고 자동으로 jev/laya를 거친다.
+- G3: Laya가 쌓인 검증 데이터로 계속 학습해 성장한다.
+
+## 기준선 (2026-09-23 확인)
+
+- main `784e9e5`, 작업 트리 clean. 설치본 `~/.local/share/jev-agent-control/repository`도 `784e9e5`.
+- 호스트 버전: `codex-cli 0.154.0`, `Claude Code 2.1.237`.
+- Codex 역할 `~/.codex/agents/*.toml`: scout, lightweight_worker, implementer(`gpt-5.6-terra`/medium), verifier, specialist, antigravity_bridge.
+- Claude 역할 `~/.claude/agents/*.md`: scout(haiku), lightweight-worker(haiku), implementer(sonnet), verifier(sonnet), specialist(opus), antigravity-bridge(haiku) 외 다수.
+- 라우팅: `src/routing.mjs` chooseRoute는 tier → `features.json` `router.profiles[host][tier].model`. routeGuard는 사용 가능 모델 2개 미만이면 위임한다. 저장소 기본값(`features.example.json`)은 두 호스트 모두 비어 있고, 실제 JEV_HOME의 features.json은 codex만 채워져 있다(luna/terra/sol).
+- 실제 JEV_HOME 상태(`jev-control status`, 2026-09-23): global mode `on`, router `on`, training capture `on`, provider `jev`. owner가 켠 상태이며 이 작업은 바꾸지 않는다. 모든 개발 테스트는 임시 JEV_HOME을 쓴다.
+- G2 자동 호출 경로, G3 학습·자격 생성·등록·교체 경로는 없다.
+
+## 저장소 계약과의 충돌 (2026-09-23 owner 결정으로 개정)
+
+지시서는 저장소 안전 규칙이 우선한다고 명시했다. 현재 `AGENTS.md`는 아래를 범위 밖 또는 금지로 둔다.
+
+| 지시서 단계 | 충돌하는 현재 계약 |
+|---|---|
+| P3 hook 설치, PreToolUse `updatedInput`으로 subagent_type/model 재작성 | `AGENTS.md:26` "not ... permission hooks, ... model proxies or blanket per-tool checks", `AGENTS.md:13` "Do not patch host internals or silently rewrite model configuration" |
+| P3 `~/.codex/AGENTS.md`·`~/.claude/CLAUDE.md` 관리 블록 | `AGENTS.md:10` "Preserve all existing ... project instructions", README "기존 모델·다른 MCP·권한 설정은 보존" |
+| P5 `laya promote`/`rollback` | `AGENTS.md:33` "No online training, automatic provider fallback, or checkpoint promotion" |
+
+owner가 개정을 승인했다. P0 커밋에서 `AGENTS.md`를 개정했다: 소유 hook("Owned host hooks" 절)과 명시적 `laya promote`/`rollback`을 허용하고, hook은 거부·권한 응답을 하지 않으며 spawn 재작성에 필요한 `allow`만 반환한다. README·ARCHITECTURE의 "hook·promotion 없음" 서술은 아직 사실이므로, 해당 기능이 들어가는 P3·P5 커밋에서 함께 고친다.
+
+## 설계 위험과 확정한 대응 (P2)
+
+- **기존 사칭 경로(2026-09-23 코드 확인)**: `jev-control training outcome`은 stdin JSON을 `trust:'operator'`로 저장한다(`src/training/cli.mjs`, `store.outcome`). 비TTY 에이전트가 `source:'runner'`/`'human'`과 objective/human 라벨을 그대로 넣을 수 있다. 대응: CLI stdin outcome은 MCP와 같이 `trust:'host'`로 강제해 host_review로 낮춘다. 강한 라벨은 아래 두 경로와 in-process 라이브러리 runner(`store.outcome`, AEGIS 같은 직접 소유 runner)만 만든다.
+- **`runner verify`의 명령 선택 문제**: jev가 명령을 직접 실행해도 명령을 에이전트가 고르면 `-- true` 같은 무의미한 검증으로 강한 결과를 만들 수 있다. 대응: owner가 TTY에서 등록한 **사전 등록 검증(assertion)**만 실행한다.
+  - `jev-control runner allow`(TTY 전용): 이름, argv(셸 없음), 선택적 `purpose`·`question_id`·`pass_label`·`fail_label`을 `JEV_HOME/runner.json`(0600)에 등록한다.
+  - `jev-control runner verify --decision <id> --check <name>`: 에이전트는 등록된 이름만 고른다. 명령·라벨 대응은 등록 내용에서 온다. purpose·question_id가 decision과 맞지 않으면 거부한다.
+  - 기록: `source:'runner'` outcome, checks에 종료 코드·소요 시간·`sha256(argv, cwd, decision_id, 시작 시각)` 참조. question_id가 있는 검증만 `kind:'label'` check와 objective 라벨을 만든다. 출력 원문은 저장하지 않는다.
+- **route 질문의 라벨 한계**: route decision의 질문은 intent/difficulty/risk다. 작업 성공·테스트 통과는 이 질문의 정답이 아니다(`docs/TRAINING_DATA.md` "라우팅 성공을 feature 정답으로 처리하지 않는다"). route 질문의 강한 라벨은 사람 교정(`training correct`)으로만 생긴다. runner 검증은 route 결과의 객관 outcome(품질·재시도·에스컬레이션)을 남기고, 라벨은 judge/retry/select처럼 질문과 명령 결과가 직접 대응하는 purpose에서만 만든다.
+- **`training correct`의 TTY 검사**: Claude Bash는 TTY가 아니지만 PTY 기반 터미널에서 도는 에이전트는 TTY를 가진다. TTY만으로 사람임을 보장하지 못한다. SECURITY.md 위협 모델(동일 OS 사용자 제외)과 같은 경계로 문서에 명시한다. `runner allow`도 같은 경계다.
+
+## 단계와 acceptance
+
+상태 표기: 미착수 / 진행 중 / 국소 검증됨 / 동작 검증됨 / 완료 / 보류(승인 대기)
+
+### P0. 기준선과 실측 — 부분 완료 (Codex 확정, Claude 네이티브 실측은 CLI 인증 만료로 차단)
+- [x] 계획 문서 작성
+- [x] Codex spawn 모델 우선순위 실측 — 역할 TOML 우선 확정 (R1)
+- [~] Codex PreToolUse updatedInput agent_type 재작성 — 공식 문서 근거 확보, 네이티브 확인은 P3 (R2)
+- [ ] Claude PreToolUse(matcher Agent) updatedInput model 재작성 실측 — 차단(Claude CLI 인증 만료, R3)
+- acceptance: 두 호스트에서 "역할/모델을 hook으로 바꿀 수 있는가"를 증거와 함께 확정하고 아래 실측 기록에 남긴다.
+
+### P1. 역할 단위 라우팅 (G1) — 진행 중
+- profiles를 tier → `{ role, model?, reasoning? }`로 확장, 스키마 버전 올림, 기존 codex profile 자동 이전, 이전 실패 시 fail-closed.
+- Codex: economy→lightweight_worker, standard→implementer, strong→specialist, 조사 전용 intent→scout.
+- Claude: economy→lightweight-worker/haiku, standard→implementer/sonnet, strong→specialist/opus. fable 제외.
+- routeGuard 사용 가능 판정을 "보유 역할 2개 이상"으로 바꾸고 `availableRoles` 입력 추가.
+- doctor/status가 빈 profile·미보유 역할을 경고.
+- 모델 ID·역할 이름은 TypeSafe로 보내지 않는다.
+- acceptance: 두 호스트 profile로 route 결과에 role이 나오고, 미보유 역할이면 `TARGET_UNAVAILABLE`로 위임. 테스트 추가.
+
+### P2. 결정↔실행 연결과 결과 기록 — 미착수
+- hook 입력 `tool_use_id`/`agent_id` ↔ `decision_id` 최소 인덱스(원문 없음, 보존 기한).
+- `jev-control runner allow`(TTY) / `jev-control runner verify --decision <id> --check <name>`: 사전 등록 검증만 jev가 직접 실행, 종료 코드·소요 시간·명령 해시를 `source:'runner'`로 기록. 출력 원문 저장 안 함. 호출자 결과 주입 불가. (위 "설계 위험과 확정한 대응")
+- CLI `training outcome` stdin은 host_review로 강제.
+- `jev-control training correct --decision <id>`: 비TTY 거부, `source:'human'`.
+- SubagentStop hook: 완료·실패·중단을 host_review로 기록.
+- 최소 표본 게이트: purpose별 강한 라벨 최소 수 미달 시 build/export 거부, `--allow-small` 명시만 허용, 빈 split export 거부.
+- acceptance: 합성 시나리오 route → 실행 → runner verify → evaluate → build → export가 강한 라벨로 끝까지 이어짐. 사칭 경로(MCP, 비TTY correct, 결과 주입) 음성 테스트.
+
+### P3. 호스트 자동 연결 설치기 (G2) — 미착수
+- installer `--hooks`: 소유 표식 항목만 추가·제거, 기존 hook 순서·내용 보존, 충돌 시 실패, dry-run diff.
+- Codex `~/.codex/hooks.json`: PreToolUse(spawn_agent) route 조회, SubagentStop 결과 기록.
+- Claude `~/.claude/settings.json`: PreToolUse(Agent) route 조회(ON이면 updatedInput, modelLocked 존중), SubagentStop 결과 기록.
+- hook은 fail-open, 기존 timeoutMs 이내, 전역 OFF·`JEV_DISABLE=1`이면 즉시 통과.
+- `~/.codex/AGENTS.md`·`~/.claude/CLAUDE.md` 설치기 소유 짧은 블록, uninstall 시 블록만 제거.
+- Claude MCP·스킬 `install --target claude`, 새 세션에서 `jev_agent_control` 노출 확인.
+- acceptance: 두 호스트 dry-run → 승인 → 적용 → 새 세션 hook 발화·기록 확인 → uninstall 원복 → 재적용. 기존 hook 해시 보존.
+
+### P4. SHADOW 운영과 측정 — 미착수, 승인 필요
+- 승인 후 router SHADOW, 추천·실제 선택·결과 병렬 기록.
+- metrics: 추천 분포, 위임 사유 분포, 추천-실제 불일치, 강한/약한 라벨 수, 호출당 지연·비용 실측.
+- ON 전환 기준 사전 등록(최소 표본, 추천 추종 시 실패율 비악화, 에스컬레이션 비증가). 전환은 owner 승인.
+
+### P5. Laya 성장 루프 (G3) — 미착수
+- `training/laya-kit/`: export 파일로 학습하도록 고친 공식 notebook 스크립트, Kaggle T4×2 가이드, 버전·해시 고정. 클라우드 실행은 owner 승인.
+- (선택) MPS 단일 장치 spike go/no-go.
+- `laya register` / `laya qualify` / `laya promote` / `laya rollback`.
+- 강한 라벨 기준 수 도달 시 metrics·doctor 알림만, 자동 학습·교체 없음.
+- acceptance: 합성 checkpoint 픽스처로 register → qualify(합격·불합격) → promote → rollback, 고정 holdout 악화 시 promote 거부 음성 테스트.
+
+### P6. 문서·배포·인계 — 미착수
+- README, ARCHITECTURE, TRAINING_DATA 갱신, 사실 아닌 문장 같은 커밋에서 수정.
+- 설치본 절차대로 갱신, 두 호스트 doctor, checksNotPerformed 그대로 보고.
+- trader 인계 메모(문서만).
+
+## 승인 게이트 기록
+
+| 날짜 | 게이트 | owner 결정 |
+|---|---|---|
+| 2026-09-23 | 계약 개정(P3·P5) | 승인: AGENTS.md 개정. hook 기본 OFF·SHADOW, ON은 owner 승인, promote는 명시 명령 전용. README·ARCHITECTURE 같은 커밋에서 수정 |
+| 2026-09-23 | P0 실측 사용량 | 승인: Codex·Claude 각 최소 1회. 실패 시 추가 실행 전 재확인 |
+| 2026-09-23 | 단계 연속 진행 | 승인: P0→P6 연속. 전역 설정 쓰기·과금 호출·SHADOW/ON 전환·클라우드 학습은 게이트에서 멈춤 |
+
+## 실측 기록
+
+### R1. Codex spawn 모델 우선순위 — 확정 (2026-09-23, 네이티브 실행)
+
+- 환경: `codex-cli 0.154.0`, `features.multi_agent_v2.enabled = true`, 메인 `gpt-6-astra`/high. 임시 폴더, `codex exec -s read-only`.
+- 호출: `agents.spawn_agent {"agent_type":"lightweight_worker","model":"gpt-5.6-terra","fork_turns":"none",...}`.
+- 증거: 자식 rollout `~/.codex/sessions/2026/09/23/rollout-2026-09-23T08-53-02-01a0cb89-84c1-...jsonl`의 `session_meta.agent_role = lightweight_worker`, `turn_context.model = gpt-5.6-luna`, `effort = medium`.
+- 결론: **역할 TOML의 model·effort가 spawn 인자 model보다 우선한다.** spawn 인자 model은 조용히 무시된다(오류 없음). `~/.codex/AGENTS.md:53` 실측 메모와 일치하고, 공식 subagents 문서(developers.openai.com/codex/subagents, 2026-09-23 확인: 역할 파일 > spawn 명시값 > `[agents]` 기본값 > 부모 세션)와도 일치한다. 지시서가 말한 "공식 문서와의 충돌"은 없다.
+- 설계 영향: Codex에서 모델을 바꾸는 유일한 수단은 **`agent_type`(역할) 선택**이다. hook의 `model` 재작성은 효과가 없다. P1 Codex profile은 role만 쓰고 model은 표시용 메타데이터로만 둔다.
+- 사용량: 메인 input 107,916(cached 78,592), output 148 tokens + 자식 1턴.
+
+### R2. Codex PreToolUse `updatedInput`로 `agent_type` 재작성 — 문서 근거 확보, 네이티브 확인은 P3로 이월
+
+- 공식(developers.openai.com/codex/hooks, 2026-09-23): matcher `Agent`가 `spawn_agent`도 잡는다. `updatedInput`은 인자 객체 전체를 대체하며 반드시 `permissionDecision:"allow"`와 함께 반환해야 한다(다른 조합은 오류).
+- trust: 새·변경 hook은 사용자가 `/hooks`에서 trust해야 실행된다. `trusted_hash` 구조·계산은 공식 문서에 없다(비공식: openai/codex#46210). `codex exec`에서 미승인 hook은 진단 없이 건너뛴다(비공식, 0.154.0 소스 근거).
+- 설치기 영향: 설치기는 trust 값을 쓰지 않는다. 설치 후 사용자가 Codex `/hooks`에서 승인해야 하고, doctor는 "hook 등록됨 ≠ 실행됨"을 구분해 보고한다.
+- 네이티브 실측을 지금 하려면 `--dangerously-bypass-hook-trust`가 필요하다. 이 플래그는 사용자가 일부러 미승인으로 둔 전역 hook까지 실행시킬 수 있어 쓰지 않는다. P3 설치 후 사용자가 trust한 상태에서 네이티브로 확인한다.
+- SubagentStart/Stop 입력: `agent_id`, `agent_type`, `agent_transcript_path`, `last_assistant_message`, `stop_hook_active`, 공통 `session_id`·`turn_id`·`model`. 성공/실패 필드는 없다.
+
+### R3. Claude PreToolUse(Agent) `updatedInput` model 재작성 — 차단됨
+
+- 격리 폴더(project `.claude/settings.json`)에 PreToolUse(Agent)·SubagentStart·SubagentStop command hook을 두고 `claude -p --model haiku`로 실행했다.
+- 결과: `Failed to authenticate: OAuth session expired and could not be refreshed`, 비용 0. hook 발화 없음.
+- 다음 행동: owner가 터미널에서 Claude CLI 로그인을 갱신한 뒤 같은 probe를 1회 재실행한다.
+- 공식 근거(code.claude.com/docs/en/hooks, sub-agents, 2026-09-23): Agent `tool_input`은 `prompt`·`description`·`subagent_type`·`model`. `updatedInput`은 입력 전체 교체이며 `permissionDecision`(`allow`/`ask`)과 함께 쓰는 형식이다. 모델 해석 순서는 호출 `model` > 역할 frontmatter `model` > `CLAUDE_CODE_SUBAGENT_MODEL` > 메인 모델. project `.claude/settings.json` hook은 `claude -p`에서도 실행된다. SubagentStop에도 성공/실패 필드는 없다.
+- 비공식: anthropics/claude-code#95769가 PreToolUse 재작성 안정성 한계를 보고했다. 네이티브 실측 전까지 Claude ON 재작성은 UNKNOWN이다.
