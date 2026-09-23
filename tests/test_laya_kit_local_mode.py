@@ -183,7 +183,10 @@ class TrainDdpScriptLocalModeStructure(unittest.TestCase):
 
     def test_main_local_defaults_autocast_off_fp32(self):
         body = self._extract_function_body(kit.TRAIN_DDP_SCRIPT, 'main_local')
-        self.assertIn('mps_autocast = sys.argv[12] if len(sys.argv) > 12 else "off"', body)
+        # jev-change 2026-09-23: argv[9] is now --select-best-epoch (see
+        # tests/test_laya_kit_eval_and_epoch_select.py), shifting
+        # device/grad-accum/micro-batch/mps-autocast/max-steps each up by one.
+        self.assertIn('mps_autocast = sys.argv[13] if len(sys.argv) > 13 else "off"', body)
 
     def test_main_local_logs_mps_driver_allocated_memory_per_epoch(self):
         body = self._extract_function_body(kit.TRAIN_DDP_SCRIPT, 'main_local')
