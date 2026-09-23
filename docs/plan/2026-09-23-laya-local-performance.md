@@ -77,6 +77,13 @@ owner 요청: 이 Mac(Apple M4 Pro, GPU 16코어, 통합 메모리 24GB)에서 L
 
 - 문구를 바꿔도 한국어 intent·risk·difficulty의 한계는 그대로다. 변화 폭은 표본 24개의 잡음 수준이다. zero-shot 한계는 문구가 아니라 모델 능력 문제이며, 이 판단들에 쓰려면 사용자 작업 분포로 fine-tune이 필요하다.
 
+### B6. 실적용 후 실제 경로 지연 (launchd 서버, english FP16 MPS, 2026-09-23)
+
+- 실제 `claude -p` 세션, 맥락 표시 있는 implementer spawn 1건: hook이 서버로 판단(TypeSafe 호출 0), route 판단 607ms, pre-spawn hook 616ms, post-spawn `LINKED` 7.6ms, subagent-stop `RECORDED` 9.0ms.
+- 소켓 직접 호출(판단 기록 없음): 연속 호출 p50 103ms. 쉬었다가 들어온 첫 호출은 2s 196ms, 5s 209ms, 10s 215ms, 30s 475ms, 60s 480ms.
+- 같은 조건의 프로세스 내 비교(`scripts/laya-idle-bench.py`, 3질문): MPS FP16은 연속 107ms / 5s 후 198–205ms / 30–60s 후 419–481ms. CPU FP32는 연속 217–219ms / 5s 후 237–252ms / 30–60s 후 556–568ms. 쉬고 난 뒤의 느려짐은 GPU만의 현상이 아니며 CPU가 더 느리다. MPS FP16을 유지한다.
+- keep-warm(주기적 더미 추론)은 spawn 간격(수 분)을 덮으려면 수십 회 추론이 필요해 에너지 대비 이득이 나쁘므로 넣지 않는다. 실제 hook 경로의 판단 지연은 드문 호출 기준 약 0.2–0.5초(+ Node 시작 약 50ms)이며, TypeSafe(약 0.65–0.73초 + API 비용)보다 빠르고 비용이 0이다.
+
 ### B4. Codex A/B: spawn 전 명시 `jev_route` vs 바로 spawn (codex-cli 0.154.0, `codex exec`, 각 3회, 중앙값)
 
 | | A: route 후 spawn | B: 바로 spawn | 차이 |
