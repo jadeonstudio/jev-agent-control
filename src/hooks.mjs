@@ -154,7 +154,11 @@ function consumePendingCodex(home, { sessionId, agentType }, nowMs) {
 
 async function preSpawn(host, input, ctx) {
   const info = extractPreSpawn(host, input);
-  if (!info) return { output: null, telemetry: { reason: 'INVALID_HOOK_INPUT' } };
+  if (!info) {
+    // Tool names are host identifiers, not content; keep only a short safe token to diagnose matcher/name mismatches.
+    const name = isObject(input) && typeof input.tool_name === 'string' && /^[A-Za-z0-9_.:-]{1,64}$/.test(input.tool_name) ? input.tool_name : null;
+    return { output: null, telemetry: { reason: 'INVALID_HOOK_INPUT', tool_name: name } };
+  }
   let policy;
   try { policy = loadFeaturePolicy(ctx.home); }
   catch (error) { return { output: null, telemetry: { reason: errorCode(error), original_role: info.originalRole } }; }
@@ -221,7 +225,8 @@ function logHookEvent({ home, layer, host, event, telemetry, applied, elapsedMs 
     if (mode === 'off' || !status.telemetry) return;
     appendEvent(home, { kind: 'hook', at: new Date().toISOString(), host, event, reason: telemetry?.reason ?? null,
       mode, applied: Boolean(applied), original_role: telemetry?.original_role ?? null,
-      recommended_role: telemetry?.recommended_role ?? null, decision_id: telemetry?.decision_id ?? null, elapsedMs });
+      recommended_role: telemetry?.recommended_role ?? null, decision_id: telemetry?.decision_id ?? null, elapsedMs,
+      ...(telemetry?.tool_name !== undefined ? { tool_name: telemetry.tool_name } : {}) });
   } catch { /* observability cannot become an availability dependency */ }
 }
 /** Pure-ish dispatcher: takes an already-parsed hook payload, never throws, only ever logs a content-free event. */
@@ -272,11 +277,20 @@ export async function runHookCli({ host, event, home: homeOverride, env = proces
     try {
       const status = layer.status();
       if (status.features.router.mode === 'off') return;
+      const start = performance.now();
+      let settledReason = null;
       const result = await withTimeout((async () => {
         const input = await readHookInput({ stdin, maxBytes: MAX_HOOK_STDIN_BYTES });
-        if (input === null) return null;
-        return processHookEvent({ host, event, input, home, env, now, layer });
+        if (input === null) { settledReason = 'INVALID_STDIN'; return null; }
+        const r = await processHookEvent({ host, event, input, home, env, now, layer });
+        settledReason = 'PROCESSED';
+        return r;
       })(), timeoutMs);
+      // Content-free diagnostics: distinguish "host never called us" from "called but input rejected / timed out".
+      if (settledReason !== 'PROCESSED') {
+        logHookEvent({ home, layer, host, event, telemetry: { reason: settledReason ?? 'HOOK_TIMEOUT' }, applied: false,
+          elapsedMs: Math.round((performance.now() - start) * 1000) / 1000 });
+      }
       if (result?.output) write(JSON.stringify(result.output) + '\n');
     } finally { engine.close(); }
   } catch { /* fail-open */ }

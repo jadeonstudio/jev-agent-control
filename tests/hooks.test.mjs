@@ -338,3 +338,22 @@ test('CLI subprocess: bad hook arguments or an old runtime never exit non-zero (
   }
   fs.rmSync(home, { recursive: true, force: true });
 });
+
+test('runHookCli records content-free diagnostics for rejected stdin and timeouts (no output, no content)', async t => {
+  const s = setup({ mode: 'on', featureMode: 'on' }); t.after(s.cleanup);
+  await runHookCli({ host: 'codex', event: 'pre-spawn', home: s.home, env: s.env, stdin: Readable.from(['not json SECRET_MARKER {{']), write: () => {} });
+  const neverEnding = new Readable({ read() {} });
+  await runHookCli({ host: 'codex', event: 'pre-spawn', home: s.home, env: s.env, stdin: neverEnding, write: () => {}, timeoutMs: 100 });
+  neverEnding.destroy();
+  const hookEvents = readEvents(s.home).filter(e => e.kind === 'hook');
+  assert.deepEqual(hookEvents.map(e => e.reason), ['INVALID_STDIN', 'HOOK_TIMEOUT']);
+  assert.equal(JSON.stringify(hookEvents).includes('SECRET_MARKER'), false);
+});
+test('pre-spawn with an unexpected tool_name records a sanitized tool_name for diagnosis', async t => {
+  const s = setup({ provider: p => response(p, { intent: 'edit', difficulty: [1, 0, 0, 0, 0] }) }); t.after(s.cleanup);
+  await processHookEvent({ host: 'codex', event: 'pre-spawn', input: codexInput({ tool_name: 'weird/tool name<script>' }), home: s.home, env: s.env, layer: s.layer });
+  await processHookEvent({ host: 'codex', event: 'pre-spawn', input: codexInput({ tool_name: 'collab.spawn' }), home: s.home, env: s.env, layer: s.layer });
+  const ev = readEvents(s.home).filter(e => e.kind === 'hook');
+  assert.equal(ev[0].reason, 'INVALID_HOOK_INPUT'); assert.equal(ev[0].tool_name, null);
+  assert.equal(ev[1].tool_name, 'collab.spawn');
+});
