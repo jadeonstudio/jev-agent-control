@@ -97,19 +97,27 @@ export function distillImport(home, { run, inputFile, readFileImpl = (f) => fs.r
       total++;
       let parsed;
       try { parsed = JSON.parse(trimmed); } catch { fail('INVALID_DISTILL_TASK_LINE'); }
-      only(parsed, ['lang', 'domain', 'task'], ['lang', 'task']);
+      only(parsed, ['lang', 'domain', 'task', 'group', 'reviewable'], ['lang', 'task']);
       if (!['ko', 'en'].includes(parsed.lang)) fail('INVALID_DISTILL_TASK_LINE');
       // UTF-8 byte limit (not a character count) matching the hook's own truncateUtf8(..., 8000)
       // cap (src/hooks.mjs preSpawn task=description+prompt), so owner-authored Korean prompts up
       // to ~2,500 chars (well over the old 2000-char cap) import.
       if (typeof parsed.task !== 'string' || !parsed.task.trim() || Buffer.byteLength(parsed.task) > 8000) fail('INVALID_DISTILL_TASK_LINE');
       if (parsed.domain !== undefined && parsed.domain !== null) text(parsed.domain, 80);
+      // Optional dedup/leak-prevention key (e.g. shared by a ko/en translation pair of the same
+      // underlying task) so a human-reviewed member and its teacher-labeled sibling never split
+      // across train and eval (see buildDistillDataset).
+      if (parsed.group !== undefined && parsed.group !== null && (typeof parsed.group !== 'string' || !ID.test(parsed.group))) fail('INVALID_DISTILL_TASK_LINE');
+      // Short synthetic augmentation items can be marked reviewable:false so the human-reviewed
+      // calibration/test set reflects realistic long agent prompts; they only ever ground train.
+      if (parsed.reviewable !== undefined && typeof parsed.reviewable !== 'boolean') fail('INVALID_DISTILL_TASK_LINE');
       if (containsSensitiveData(parsed)) { skippedSensitive++; continue; }
       const normalized = normalizeTaskText(parsed.task);
       const task_id = digest({ lang: parsed.lang, text: normalized });
       if (seen.has(task_id)) { skippedDuplicate++; continue; }
       seen.add(task_id);
       appendPrivateJsonl(file, { task_id, lang: parsed.lang, domain: parsed.domain ?? null, task: parsed.task,
+        group: parsed.group ?? null, reviewable: parsed.reviewable ?? true,
         source: 'synthetic', egress: 'allowed', added_at: new Date().toISOString() });
       added++;
     }
@@ -135,7 +143,7 @@ export function distillImportShadow(home, { run, trainingStore } = {}) {
       const task_id = digest({ lang, text: normalizeTaskText(task) });
       if (seen.has(task_id)) { skippedDuplicate++; continue; }
       seen.add(task_id);
-      appendPrivateJsonl(file, { task_id, lang, domain: null, task, source: 'shadow', egress: 'forbidden', added_at: new Date().toISOString() });
+      appendPrivateJsonl(file, { task_id, lang, domain: null, group: null, reviewable: true, task, source: 'shadow', egress: 'forbidden', added_at: new Date().toISOString() });
       added++;
     }
     return { run, scannedDecisions, added, skippedSensitive, skippedDuplicate };
@@ -210,10 +218,28 @@ export async function distillReview(home, { run, count = 200, isStdinTTY, isStdo
   const byLang = { ko: [], en: [] };
   for (const task_id of teacherById.keys()) {
     const t = tasksById.get(task_id);
-    if (t && byLang[t.lang]) byLang[t.lang].push(task_id);
+    if (t && t.reviewable !== false && byLang[t.lang]) byLang[t.lang].push(task_id);
   }
   for (const lang of ['ko', 'en']) byLang[lang].sort();
-  const selected = [...byLang.ko.slice(0, perLang), ...byLang.en.slice(0, perLang)];
+  // Group-aware selection: never put two members of the same group (e.g. a ko/en translation
+  // pair sharing `group`) into the review budget together, and never re-select a group that
+  // already has a reviewed member, so review spend isn't wasted labeling near-duplicate content.
+  const reviewedGroupKeys = new Set();
+  for (const task_id of reviewedIds) { const t = tasksById.get(task_id); if (t) reviewedGroupKeys.add(t.group ?? t.task_id); }
+  const selectedGroupKeys = new Set();
+  const selected = [];
+  for (const lang of ['ko', 'en']) {
+    let picked = 0;
+    for (const task_id of byLang[lang]) {
+      if (picked >= perLang) break;
+      const t = tasksById.get(task_id);
+      const key = t.group ?? t.task_id;
+      if (reviewedGroupKeys.has(key) || selectedGroupKeys.has(key)) continue;
+      selectedGroupKeys.add(key);
+      selected.push(task_id);
+      picked++;
+    }
+  }
   const pending = selected.filter(id => !reviewedIds.has(id));
   let reviewed = 0, skipped = 0, quit = false;
   for (const task_id of pending) {
@@ -272,18 +298,33 @@ export function buildDistillDataset(home, { run, trainingStore } = {}) {
   return store.lock(() => {
     const snapshot_id = digest(`distill-run:${run}`);
     const samples = [];
+    // Group leak prevention: a `group` (e.g. shared by a ko/en translation pair of the same
+    // underlying task) that has ANY human-reviewed member must never also ground train via a
+    // teacher label on another member — that would leak eval content into train.
+    const reviewedGroupKeys = new Set();
+    for (const task of tasks) if (reviewById.has(task.task_id)) reviewedGroupKeys.add(task.group ?? task.task_id);
+    let excludedGroupLeak = 0;
     for (const task of [...tasks].sort((a, b) => a.task_id.localeCompare(b.task_id))) {
       const teacher = teacherById.get(task.task_id);
       const reviewed = reviewById.get(task.task_id);
+      const groupKey = task.group ?? task.task_id;
+      // Namespaced so a `group` name can never collide with a bare task_id's own digest; kept
+      // byte-identical to the pre-group formula (digest({distill_task: task_id})) when task.group
+      // is unset, so ungrouped runs produce the exact same dataset_version/data as before.
+      const group_id = task.group ? digest({ distill_group: groupKey }) : digest({ distill_task: task.task_id });
       let split, provenance, labelSource, labelConfidence, valueFor, probsFor;
       if (reviewed) {
-        // Deterministic 50/50 calibration/test on the task's own id hash; reviewed tasks never enter train (no leakage).
-        split = parseInt(task.task_id.slice(0, 8), 16) % 2 === 0 ? 'calibration' : 'test';
+        // Deterministic 50/50 calibration/test on the GROUP key's hash (not the task's own id), so
+        // every reviewed member of one group lands in the same split. For an ungrouped task the
+        // group key IS the task_id, so this is byte-identical to the pre-group formula.
+        const splitSeed = task.group ? group_id : task.task_id;
+        split = parseInt(splitSeed.slice(0, 8), 16) % 2 === 0 ? 'calibration' : 'test';
         provenance = teacher ? teacherProvenance(teacher.model) : HOST_REVIEW_PROVENANCE;
         labelSource = 'human'; labelConfidence = 1;
         valueFor = qid => reviewed.labels[qid];
         probsFor = (q, value) => targetDistribution(q, value);
       } else if (teacher && task.egress === 'allowed') {
+        if (reviewedGroupKeys.has(groupKey)) { excludedGroupLeak++; continue; } // teacher label never grounds train when a group sibling is in eval
         split = 'train';
         provenance = teacherProvenance(teacher.model);
         labelSource = 'teacher'; labelConfidence = TEACHER_LABEL_CONFIDENCE;
@@ -293,7 +334,6 @@ export function buildDistillDataset(home, { run, trainingStore } = {}) {
       const request = buildTaskRequest(task.task);
       const request_hash = digest(request);
       const task_uuid = hashToUuid(task.task_id);
-      const group_id = digest({ distill_task: task.task_id });
       for (const [qid, q] of Object.entries(ROUTE_QUESTIONS)) {
         const value = valueFor(qid);
         validateTarget(q, value);
@@ -312,7 +352,7 @@ export function buildDistillDataset(home, { run, trainingStore } = {}) {
     const data = samples.map(encode).join('\n') + (samples.length ? '\n' : '');
     const data_sha256 = digest(data);
     const version = digest({ kind: 'distill', run, data_sha256 });
-    const counts = { split: {}, lang: {}, label_source: {} };
+    const counts = { split: {}, lang: {}, label_source: {}, excluded_group_leak: excludedGroupLeak };
     for (const s of samples) {
       counts.split[s.split] = (counts.split[s.split] ?? 0) + 1;
       counts.label_source[s.label_source] = (counts.label_source[s.label_source] ?? 0) + 1;
@@ -343,6 +383,8 @@ export function distillStatus(home, { run } = {}) {
   const bySourceLang = {};
   for (const t of tasks) { const k = `${t.source}:${t.lang}`; bySourceLang[k] = (bySourceLang[k] ?? 0) + 1; }
   const usage = teacherLines.reduce((acc, l) => ({ inputTokens: acc.inputTokens + (l.usage?.inputTokens ?? 0), outputTokens: acc.outputTokens + (l.usage?.outputTokens ?? 0) }), { inputTokens: 0, outputTokens: 0 });
+  const groups = new Set(tasks.map(t => t.group ?? t.task_id)).size;
+  const reviewable = tasks.filter(t => t.reviewable !== false).length;
   return { run, tasks: tasks.length, tasks_by_source_lang: bySourceLang, teacher_labels: teacherLines.length,
-    teacher_label_failures: failures.length, reviewed: reviewLines.length, teacher_usage: usage };
+    teacher_label_failures: failures.length, reviewed: reviewLines.length, teacher_usage: usage, groups, reviewable };
 }

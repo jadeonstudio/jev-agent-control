@@ -101,6 +101,47 @@ test('distill import uses a UTF-8 byte limit of 8000 (matching the hook truncate
   assert.throws(() => distillImport(home, { run: 'run4', inputFile: writeInputFile(t, [{ lang: 'ko', task: koreanOverByteLimit }]) }), /INVALID_DISTILL_TASK_LINE/);
 });
 
+test('distill import accepts an optional group field matching ID and stores null when absent', t => {
+  const home = fixture(t);
+  const file = writeInputFile(t, [
+    { lang: 'ko', task: '고양이를 부탁해', group: 'pair1' },
+    { lang: 'en', task: 'Please take care of the cat', group: 'pair1' },
+    { lang: 'en', task: 'ungrouped task text' },
+  ]);
+  const r = distillImport(home, { run: 'run1', inputFile: file });
+  assert.equal(r.added, 3);
+  const lines = fs.readFileSync(path.join(runDir(home, 'run1'), 'tasks.jsonl'), 'utf8').trim().split('\n').map(JSON.parse);
+  assert.equal(lines.filter(l => l.group === 'pair1').length, 2);
+  assert.equal(lines.find(l => l.task === 'ungrouped task text').group, null);
+});
+
+test('distill import rejects a group value that does not match the ID pattern', t => {
+  const home = fixture(t);
+  assert.throws(() => distillImport(home, { run: 'run1', inputFile: writeInputFile(t, [{ lang: 'en', task: 'x', group: 'not a valid id' }]) }), /INVALID_DISTILL_TASK_LINE/);
+  assert.throws(() => distillImport(home, { run: 'run1', inputFile: writeInputFile(t, [{ lang: 'en', task: 'x', group: 123 }]) }), /INVALID_DISTILL_TASK_LINE/);
+});
+
+test('distill import accepts an optional reviewable boolean, defaulting to true', t => {
+  const home = fixture(t);
+  const file = writeInputFile(t, [
+    { lang: 'en', task: 'short synthetic augmentation item', reviewable: false },
+    { lang: 'en', task: 'a realistic long agent prompt task', reviewable: true },
+    { lang: 'en', task: 'a task with no reviewable field at all' },
+  ]);
+  const r = distillImport(home, { run: 'run1', inputFile: file });
+  assert.equal(r.added, 3);
+  const lines = fs.readFileSync(path.join(runDir(home, 'run1'), 'tasks.jsonl'), 'utf8').trim().split('\n').map(JSON.parse);
+  assert.equal(lines.find(l => l.task === 'short synthetic augmentation item').reviewable, false);
+  assert.equal(lines.find(l => l.task === 'a realistic long agent prompt task').reviewable, true);
+  assert.equal(lines.find(l => l.task === 'a task with no reviewable field at all').reviewable, true); // default
+});
+
+test('distill import rejects a non-boolean reviewable value', t => {
+  const home = fixture(t);
+  assert.throws(() => distillImport(home, { run: 'run1', inputFile: writeInputFile(t, [{ lang: 'en', task: 'x', reviewable: 'yes' }]) }), /INVALID_DISTILL_TASK_LINE/);
+  assert.throws(() => distillImport(home, { run: 'run1', inputFile: writeInputFile(t, [{ lang: 'en', task: 'x', reviewable: 0 }]) }), /INVALID_DISTILL_TASK_LINE/);
+});
+
 test('distill import-shadow pulls captured route task text with forbidden egress and skips non-route captures', t => {
   const home = fixture(t);
   setMode(home, 'on', {});
@@ -129,6 +170,8 @@ test('distill import-shadow pulls captured route task text with forbidden egress
   assert.equal(lines[0].source, 'shadow');
   assert.equal(lines[0].egress, 'forbidden');
   assert.equal(lines[0].task, 'Investigate a flaky CI job');
+  assert.equal(lines[0].group, null);
+  assert.equal(lines[0].reviewable, true);
 });
 
 // ============================== label ==============================
@@ -319,6 +362,67 @@ test('review is resumable: an interrupted (quit) session leaves unreviewed tasks
   assert.equal(new Set(lines.map(l => l.task_id)).size, 4);
 });
 
+test('review selection never selects two members of the same group (translation pair) in one pass', async t => {
+  const home = fixture(t);
+  const file = writeInputFile(t, [
+    { lang: 'ko', task: '문서를 검토해줘', group: 'pairA' },
+    { lang: 'en', task: 'Review the document', group: 'pairA' },
+    { lang: 'ko', task: '다른 작업 표준', group: 'pairB' },
+    { lang: 'en', task: 'another standalone task', group: 'pairB' },
+  ]);
+  distillImport(home, { run: 'run1', inputFile: file });
+  await distillLabel(home, { run: 'run1', confirmEgress: true, key: 'k', provider: async () => teacherRaw('jev-1.13.0'), sleepImpl: async () => {} });
+  const result = await distillReview(home, { run: 'run1', count: 4, isStdinTTY: true, isStdoutTTY: true, prompt: fakePromptQueue(Array(12).fill('')) });
+  assert.equal(result.selected, 2); // one member per group at most, never both siblings in the same selection
+  const tasks = fs.readFileSync(path.join(runDir(home, 'run1'), 'tasks.jsonl'), 'utf8').trim().split('\n').map(JSON.parse);
+  const byId = new Map(tasks.map(t => [t.task_id, t]));
+  const lines = fs.readFileSync(path.join(runDir(home, 'run1'), 'review.jsonl'), 'utf8').trim().split('\n').map(JSON.parse);
+  const groupsSeen = lines.map(l => byId.get(l.task_id).group);
+  assert.equal(new Set(groupsSeen).size, groupsSeen.length); // no duplicate group among reviewed tasks
+});
+
+test('review never selects a task marked reviewable:false; it stays train-only via its teacher label', async t => {
+  const home = fixture(t);
+  const file = writeInputFile(t, [
+    { lang: 'ko', task: '짧은 합성 문장 1', reviewable: false },
+    { lang: 'en', task: 'short synthetic sentence 1', reviewable: false },
+    { lang: 'ko', task: '실제 에이전트 프롬프트처럼 긴 작업 지시문입니다', reviewable: true },
+    { lang: 'en', task: 'a realistic long agent prompt task instruction', reviewable: true },
+  ]);
+  distillImport(home, { run: 'run1', inputFile: file });
+  await distillLabel(home, { run: 'run1', confirmEgress: true, key: 'k', provider: async () => teacherRaw('jev-1.13.0'), sleepImpl: async () => {} });
+  const result = await distillReview(home, { run: 'run1', count: 4, isStdinTTY: true, isStdoutTTY: true, prompt: fakePromptQueue(Array(12).fill('')) });
+  assert.equal(result.selected, 2); // only the 2 reviewable tasks, never the reviewable:false ones
+  const tasks = fs.readFileSync(path.join(runDir(home, 'run1'), 'tasks.jsonl'), 'utf8').trim().split('\n').map(JSON.parse);
+  const byId = new Map(tasks.map(t => [t.task_id, t]));
+  const lines = fs.readFileSync(path.join(runDir(home, 'run1'), 'review.jsonl'), 'utf8').trim().split('\n').map(JSON.parse);
+  assert.ok(lines.every(l => byId.get(l.task_id).reviewable === true));
+});
+
+test('distill status reports a reviewable count', t => {
+  const home = fixture(t);
+  const file = writeInputFile(t, [
+    { lang: 'ko', task: '작업 A1', reviewable: false },
+    { lang: 'en', task: 'task A2', reviewable: false },
+    { lang: 'ko', task: '작업 B' },
+  ]);
+  distillImport(home, { run: 'run1', inputFile: file });
+  const status = distillStatus(home, { run: 'run1' });
+  assert.equal(status.reviewable, 1); // only the default-true task
+});
+
+test('distill status reports a groups count (distinct group keys; ungrouped tasks count as their own group)', t => {
+  const home = fixture(t);
+  const file = writeInputFile(t, [
+    { lang: 'ko', task: '작업 A1', group: 'g1' },
+    { lang: 'en', task: 'task A2', group: 'g1' },
+    { lang: 'ko', task: '작업 B' },
+  ]);
+  distillImport(home, { run: 'run1', inputFile: file });
+  const status = distillStatus(home, { run: 'run1' });
+  assert.equal(status.groups, 2); // g1 (2 members) + the ungrouped task's own singleton group
+});
+
 // ============================== build ==============================
 
 test('build: teacher-only tasks ground train with soft targets; reviewed tasks ground calibration/test and are excluded from train', async t => {
@@ -343,6 +447,57 @@ test('build: teacher-only tasks ground train with soft targets; reviewed tasks g
   const evalSample = samples.find(s => s.split !== 'train');
   assert.equal(evalSample.label_source, 'human');
   assert.equal(evalSample.label_confidence, 1);
+});
+
+test('build: a non-reviewed task whose group has a reviewed member is excluded from train (no leakage via translation pair)', async t => {
+  const home = fixture(t);
+  const file = writeInputFile(t, [
+    { lang: 'ko', task: '이 문서를 요약해줘', group: 'pairA' },
+    { lang: 'en', task: 'Summarize this document', group: 'pairA' },
+    { lang: 'en', task: 'Add a retry to the fetch call' }, // ungrouped, stays teacher-only in train
+  ]);
+  distillImport(home, { run: 'run1', inputFile: file });
+  const tasks = fs.readFileSync(path.join(runDir(home, 'run1'), 'tasks.jsonl'), 'utf8').trim().split('\n').map(JSON.parse);
+  const pairKo = tasks.find(t => t.lang === 'ko');
+  const pairEn = tasks.find(t => t.group === 'pairA' && t.lang === 'en');
+  const lone = tasks.find(t => t.group === null);
+  await distillLabel(home, { run: 'run1', confirmEgress: true, key: 'k', provider: async () => teacherRaw('jev-1.13.0'), sleepImpl: async () => {} });
+  // Simulate a human review of ONLY the ko member of pairA (bypassing the TTY review flow, which
+  // would already refuse to select both siblings at once — see the dedup test above).
+  const reviewFilePath = path.join(runDir(home, 'run1'), 'review.jsonl');
+  fs.writeFileSync(reviewFilePath, JSON.stringify({ task_id: pairKo.task_id, labels: { intent: 'edit', difficulty: 0, risk: 'safe' }, reviewer: 'human-tty', at: new Date().toISOString() }) + '\n', { mode: 0o600 });
+  const built = buildDistillDataset(home, { run: 'run1' });
+  const store = createTrainingStore({ home });
+  const { samples } = readDataset(store, built.dataset_version);
+  const trainSamples = samples.filter(s => s.split === 'train');
+  const evalSamples = samples.filter(s => s.split !== 'train');
+  assert.ok(!samples.some(s => s.raw_refs.distill.task_id === pairEn.task_id)); // teacher-labeled sibling never emitted
+  assert.ok(trainSamples.some(s => s.raw_refs.distill.task_id === lone.task_id)); // unrelated teacher-only task still trains
+  assert.ok(evalSamples.some(s => s.raw_refs.distill.task_id === pairKo.task_id)); // reviewed member grounds eval
+  const manifest = JSON.parse(fs.readFileSync(built.manifest, 'utf8'));
+  assert.equal(manifest.counts.excluded_group_leak, 1);
+  const trainGroupIds = new Set(trainSamples.map(s => s.group_id));
+  const evalGroupIds = new Set(evalSamples.map(s => s.group_id));
+  for (const g of trainGroupIds) assert.equal(evalGroupIds.has(g), false); // no group_id crosses train/eval
+  assert.equal(evalSamples.find(s => s.raw_refs.distill.task_id === pairKo.task_id).group_id, digest({ distill_group: 'pairA' }));
+});
+
+test('ungrouped datasets are unaffected by the group feature: group_id/split match the pre-group formula exactly', async t => {
+  const home = labeledFixture(t, 4);
+  await distillLabel(home, { run: 'run1', confirmEgress: true, key: 'k', provider: async () => teacherRaw('jev-1.13.0'), sleepImpl: async () => {} });
+  await distillReview(home, { run: 'run1', count: 4, isStdinTTY: true, isStdoutTTY: true, prompt: fakePromptQueue(Array(6).fill('')) });
+  const built = buildDistillDataset(home, { run: 'run1' });
+  const store = createTrainingStore({ home });
+  const { samples } = readDataset(store, built.dataset_version);
+  assert.ok(samples.length > 0);
+  for (const s of samples) {
+    const origTaskId = s.raw_refs.distill.task_id;
+    assert.equal(s.group_id, digest({ distill_task: origTaskId })); // pre-group formula, byte-identical
+    if (s.label_source === 'human') {
+      const expectedSplit = parseInt(origTaskId.slice(0, 8), 16) % 2 === 0 ? 'calibration' : 'test';
+      assert.equal(s.split, expectedSplit);
+    }
+  }
 });
 
 test('build is idempotent and writes into the shared training store root usable by export/holdout', async t => {

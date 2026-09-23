@@ -172,7 +172,7 @@ jev-control laya status
 ### teacher 증류 + 사람 검수 (`register` 전, 한국어 route 라벨이 없을 때)
 
 ```sh
-jev-control laya distill import --run r1 --input synthetic-tasks.jsonl   # {lang, domain?, task} 합성 문장만
+jev-control laya distill import --run r1 --input synthetic-tasks.jsonl   # {lang, domain?, task, group?, reviewable?} 합성 문장만; group=번역쌍 등 누출 방지 키, reviewable:false=검수 후보 제외
 jev-control laya distill import-shadow --run r1                          # 캡처된 shadow task 문장(egress 금지, 외부 전송 없음)
 jev-control laya distill label --run r1 --confirm-egress                 # 합성 문장만 Jev(TypeSafe)로 전송, 분당 50회 제한
 jev-control laya distill review --run r1 --count 200                     # TTY 전용 사람 검수, 언어별 층화, 재개 가능
