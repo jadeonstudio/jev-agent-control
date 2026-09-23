@@ -15,6 +15,8 @@ owner 요청: 이 Mac(Apple M4 Pro, GPU 16코어, 통합 메모리 24GB)에서 L
 - **Apple Silicon 서빙**: M4 Pro에서 FP16의 속도 이득은 약 10%로 작다(비공식 실측). 메모리 절감이 주 이득. `torch.compile` MPS는 아직 프로토타입. MLX/ONNX+CoreML은 이 워크로드 직접 근거가 없고 반증 사례가 있다. launchd `KeepAlive`와 `EnablePressuredExit`는 동시에 쓸 수 없고 `TimeOut` 키는 무효라, 유휴 언로드는 앱이 직접 구현해야 한다.
 - **라우팅 효과**: RouteLLM·FrugalGPT의 30–85% 절감은 비코딩 QA 기준이다. 2026 대규모 재평가(LLMRouterBench 등)에서는 다수 라우터가 단순 기준선을 넘지 못했다. 이득 조건은 난이도 분산이 큰 작업, 보정된 확신도 + 애매하면 상위 tier(abstain), 오분류 복구 비용이 낮을 것이다. 캐싱·effort 조절이 더 확실한 절감 수단이다.
 
+- **학습 데이터 출처(공식 데이터 카드·README)**: `LocalLLaMA/typed-decisions`의 gold는 사람 라벨이 아니라 LLM teacher 출력이다(case당 temperature 0.7로 3회 샘플링한 분포의 평균, teacher 모델명 비공개). 영어만 있고 train 1,200행(약 3만 문항) / test 400행이며 Apache-2.0이다. 이 train 전체로 4 epoch fine-tune해 0.766을 냈고, 이는 teacher 자체 일치도 0.735보다 높다. 학습 시간은 공식 README 기준 2×T4 약 4–5시간이지만 학습 키트가 notebook 셀에서 옮긴 값은 약 4–6분이다. 둘이 충돌하므로 실제 실행 전까지 UNKNOWN이다. 한국어 fine-tune 사례는 확인되지 않았다. Kaggle 무료 GPU는 주당 약 30시간(가변), 세션당 12시간이다.
+
 ## 실측 기록
 
 ### B1. 기준선과 초기화 생략 (english, MPS, laya 0.3.4 / torch 2.14 / transformers 5.17, `scripts/laya-bench.py`)
