@@ -62,7 +62,7 @@ test('install --hooks preserves foreign hook groups, appends ours at the end, an
   const claudeBlock = fs.readFileSync(claudeMd(f.user), 'utf8');
   assert.ok(claudeBlock.includes('lightweight-worker'));
   const codexBlock = fs.readFileSync(codexAgents(f.env), 'utf8');
-  assert.ok(codexBlock.includes('lightweight_worker'));
+  assert.ok(codexBlock.includes('기록만')); // Codex hooks only record (opaque spawn message, plan B4)
 
   assert.deepEqual(report.hostTrustRequired, ['codex']);
   assert.equal(report.hostApprovalsChanged, false);
@@ -310,9 +310,11 @@ test('instruction blocks match what each host hook can actually see', t => {
   f.install({ hooks: true });
   const codexBlock = fs.readFileSync(codexAgents(f.env), 'utf8');
   const claudeBlock = fs.readFileSync(claudeMd(f.user), 'utf8');
-  // codex-cli 0.154.0 hands hooks an opaque spawn message, so Codex must call jev_route itself before spawning.
-  assert.match(codexBlock, /jev_route/);
-  assert.match(codexBlock, /agent_type/);
+  // codex-cli 0.154.0 hands hooks an opaque spawn message, and an explicit jev_route before each spawn measured
+  // +8.6s with no saving (plan B4), so the Codex block must tell agents NOT to route and state that hooks only record.
+  assert.match(codexBlock, /jev_route`를 따로 호출하지 않는다/);
+  assert.match(codexBlock, /기록만/);
+  assert.doesNotMatch(codexBlock, /route\.role/);
   assert.doesNotMatch(codexBlock, /\[jev scope=/);
   assert.match(claudeBlock, /\[jev scope=/);
 });
