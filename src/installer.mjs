@@ -12,6 +12,29 @@ const END = '# <<< jev-agent-control managed';
 const BLOCK_BEGIN = '<!-- >>> jev-agent-control managed -->';
 const BLOCK_END = '<!-- <<< jev-agent-control managed -->';
 const HOOK_TIMEOUT_SEC = 10;
+const LAYA_AGENT_LABEL = 'com.jev-agent-control.laya';
+const xmlEscape = s => s.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+const xmlString = s => `<string>${xmlEscape(s)}</string>`;
+/** The user launchd agent that keeps `laya serve` running (L3, owner decision 2026-09-23). No secrets: the
+ * only environment variable it carries is JEV_HOME. Restarts only on abnormal exit (KeepAlive.SuccessfulExit
+ * false), never on a clean shutdown from `laya serve`'s own SIGTERM/SIGINT handling. */
+export function layaAgentPlist({ execPath, cli, home }) {
+  const args = [execPath, cli, 'laya', 'serve', '--home', home];
+  const log = path.join(home, 'logs', 'laya-serve.log');
+  return ['<?xml version="1.0" encoding="UTF-8"?>',
+    '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">',
+    '<plist version="1.0">', '<dict>',
+    '\t<key>Label</key>', `\t${xmlString(LAYA_AGENT_LABEL)}`,
+    '\t<key>ProgramArguments</key>', '\t<array>', ...args.map(a => `\t\t${xmlString(a)}`), '\t</array>',
+    '\t<key>RunAtLoad</key>', '\t<true/>',
+    '\t<key>KeepAlive</key>', '\t<dict>', '\t\t<key>SuccessfulExit</key>', '\t\t<false/>', '\t</dict>',
+    '\t<key>ProcessType</key>', '\t<string>Interactive</string>',
+    '\t<key>StandardOutPath</key>', `\t${xmlString(log)}`,
+    '\t<key>StandardErrorPath</key>', `\t${xmlString(log)}`,
+    '\t<key>EnvironmentVariables</key>', '\t<dict>', '\t\t<key>JEV_HOME</key>', `\t\t${xmlString(home)}`, '\t</dict>',
+    '</dict>', '</plist>', ''].join('\n');
+}
+export function layaAgentPlistPath(userHome) { return path.join(userHome, 'Library/LaunchAgents', `${LAYA_AGENT_LABEL}.plist`); }
 // Owned host hooks (AGENTS.md "Owned host hooks"): only these event groups are ever added/removed,
 // always appended at the end of the host's existing array for that event, never reordering others.
 const HOOK_EVENTS_BY_HOST = Object.freeze({
@@ -153,10 +176,12 @@ export function describeHookStatus({ home, env = process.env, scope = 'user', pr
   }
   return result;
 }
-export function installationPlan({ home, env = process.env, target = 'both', scope = 'user', project = process.cwd(), remove = false, hooks = false, hooksOnly = false, skills = true, root = REPO_ROOT } = {}) {
+export function installationPlan({ home, env = process.env, target = 'both', scope = 'user', project = process.cwd(), remove = false, hooks = false, hooksOnly = false, skills = true, root = REPO_ROOT, layaAgent = false } = {}) {
   if (process.platform === 'win32') fail('USE_WSL');
   if (!['both', 'codex', 'claude'].includes(target) || !['user', 'project'].includes(scope)) fail('INVALID_INSTALL_OPTIONS');
   if (hooksOnly && !remove) fail('HOOKS_ONLY_REQUIRES_UNINSTALL');
+  if (layaAgent && process.platform !== 'darwin') fail('UNSUPPORTED_PLATFORM');
+  if (layaAgent && hooksOnly) fail('INVALID_INSTALL_OPTIONS');
   const userHome = fs.realpathSync(env.HOME || os.homedir());
   const projectRoot = fs.realpathSync(project);
   root = fs.realpathSync(root);
@@ -320,13 +345,40 @@ export function installationPlan({ home, env = process.env, target = 'both', sco
     add(shim, remove && target === 'both' ? null : (remove ? before : next), before, 0o700);
     if (!remove || target === 'both') updateRecord(owned, shim, next);
   }
-  return { home, target, scope, remove, hooksOnly, skills, agents, actions, runtime: cli, hookChanges, instructionBlocks, hostTrustRequired: [...hostTrustSet] };
+  let layaAgentPlan = null;
+  if (layaAgent) {
+    const file = layaAgentPlistPath(userHome);
+    const key = file;
+    const owned = record(key);
+    const before = readText(file, { optional: true });
+    if (remove) {
+      const changed = before !== null;
+      if (before !== null) add(file, null, before);
+      updateRecord(owned, key, undefined, true);
+      layaAgentPlan = { path: file, action: changed ? 'removed' : 'absent', label: LAYA_AGENT_LABEL };
+    } else {
+      if (before !== null && before !== owned.value) fail('LAYA_AGENT_PLIST_CHANGED');
+      const target = layaAgentPlist({ execPath: process.execPath, cli, home });
+      const changed = before !== target;
+      add(file, target, before, 0o600);
+      updateRecord(owned, key, target, false);
+      layaAgentPlan = { path: file, action: changed ? (before === null ? 'installed' : 'unchanged') : 'unchanged', label: LAYA_AGENT_LABEL };
+    }
+  }
+  const uid = typeof process.getuid === 'function' ? process.getuid() : null;
+  const launchctl = layaAgentPlan ? {
+    bootstrap: uid !== null ? `launchctl bootstrap gui/${uid} ${layaAgentPlan.path}` : null,
+    bootout: uid !== null ? `launchctl bootout gui/${uid}/${LAYA_AGENT_LABEL}` : null,
+  } : null;
+  return { home, target, scope, remove, hooksOnly, skills, agents, actions, runtime: cli, hookChanges, instructionBlocks,
+    hostTrustRequired: [...hostTrustSet], layaAgent: layaAgentPlan, launchctl };
 }
 export function applyInstallation(plan, { dryRun = false } = {}) {
   const report = { ok: true, dryRun, target: plan.target, scope: plan.scope, operation: plan.remove ? (plan.hooksOnly ? 'uninstall-hooks-only' : 'uninstall') : 'install',
     changes: plan.actions.map(a => ({ path: a.file, action: a.next === null ? 'remove-owned-file' : 'write' })),
     runtime: plan.runtime, typeSafeCredentialWritten: false, hostApprovalsChanged: false, skillsManaged: plan.skills !== false,
-    hookChanges: plan.hookChanges, instructionBlocks: plan.instructionBlocks, hostTrustRequired: plan.hostTrustRequired };
+    hookChanges: plan.hookChanges, instructionBlocks: plan.instructionBlocks, hostTrustRequired: plan.hostTrustRequired,
+    layaAgent: plan.layaAgent, launchctl: plan.launchctl };
   if (dryRun) return report;
   ensureDir(plan.home, true);
   const lock = path.join(plan.home, 'install.lock'); noSymlinks(lock);

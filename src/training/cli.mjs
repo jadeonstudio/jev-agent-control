@@ -12,9 +12,11 @@ import { selectProvider } from '../inference.mjs';
 import { createDecisionEngine } from '../engine.mjs';
 import { registerCheckpoint, freezeHoldout, listHoldouts, qualifyCandidate, compareCandidate,
   promoteCandidate, rollbackLaya, layaStatus } from './laya-lifecycle.mjs';
+import { startLayaServer } from '../laya-server.mjs';
+import { layaSocketPath, createLayaSocketClient } from '../inference.mjs';
 
 export const TRAINING_COMMANDS = ['training', 'dataset', 'provider', 'compare', 'runner', 'laya'];
-export const TRAINING_HELP = `\nProvider and offline dataset commands:\n  provider status|jev|laya       Select an explicitly configured provider; no download\n  training capture status|on|off  Content capture is OFF by default and separate from telemetry\n  training min-labels [N]        Minimum strong labels per purpose for dataset build; changing it requires a TTY\n  training outcome|host          Read minimal evidence/baseline JSON from stdin; outcome is always weak host_review\n  training correct --decision ID Interactive TTY-only human correction; never accepted from a pipe\n  training evaluate              Append derived evaluations without changing raw evidence\n  runner allow --name N --timeout-ms MS [--cwd DIR] [--purpose P --question Q --pass-label V --fail-label V] [--replace] -- ARGV...\n                                  TTY-only pre-registration; an agent later selects only the name\n  runner list|remove --name N    Show or remove a registered pre-approved check\n  runner verify --decision ID --check N  Run the pre-registered check and record its own source:'runner' outcome\n  dataset stats|validate|build [--allow-small]\n  dataset export --version HASH [--format laya|canonical]\n  compare --live                 Explicitly authorize Jev/Laya comparison; only one active arm\n  laya register --checkpoint DIR [--model NAME] [--device cpu|mps|cuda] [--precision fp32|fp16]  Copy and fingerprint a prepared local checkpoint\n  laya holdout freeze --dataset HASH [--name ID]  Freeze the dataset's test split as an immutable regression holdout\n  laya holdout list              List holdout metadata only (no sample content)\n  laya qualify --candidate HASH --dataset HASH --holdout ID [--target-accuracy N] [--min-coverage N] [--min-calibration N] [--min-test N] [--min-lower-bound N]\n                                  Calibrate a conservative acceptance threshold and check it on test+holdout\n  laya compare --candidate HASH --holdout ID [--no-active-baseline]  Shadow-compare the candidate against the active checkpoint\n  laya promote --candidate HASH --holdout ID [--max-regression N]  Explicit operator promotion; requires qualification + non-regressing comparison\n  laya rollback                  Restore the laya block active immediately before the last promote/rollback\n  laya status                    Active checkpoint, candidates, qualification state, holdout metadata\nNo command trains, promotes a model, reads keys into output, or uploads a dataset.\n`;
+export const TRAINING_HELP = `\nProvider and offline dataset commands:\n  provider status|jev|laya       Select an explicitly configured provider; no download\n  training capture status|on|off  Content capture is OFF by default and separate from telemetry\n  training min-labels [N]        Minimum strong labels per purpose for dataset build; changing it requires a TTY\n  training outcome|host          Read minimal evidence/baseline JSON from stdin; outcome is always weak host_review\n  training correct --decision ID Interactive TTY-only human correction; never accepted from a pipe\n  training evaluate              Append derived evaluations without changing raw evidence\n  runner allow --name N --timeout-ms MS [--cwd DIR] [--purpose P --question Q --pass-label V --fail-label V] [--replace] -- ARGV...\n                                  TTY-only pre-registration; an agent later selects only the name\n  runner list|remove --name N    Show or remove a registered pre-approved check\n  runner verify --decision ID --check N  Run the pre-registered check and record its own source:'runner' outcome\n  dataset stats|validate|build [--allow-small]\n  dataset export --version HASH [--format laya|canonical]\n  compare --live                 Explicitly authorize Jev/Laya comparison; only one active arm\n  laya register --checkpoint DIR [--model NAME] [--device cpu|mps|cuda] [--precision fp32|fp16]  Copy and fingerprint a prepared local checkpoint\n  laya holdout freeze --dataset HASH [--name ID]  Freeze the dataset's test split as an immutable regression holdout\n  laya holdout list              List holdout metadata only (no sample content)\n  laya qualify --candidate HASH --dataset HASH --holdout ID [--target-accuracy N] [--min-coverage N] [--min-calibration N] [--min-test N] [--min-lower-bound N]\n                                  Calibrate a conservative acceptance threshold and check it on test+holdout\n  laya compare --candidate HASH --holdout ID [--no-active-baseline]  Shadow-compare the candidate against the active checkpoint\n  laya promote --candidate HASH --holdout ID [--max-regression N]  Explicit operator promotion; requires qualification + non-regressing comparison\n  laya rollback                  Restore the laya block active immediately before the last promote/rollback\n  laya status                    Active checkpoint, candidates, qualification state, holdout metadata\n  laya serve [--home DIR] [--no-preload]  Resident server on a local Unix socket (JEV_HOME/run/laya.sock); idle-unloads the worker\n  laya server-status             Query the resident server over the socket (content-free)\nNo command trains, promotes a model, reads keys into output, or uploads a dataset.\n`;
 const output = x => process.stdout.write(JSON.stringify(x, null, 2) + '\n');
 async function stdin() {
   if (process.stdin.isTTY) fail('PIPE_JSON_TO_STDIN');
@@ -136,6 +138,23 @@ async function layaMain(argv, env) {
   }
   if (sub === 'rollback') { const flags = parseFlags(argv.slice(1), ['home'], []); output(rollbackLaya(layaHome(flags, env))); return; }
   if (sub === 'status') { const flags = parseFlags(argv.slice(1), ['home'], []); output(layaStatus(layaHome(flags, env))); return; }
+  if (sub === 'serve') {
+    const flags = parseFlags(argv.slice(1), ['home'], ['no-preload']);
+    const home = layaHome(flags, env);
+    const server = await startLayaServer({ home, env, preload: !flags['no-preload'] });
+    const shutdown = () => { server.close().finally(() => process.exit(0)); };
+    process.once('SIGINT', shutdown);
+    process.once('SIGTERM', shutdown);
+    return;
+  }
+  if (sub === 'server-status') {
+    const flags = parseFlags(argv.slice(1), ['home'], []);
+    const home = layaHome(flags, env);
+    const client = createLayaSocketClient({ socketPath: layaSocketPath(home) });
+    try { output({ running: true, ...await client.status({ timeoutMs: 2000 }) }); }
+    catch (e) { output({ running: false, reason: e?.code ?? 'LAYA_SERVER_UNAVAILABLE' }); }
+    return;
+  }
   fail('INVALID_TRAINING_COMMAND');
 }
 export async function trainingMain(argv, env = process.env) {

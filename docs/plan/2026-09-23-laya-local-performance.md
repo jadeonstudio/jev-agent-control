@@ -93,7 +93,7 @@ owner 요청: 이 Mac(Apple M4 Pro, GPU 16코어, 통합 메모리 24GB)에서 L
 - [x] L1 worker 최적화: `no_init_weights()` 로드, `precision: fp16`(half + 강제 autocast), identity·qualification을 precision에 묶음. 실제 가중치 e2e(english, MPS, jev 엔진 경유): fp32 콜드 3.8s / warm p50 149ms, fp16 콜드 2.7s / warm p50 144ms, intent·risk 22/22 일치, difficulty 최대 차 0.0089. 재현: `scripts/laya-e2e.mjs`.
 - [x] laya 0.3.6 판단: 0.3.5·0.3.6 변경은 Router·다운로드·로망스어 라우팅 위주로 jev 경로(Agent 직접 사용)와 무관하다. 0.3.4 유지(재설치 불필요), 실제 이득은 로더·정밀도·상주 서빙에서 나온다.
 - [x] L2 한국어 경로 평가: multilingual 통일 기각, 한국어는 zero-shot 불가 → fine-tune 필요 (B3)
-- [ ] L3 상주 서버: `jev-control laya serve`(Unix 소켓, 유휴 언로드, 준비 안 됐으면 즉시 NOT_READY), hook·MCP가 서버를 사용, launchd 설치기(dry-run·승인)
+- [x] L3 상주 서버: `jev-control laya serve`/`laya server-status`(`src/laya-server.mjs`, Unix 소켓 `JEV_HOME/run/laya.sock` 0600·`run/` 0700, 유휴 언로드 `laya.serverIdleUnloadMs`, `wait:false`면 준비 안 됐을 때 즉시 NOT_READY+백그라운드 로드), 엔진이 소켓 있으면 자동 사용(`layaSpawn`/`layaWait` 엔진 옵션), hook은 `layaSpawn:false,wait:false`로 항상 즉시 통과, MCP·CLI는 기본 `layaSpawn:true,wait:true`. launchd 설치기 `install/uninstall --laya-agent`(macOS 전용, dry-run 승인, plist에 JEV_HOME만). doctor `layaServer` 섹션. 실측(english, MPS, fp16, `scripts/laya-server-e2e.mjs`): 서버 콜드→ready 3.2s, status 왕복 0ms, hook p50/p95 서버 있음 184/321ms(실제 3질문 추론 포함) vs 서버 없음 52/58ms(즉시 통과), 유휴 언로드로 worker RSS 464MiB→0MiB, 언로드 후 재요청 재로드 3.9s, close() 후 소켓 파일 제거 확인. 테스트: `tests/laya-server.test.mjs`(13개), `tests/install-laya-agent.test.mjs`(8개), `tests/hooks.test.mjs`의 L3 케이스.
 - [ ] L4 품질: 라벨 있는 평가 세트로 checkpoint·Jev 비교, qualification 경로(사람 라벨 필요)
 - [~] L5 Codex A/B 실측 완료(B4), 블록 변경은 owner 확인 대기
 - [ ] L6 설치본 반영·문서·커밋

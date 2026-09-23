@@ -277,7 +277,9 @@ export async function runHookCli({ host, event, home: homeOverride, env = proces
     if (!HOSTS.includes(host) || !HOOK_EVENTS.includes(event)) return;
     const home = resolveHome({ ...env, ...(homeOverride ? { JEV_HOME: homeOverride } : {}) });
     let engine, layer;
-    try { engine = createDecisionEngine({ home, env }); layer = createControlLayer({ home, env, engine }); }
+    // L3 (2026-09-23): a hook never spawns its own worker and never waits for a resident server's
+    // worker to finish loading; a socket that exists but is still loading returns LAYA_NOT_READY at once.
+    try { engine = createDecisionEngine({ home, env, layaSpawn: false, layaWait: false }); layer = createControlLayer({ home, env, engine }); }
     catch { return; }
     try {
       const status = layer.status();

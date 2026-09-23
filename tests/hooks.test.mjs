@@ -13,6 +13,7 @@ import { createDecisionEngine } from '../src/engine.mjs';
 import { createControlLayer } from '../src/control-layer.mjs';
 import { createTrainingStore } from '../src/training/store.mjs';
 import { createLinkIndex } from '../src/training/links.mjs';
+import { atomicWrite } from '../src/storage.mjs';
 
 const bin = fileURLToPath(new URL('../bin/jev-control.mjs', import.meta.url));
 const ANNOTATION = '[jev scope=local complete=yes failures=0]';
@@ -371,4 +372,19 @@ test('NO_CONTEXT_ANNOTATION records only the prompt form (plain/opaque), never c
   assert.deepEqual(ev.map(e => [e.reason, e.prompt_form]), [['NO_CONTEXT_ANNOTATION', 'opaque'], ['NO_CONTEXT_ANNOTATION', 'plain']]);
   assert.equal(JSON.stringify(ev).includes('SECRET'), false);
   assert.equal(s.calls.length, 0);
+});
+
+test('L3: runHookCli with provider=laya and no resident server passes through fast, no output, no direct spawn', async t => {
+  const s = setup(); t.after(s.cleanup);
+  installFixtureRoles(s.home, 'claude');
+  atomicWrite(path.join(s.home, 'providers.json'), JSON.stringify({ version: 1, provider: 'laya', laya: {
+    python: '/usr/bin/python3', modelPath: s.home, model: 'laya/base', checkpoint: 'a'.repeat(64), runtimeVersion: '0.3.4', device: 'cpu' } }));
+  let wrote = '';
+  const t0 = Date.now();
+  await runHookCli({ host: 'claude', event: 'pre-spawn', home: s.home, env: s.env, stdin: Readable.from([JSON.stringify(claudeInput())]), write: t2 => { wrote += t2; } });
+  assert.equal(wrote, '');
+  assert.ok(Date.now() - t0 < 100, 'a hook must never wait for a worker to load');
+  const hookEvent = readEvents(s.home).find(e => e.kind === 'hook' && e.event === 'pre-spawn');
+  assert.ok(hookEvent);
+  assert.equal(hookEvent.applied, false);
 });

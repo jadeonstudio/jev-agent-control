@@ -1,11 +1,12 @@
 import fs from 'node:fs';
 import path from 'node:path';
+import net from 'node:net';
 import { StringDecoder } from 'node:string_decoder';
 import { spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { randomUUID } from 'node:crypto';
 import { readText, atomicWrite, ensureDir } from './storage.mjs';
-import { ControlError, fail } from './constants.mjs';
+import { ControlError, fail, isObject } from './constants.mjs';
 import { normalizeResponse } from './contracts.mjs';
 import { only, text, HASH, digest, fraction } from './training/schema.mjs';
 
@@ -20,12 +21,12 @@ export function validateProviderConfig(c) {
   c.laya ??= null;
   if (c.laya !== null) {
     const l = c.laya;
-    only(l, ['python', 'modelPath', 'model', 'checkpoint', 'runtimeVersion', 'device', 'startupTimeoutMs', 'idleTimeoutMs', 'precision', 'qualification'],
+    only(l, ['python', 'modelPath', 'model', 'checkpoint', 'runtimeVersion', 'device', 'startupTimeoutMs', 'idleTimeoutMs', 'precision', 'qualification', 'serverIdleUnloadMs'],
       ['python', 'modelPath', 'model', 'checkpoint', 'runtimeVersion', 'device']);
     if (!path.isAbsolute(l.python) || !path.isAbsolute(l.modelPath) || !HASH.test(l.checkpoint) || l.runtimeVersion !== '0.3.4' ||
         !['cpu', 'mps', 'cuda'].includes(l.device) || !/^[A-Za-z0-9][A-Za-z0-9._/-]{0,100}$/.test(l.model)) fail('INVALID_PROVIDER_CONFIG');
-    for (const [name, fallback, max] of [['startupTimeoutMs', 120000, 180000], ['idleTimeoutMs', 60000, 300000]]) {
-      l[name] ??= fallback; if (!Number.isInteger(l[name]) || l[name] < 100 || l[name] > max) fail('INVALID_PROVIDER_CONFIG');
+    for (const [name, fallback, min, max] of [['startupTimeoutMs', 120000, 100, 180000], ['idleTimeoutMs', 60000, 100, 300000], ['serverIdleUnloadMs', 1800000, 60000, 86400000]]) {
+      l[name] ??= fallback; if (!Number.isInteger(l[name]) || l[name] < min || l[name] > max) fail('INVALID_PROVIDER_CONFIG');
     }
     // fp16 halves resident memory (measured: english MPS tensor 1,610 -> 810MiB) with a measured max
     // probability delta of 0.0074 vs fp32; qualification below is bound to precision because a precision
@@ -196,5 +197,56 @@ export function createLayaClient({ spawnImpl = spawn } = {}) {
     resident = keepResident; armIdle(l); return result;
   }
   return Object.freeze({ infer, prepare, close: stop,
-    status: () => ({ running: Boolean(child), ready: Boolean(readyIdentity), resident, inFlight: pending.size + tombstones.size, generation }) });
+    status: () => ({ running: Boolean(child), ready: Boolean(readyIdentity), resident, inFlight: pending.size + tombstones.size, generation, identity: readyIdentity ?? null }) });
+}
+
+/** Path of the resident-server Unix socket for a given JEV_HOME (L3, docs/plan/2026-09-23-laya-local-performance.md). */
+export function layaSocketPath(home) { return path.join(home, 'run', 'laya.sock'); }
+/** True only when the path exists and is actually a socket (never a symlink, regular file or directory). */
+export function layaSocketExists(home) {
+  try { return fs.lstatSync(layaSocketPath(home)).isSocket(); } catch { return false; }
+}
+/** Thin client for the resident `laya serve` process: one JSON line request, one JSON line response, then the
+ * connection closes. No retry, no persistent connection; the server owns the worker's lifecycle. */
+export function createLayaSocketClient({ socketPath: sock, connectImpl = net.createConnection }) {
+  function request(op, extra, { timeoutMs, signal }) {
+    return new Promise((resolve, reject) => {
+      let settled = false, socket;
+      const finish = (fn, value) => {
+        if (settled) return; settled = true;
+        clearTimeout(connectTimer); clearTimeout(replyTimer); signal?.removeEventListener('abort', onAbort);
+        try { socket?.destroy(); } catch { /* already closed */ }
+        fn(value);
+      };
+      const onAbort = () => finish(reject, new ControlError('CANCELLED'));
+      let buffer = '';
+      try { socket = connectImpl({ path: sock }); }
+      catch { finish(reject, new ControlError('LAYA_SERVER_UNAVAILABLE')); return; }
+      const connectTimer = setTimeout(() => finish(reject, new ControlError('LAYA_SERVER_UNAVAILABLE')), 50);
+      const replyTimer = setTimeout(() => finish(reject, new ControlError('TIMEOUT')), Math.max(51, timeoutMs));
+      socket.on('error', () => finish(reject, new ControlError('LAYA_SERVER_UNAVAILABLE')));
+      socket.on('connect', () => { clearTimeout(connectTimer); try { socket.write(JSON.stringify({ op, ...extra }) + '\n'); } catch { finish(reject, new ControlError('LAYA_SERVER_UNAVAILABLE')); } });
+      socket.on('close', () => finish(reject, new ControlError('LAYA_SERVER_UNAVAILABLE')));
+      socket.on('data', chunk => {
+        buffer += chunk.toString('utf8');
+        const end = buffer.indexOf('\n'); if (end === -1) return;
+        let msg; try { msg = JSON.parse(buffer.slice(0, end)); } catch { finish(reject, new ControlError('LAYA_SERVER_UNAVAILABLE')); return; }
+        if (!isObject(msg)) { finish(reject, new ControlError('LAYA_SERVER_UNAVAILABLE')); return; }
+        if (msg.error) finish(reject, new ControlError(/^[A-Z_]{1,64}$/.test(msg.error) ? msg.error : 'LAYA_SERVER_ERROR'));
+        else finish(resolve, msg);
+      });
+      if (signal?.aborted) { onAbort(); return; }
+      signal?.addEventListener('abort', onAbort, { once: true });
+    });
+  }
+  return Object.freeze({
+    async infer(payload, settings, { timeoutMs = 30000, signal, wait = false } = {}) {
+      if (!Number.isInteger(timeoutMs) || timeoutMs < 1) fail('INVALID_TIMEOUT');
+      const capped = Math.min(timeoutMs, 60000);
+      const res = await request('infer', { request: payload, timeoutMs: capped, wait: Boolean(wait) }, { timeoutMs: capped + 200, signal });
+      if (!res.ok) fail('LAYA_SERVER_ERROR');
+      return res.raw;
+    },
+    status: ({ timeoutMs = 2000, signal } = {}) => request('status', {}, { timeoutMs, signal }),
+  });
 }

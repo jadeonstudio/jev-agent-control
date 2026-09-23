@@ -4,16 +4,24 @@ import { DEFAULTS, VERSION, MODES, ControlError, errorCode, fail, isObject } fro
 import { resolveHome, loadConfig, getCredential, appendEvent } from './storage.mjs';
 import { validateRequest, containsSensitiveData, wireRequest } from './contracts.mjs';
 import { callTypeSafe } from './provider.mjs';
-import { loadProviderConfig, layaReady, createLayaClient, normalizeInference } from './inference.mjs';
+import { loadProviderConfig, layaReady, createLayaClient, normalizeInference, layaSocketExists, layaSocketPath, createLayaSocketClient } from './inference.mjs';
 import { createTrainingStore } from './training/store.mjs';
 import { recordHost } from './training/host.mjs';
 import { CAPTURE_VERSION, digest, validateTrace } from './training/schema.mjs';
 
 /** Shared control; the selected inference adapter does not own permissions or training labels. */
 export function createDecisionEngine({ home = resolveHome(), env = process.env, provider, now = Date.now,
-  layaClient = createLayaClient(), training = createTrainingStore({ home }) } = {}) {
-  let inFlight = 0, calls = [], monitor;
+  layaClient = createLayaClient(), training = createTrainingStore({ home }), layaSpawn = true, layaWait = true } = {}) {
+  let inFlight = 0, calls = [], monitor, layaSocket;
   const circuits = new Map(), pendingFeedback = new Map();
+  function getLayaSocket() { layaSocket ??= createLayaSocketClient({ socketPath: layaSocketPath(home) }); return layaSocket; }
+  // L3 (2026-09-23): a live server socket always wins; otherwise `layaSpawn` decides whether this
+  // process may spawn its own worker (true, the historical behavior) or must fail immediately (hooks).
+  async function inferLaya(payload, settings, opts) {
+    if (layaSocketExists(home)) return getLayaSocket().infer(payload, settings, { ...opts, wait: layaWait });
+    if (!layaSpawn) fail('LAYA_SERVER_UNAVAILABLE');
+    return layaClient.infer(payload, settings, opts);
+  }
   const revision = (config, settings) => createHash('sha256').update(JSON.stringify({ config, settings })).digest('hex');
   function remember(id, normalized) {
     for (const [key, value] of pendingFeedback) if (now() - value.at > 300000) pendingFeedback.delete(key);
@@ -92,7 +100,7 @@ export function createDecisionEngine({ home = resolveHome(), env = process.env, 
       if (selected === 'laya') monitorLaya();
       const raw = provider ? await provider(payload, key, { timeoutMs: config.timeoutMs, signal }) : selected === 'jev' ?
         await callTypeSafe(payload, key, { timeoutMs: config.timeoutMs, signal }) :
-        await layaClient.infer(payload, settings, { timeoutMs: config.timeoutMs, signal, env });
+        await inferLaya(payload, settings, { timeoutMs: config.timeoutMs, signal, env });
       const n = normalizeInference(selected, raw, request, config, settings);
       circuit.failures = 0; circuit.until = 0;
       eligible = n.eligible; result.usage = n.usage; result.model = n.model; result.provenance = n.provenance;

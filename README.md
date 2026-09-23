@@ -84,6 +84,29 @@ Jev HTTP 주소는 `https://api.typesafe.ai/v1/systemone`으로 고정하고 HTT
 
 Laya의 파일 수준 `ready`는 실제 로딩·품질 합격이 아닙니다. checkpoint별 `qualification`이 없으면 비교 기록은 가능해도 ON 결과는 채택하지 않습니다. 준비 형식과 cold/warm 제한은 [TRAINING_DATA.md](docs/TRAINING_DATA.md)에 있습니다.
 
+## Laya 상주 서버 (선택, macOS)
+
+매번 새 프로세스가 worker를 콜드 시작하는 대신, 로그인 시 자동 시작하는 사용자 `launchd` 에이전트 하나가 `JEV_HOME/run/laya.sock`(로컬 Unix 소켓, 네트워크 포트 없음) 위에서 worker를 상주시킵니다. hook은 이 서버가 없거나 준비 중이어도 절대 기다리지 않고 즉시 통과합니다.
+
+```sh
+# dry-run으로 plist 내용을 먼저 검토
+node bin/jev-control.mjs install --target both --laya-agent --dry-run
+node bin/jev-control.mjs install --target both --laya-agent
+# 설치기는 파일만 쓰고 launchctl은 직접 실행하지 않습니다. 출력의 launchctl 명령을 본인이 실행:
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.jev-agent-control.laya.plist
+
+# 상태 확인 (요청 내용은 절대 기록하지 않음)
+jev-control laya server-status
+jev-control doctor   # layaServer 섹션: plist·소켓·ready/loading
+
+# 제거 (plist만 제거; MCP·hook·스킬·shim·mode는 그대로)
+node bin/jev-control.mjs uninstall --target both --laya-agent --dry-run
+node bin/jev-control.mjs uninstall --target both --laya-agent
+launchctl bootout gui/$(id -u)/com.jev-agent-control.laya
+```
+
+`providers.json`의 `laya.serverIdleUnloadMs`(기본 1,800,000ms=30분)만큼 추론이 없으면 서버 프로세스는 유지한 채 worker만 내려 메모리를 반환합니다. 서버 없이도 기존처럼 각 프로세스가 직접 worker를 띄우는 경로는 그대로 동작합니다(`jev-control laya serve` 없이 사용 가능). 자세한 설계 근거는 [SECURITY.md](SECURITY.md)와 [docs/plan/2026-09-23-laya-local-performance.md](docs/plan/2026-09-23-laya-local-performance.md)에 있습니다.
+
 ## ON/OFF
 
 ```sh

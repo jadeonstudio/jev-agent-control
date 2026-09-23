@@ -121,7 +121,7 @@ test('cancelled request tombstones its late response without stopping other requ
   const timed=client.infer(a,p,{timeoutMs:10,env:{}});await new Promise(r=>setTimeout(r,2));
   const [br,cr]=await Promise.all([client.infer(b,p,{timeoutMs:100,env:{}}),client.infer(c,p,{timeoutMs:100,env:{}})]);
   await assert.rejects(timed,/TIMEOUT/);assert.equal(br.identity.model,p.laya.model);assert.equal(cr.identity.model,p.laya.model);await new Promise(r=>setTimeout(r,35));
-  assert.deepEqual(client.status(),{running:true,ready:true,resident:false,inFlight:0,generation:1});child.stdout.write(JSON.stringify({id:'unknown',result:{}})+'\n');assert.equal(client.status().running,false);
+  assert.deepEqual(client.status(),{running:true,ready:true,resident:false,inFlight:0,generation:1,identity:identity(p.laya)});child.stdout.write(JSON.stringify({id:'unknown',result:{}})+'\n');assert.equal(client.status().running,false);
 });
 test('a short timed-out request does not consume a longer pending request liveness budget', async t => {
   const f=fixture(t,false),p=layaConfig(f.home);p.laya.python=process.execPath;fs.writeFileSync(path.join(f.home,'model.safetensors'),'fake');
