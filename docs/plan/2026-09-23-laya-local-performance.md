@@ -59,6 +59,19 @@ owner 요청: 이 Mac(Apple M4 Pro, GPU 16코어, 통합 메모리 24GB)에서 L
 - 한국어 intent와 risk는 세 checkpoint 모두 zero-shot으로 쓸 수 없는 수준이다. difficulty는 평균 1단계 이상 어긋난다.
 - MPS에서 `model.half()`만 적용하면 mixed-dtype matmul에서 Metal assert로 프로세스가 죽는다. fp16은 half 가중치 + 강제 autocast(fp16)가 검증된 조합이다.
 
+### B5. 질문 문구 변형 (english·typed-decisions, FP16, 같은 개발 세트)
+
+| checkpoint | 변형 | intent 영/한 | risk 영/한 | difficulty MAE 영/한 | high→safe 영/한 |
+|---|---|---|---|---|---|
+| english | jev 원문 | 0.75 / 0.33 | 0.38 / 0.21 | 1.03 / 1.11 | 3 / 0 |
+| english | 작업 문장만 | 0.75 / 0.33 | 0.38 / 0.33 | 0.98 / 1.07 | 2 / 3 |
+| english | 작업 문장만 + 짧은 선택지 | 0.75 / 0.29 | 0.50 / 0.58 | 0.96 / 1.16 | 4 / 3 |
+| typed-decisions | jev 원문 | 0.71 / 0.38 | 0.54 / 0.58 | 1.01 / 1.09 | 4 / 4 |
+| typed-decisions | 작업 문장만 | 0.75 / 0.33 | 0.33 / 0.25 | 0.99 / 1.11 | 0 / 0 |
+| typed-decisions | 작업 문장만 + 짧은 선택지 | 0.79 / 0.21 | 0.58 / 0.50 | 1.01 / 1.23 | 2 / 1 |
+
+- 문구를 바꿔도 한국어 intent·risk·difficulty의 한계는 그대로다. 변화 폭은 표본 24개의 잡음 수준이다. zero-shot 한계는 문구가 아니라 모델 능력 문제이며, 이 판단들에 쓰려면 사용자 작업 분포로 fine-tune이 필요하다.
+
 ### B4. Codex A/B: spawn 전 명시 `jev_route` vs 바로 spawn (codex-cli 0.154.0, `codex exec`, 각 3회, 중앙값)
 
 | | A: route 후 spawn | B: 바로 spawn | 차이 |

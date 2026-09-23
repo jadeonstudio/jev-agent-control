@@ -21,6 +21,8 @@ def main():
     ap.add_argument("--device", default="mps")
     ap.add_argument("--precision", choices=["fp32", "fp16"], default="fp16")
     ap.add_argument("--dataset", default=str(HERE / "fixtures" / "route-dev-set.json"))
+    ap.add_argument("--variant", choices=["jev", "task-only", "short"], default="jev",
+                    help="jev: exact jev route state/questions; task-only: state is the task text only; short: task-only + terse criteria")
     ap.add_argument("--out")
     a = ap.parse_args()
     import torch
@@ -39,21 +41,33 @@ def main():
         laya.agent.torch.autocast = lambda device_type, dtype=None, enabled=True, **kw: orig(device_type, dtype=torch.float16, enabled=True)
     load_ms = (time.perf_counter() - t) * 1000
     items = json.loads(Path(a.dataset).read_text())["items"]
+    questions = ROUTE_QUESTIONS if a.variant != "short" else SHORT_QUESTIONS
+    make_state = state_for if a.variant == "jev" else (lambda task: task)
     rows, lat = [], []
     for it in items:
         t = time.perf_counter()
         with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
-            r = agent.system_one(state_for(it["task"]), ROUTE_QUESTIONS)
+            r = agent.system_one(make_state(it["task"]), questions)
         if a.device == "mps": torch.mps.synchronize()
         lat.append((time.perf_counter() - t) * 1000)
         ans = r["answers"]
         rows.append({"id": it["id"], "lang": it["lang"], "label": {k: it[k] for k in ("intent", "difficulty", "risk")},
                      "intent": ans["intent"], "difficulty": ans["difficulty"], "risk": ans["risk"]})
-    out = {"model_dir": a.model_dir, "precision": a.precision, "device": a.device, "load_ms": round(load_ms, 1),
+    out = {"model_dir": a.model_dir, "variant": a.variant, "precision": a.precision, "device": a.device, "load_ms": round(load_ms, 1),
            "latency_ms": {"p50": round(statistics.median(lat), 1), "max": round(max(lat), 1)}, "rows": rows, "summary": summarize(rows)}
     text = json.dumps(out, ensure_ascii=False, indent=1)
     if a.out: Path(a.out).write_text(text)
     print(json.dumps(out["summary"], ensure_ascii=False, indent=1))
+
+SHORT_QUESTIONS = {
+    "intent": {"type": "choice", "instructions": "What kind of work is this request?", "criteria": {
+        "explain": "explain or find existing code", "edit": "change code or docs", "debug": "find the cause of a failure",
+        "operate": "deploy, production, or live data", "research": "look up outside information", "architecture": "large redesign across the codebase",
+        "other": "unclear request"}},
+    "difficulty": {"type": "score", "instructions": "How hard is this work?", "criteria": ["trivial", "easy", "moderate", "hard", "very hard"]},
+    "risk": {"type": "choice", "instructions": "What is the risk if this goes wrong?", "criteria": {
+        "safe": "local and reversible", "caution": "needs review", "high": "production, credentials, money, or irreversible", "unknown": "not enough information"}},
+}
 
 def conf(ans):  # jev semantics: choice uses min(confidence, selected probability); score uses confidence
     if "choice" in ans: return min(ans.get("confidence", 0), ans["probabilities"][ans["choice"]])
