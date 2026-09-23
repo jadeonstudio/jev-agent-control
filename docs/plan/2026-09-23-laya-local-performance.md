@@ -85,6 +85,17 @@ owner 요청: 이 Mac(Apple M4 Pro, GPU 16코어, 통합 메모리 24GB)에서 L
 - 같은 조건의 프로세스 내 비교(`scripts/laya-idle-bench.py`, 3질문): MPS FP16은 연속 107ms / 5s 후 198–205ms / 30–60s 후 419–481ms. CPU FP32는 연속 217–219ms / 5s 후 237–252ms / 30–60s 후 556–568ms. 쉬고 난 뒤의 느려짐은 GPU만의 현상이 아니며 CPU가 더 느리다. MPS FP16을 유지한다.
 - keep-warm(주기적 더미 추론)은 spawn 간격(수 분)을 덮으려면 수십 회 추론이 필요해 에너지 대비 이득이 나쁘므로 넣지 않는다. 실제 hook 경로의 판단 지연은 드문 호출 기준 약 0.2–0.5초(+ Node 시작 약 50ms)이며, TypeSafe(약 0.65–0.73초 + API 비용)보다 빠르고 비용이 0이다.
 
+### B7. 무손실 입력 예산 (`scripts/laya-budget.py`, route 질문 3개, worker assert_lossless와 같은 규칙)
+
+| checkpoint | max_len / head | 영어 최대 | 한국어 최대 |
+|---|---|---:|---:|
+| english | 512 / 192 | 1,549자 | 296자(590B) |
+| multilingual | 1024 / 256 | 2,512자 | 1,440자(2,976B) |
+| typed-decisions | 1024 / 256 | 2,512자 | 697자(1,439B) |
+
+- english는 한국어 토큰화 효율이 낮아 한국어 296자를 넘으면 `INPUT_TRUNCATED`로 판단하지 않는다. 실제 한국어 서브에이전트 프롬프트는 대부분 이보다 길어, english는 정확도(B3)뿐 아니라 용량 면에서도 owner 사용 패턴에 맞지 않는다.
+- 결정: fine-tune 기반 모델은 multilingual(한국어 1,440자, 2.2배 빠름, FP16 631MiB). 증류 데이터 3,000개는 짧은 문장 2,000 + 실제 프롬프트형 긴 문장 1,000으로 구성한다(생성된 짧은 문장 중앙값 55자는 실제 입력 분포와 다름). hook의 판단 입력은 예산 안 앞부분으로 명시적으로 자르고 provenance에 기록하는 방식을 추가한다(조용한 잘림 아님).
+
 ### B4. Codex A/B: spawn 전 명시 `jev_route` vs 바로 spawn (codex-cli 0.154.0, `codex exec`, 각 3회, 중앙값)
 
 | | A: route 후 spawn | B: 바로 spawn | 차이 |
