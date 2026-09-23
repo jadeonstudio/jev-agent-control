@@ -7,6 +7,7 @@ import { randomUUID } from 'node:crypto';
 import { spawnSync, execFileSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { atomicWrite, readText } from '../src/storage.mjs';
+import { ControlError } from '../src/constants.mjs';
 import { digest } from '../src/training/schema.mjs';
 import { buildDataset } from '../src/training/dataset.mjs';
 import { fixture as trainingFixture, trace, outcome, REF } from './training-helpers.mjs';
@@ -14,9 +15,11 @@ import { registerCheckpoint, activateCandidate, freezeHoldout, listHoldouts, qua
   promoteCandidate, rollbackLaya, layaStatus, loadQualification } from '../src/training/laya-lifecycle.mjs';
 
 // --- synthetic checkpoint fixture -------------------------------------------------
-function makeCheckpointDir(root) {
+function makeCheckpointDir(root, tag = 'weights') {
   const dir = fs.mkdtempSync(path.join(root, 'ckpt-'));
-  fs.writeFileSync(path.join(dir, 'model.safetensors'), 'weights');
+  // `tag` varies the content (never just the tmp path, which is not part of the fingerprint input)
+  // so callers that need two DISTINCT registered checkpoints in the same home get distinct hashes.
+  fs.writeFileSync(path.join(dir, 'model.safetensors'), tag);
   fs.writeFileSync(path.join(dir, 'rl_agent_config.json'), '{}');
   fs.mkdirSync(path.join(dir, 'encoder'));
   fs.writeFileSync(path.join(dir, 'encoder', 'config.json'), '{}');
@@ -275,6 +278,103 @@ test('qualify fails when the worker predicts wrong: accuracy never clears the ta
   assert.equal(result.qualified, false);
 });
 
+// ============================== score-question scoring (real 2026-09-23 bug) ==============================
+// A trained candidate's normalized `score` answer is the continuous EXPECTED level (a probability-weighted
+// average, e.g. 2.0257), never an integer. The target is a 0-based integer index. Comparing them with
+// `===` means a score question can never be counted correct. Difficulty agreement must instead compare
+// argmax(answer.probabilities) to the target index.
+const SCORE_LEVELS = 3;
+function scoreProbabilities(want, conf) {
+  const other = (1 - conf) / (SCORE_LEVELS - 1);
+  return Object.fromEntries(Array.from({ length: SCORE_LEVELS }, (_, i) => [String(i), i === want ? conf : other]));
+}
+function buildScoreRequest(i, want, conf) {
+  return { purpose: 'judge', risk: 'routine', state: { task: `synthetic score case ${i}`, want, conf },
+    questions: { severity: { type: 'score', instructions: 'Rate the severity of this issue.', criteria: ['low', 'medium', 'high'] } } };
+}
+function findScoreIndex(target, want, conf, cursor) {
+  for (let i = cursor.n; i < cursor.n + 20000; i++) if (splitFor(digest(buildScoreRequest(i, want, conf))) === target) { cursor.n = i + 1; return i; }
+  throw new Error('NO_INDEX_FOUND');
+}
+function addScoreSamples(f, cursor, split, rows) {
+  for (const { want, conf, truth } of rows) {
+    const i = findScoreIndex(split, want, conf, cursor);
+    const r = buildScoreRequest(i, want, conf);
+    const oneHot = Object.fromEntries(Array.from({ length: SCORE_LEVELS }, (_, k) => [String(k), k === want ? 1 : 0]));
+    const d = { decision_id: randomUUID(), trace: trace(), arm: 'active', request: r, request_hash: digest(r),
+      provenance: { provider: 'jev', model: 'jev-1.13.0', model_version: 'jev-1.13.0', checkpoint: 'jev-1.13.0',
+        runtime_version: 'systemone-v1', preprocessing_version: 'wire-request-v1', confidence_semantics: 'reported-statistic' },
+      answers: { severity: { type: 'score', value: want, confidence: .9, probabilities: oneHot } },
+      mode: 'on', apply: true, latency_ms: 10, usage: { inputTokens: 10, outputTokens: 0 },
+      inference_calls: 1, network_calls: 1, capture_policy_version: 'minimal-state-v1' };
+    f.save(d);
+    f.store.outcome(outcome(d, {
+      checks: [{ kind: 'tests', required: true, passed: true, scope: 'task', evidence_ref: REF },
+        { kind: 'label', required: true, passed: true, scope: 'task', evidence_ref: REF, question_id: 'severity' }],
+      labels: [{ question_id: 'severity', value: truth, source: 'objective', label_confidence: .95, evidence_ref: REF }] }));
+  }
+}
+// 5 correct-high-confidence (want===truth) + 5 incorrect-low-confidence, exercising the real grid search.
+function scoreCalibrationRows() {
+  const rows = [];
+  for (let k = 0; k < 5; k++) rows.push({ want: 2, conf: .95, truth: 2 });
+  for (let k = 0; k < 5; k++) rows.push({ want: 2, conf: .55, truth: 1 });
+  return rows;
+}
+function scoreEvalRows() {
+  const rows = [];
+  for (let k = 0; k < 6; k++) rows.push({ want: 2, conf: .95, truth: 2 });
+  for (let k = 0; k < 2; k++) rows.push({ want: 2, conf: .3, truth: 1 });
+  return rows;
+}
+function buildScoreDataset(f) {
+  const cursor = { n: 0 };
+  addScoreSamples(f, cursor, 'calibration', scoreCalibrationRows());
+  addScoreSamples(f, cursor, 'test', scoreEvalRows());
+  const built = buildDataset(f.store, { allowSmall: true });
+  assert.equal(built.built, undefined, JSON.stringify(built));
+  return built.dataset_version;
+}
+function fakeScoreLayaClient() {
+  return {
+    calls: () => 0, status: () => ({ running: false }), close: () => {}, prepare: async () => ({}),
+    async infer(payload, settings) {
+      const laya = settings.laya;
+      const [qid, q] = Object.entries(payload.questions)[0];
+      const want = payload.state.want, conf = payload.state.conf;
+      const probabilities = scoreProbabilities(want, conf);
+      const labels = q.criteria.map((_, idx) => idx);
+      // The real worker's `score` is the probability-weighted expected value -- continuous, and never
+      // exactly equal to the target index unless probabilities happen to be exactly one-hot.
+      const expected = labels.reduce((s, k) => s + k * probabilities[String(k)], 0);
+      return {
+        identity: { model: laya.model, checkpoint: laya.checkpoint, runtime_version: laya.runtimeVersion, device: laya.device,
+          precision: laya.precision === 'fp16' ? 'torch.float16' : 'torch.float32' },
+        answers: { [qid]: { type: 'score', score: expected, confidence: conf, probabilities } },
+        usage: { input_tokens: 5, output_tokens: 0 },
+      };
+    },
+  };
+}
+
+test('qualify credits score questions by argmax(probabilities) vs the target index, not raw continuous value equality', async t => {
+  const f = trainingFixture(t);
+  const version = buildScoreDataset(f);
+  const holdout = freezeHoldout(f.home, { datasetVersion: version, name: 'hs' });
+  const reg = registerCheckpoint(f.home, { checkpointDir: makeCheckpointDir(fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'jev-laya-')))), model: 'laya/score', device: 'cpu', python: '/usr/bin/python3', fingerprintImpl: fakeFingerprint });
+  const result = await qualifyCandidate(f.home, { candidateHash: reg.checkpoint, datasetVersion: version, holdoutName: holdout.name, layaClient: fakeScoreLayaClient(),
+    targetAccuracy: .75, minCoverage: .3, minCalibration: 5, minTest: 5, minLowerBound: .5 });
+  assert.equal(result.qualified, true, JSON.stringify(result));
+  assert.deepEqual(result.purposes, ['judge']);
+  assert.equal(result.evidence.judge.test.accuracy, 1);
+  assert.equal(result.evidence.judge.holdout.accuracy, 1);
+  // Content-free per-question raw stats (bug 4): n, raw agreement, refused.
+  assert.ok(result.by_question, 'qualify result must report per-question raw stats');
+  assert.equal(result.by_question.severity.n, 26); // 10 calibration + 8 test + 8 holdout (holdout freezes the test split)
+  assert.equal(result.by_question.severity.refused, 0);
+  assert.ok(result.by_question.severity.raw_agreement > 0 && result.by_question.severity.raw_agreement <= 1);
+});
+
 // ============================== compare + promote ==============================
 
 async function qualifiedCandidate(f, version, holdoutName, model = 'laya/promote-me') {
@@ -326,6 +426,55 @@ test('compare + promote (no active baseline) swaps providers.json laya, keeps pr
   assert.equal(history.length, 1);
   assert.equal(history[0].action, 'promote');
   assert.equal(history[0].before, null);
+});
+
+// (2026-09-23 real bug) `--no-active-baseline` must skip inferring the active checkpoint entirely when
+// one is configured, not just skip the ACTIVE_BASELINE_REQUIRED guard.
+test('compare --no-active-baseline skips inferring the active checkpoint even when one is configured', async t => {
+  const f = trainingFixture(t);
+  const version = buildRouteDataset(f);
+  const holdout = freezeHoldout(f.home, { datasetVersion: version, name: 'h1' });
+  const activeReg = registerCheckpoint(f.home, { checkpointDir: makeCheckpointDir(fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'jev-laya-'))), 'active-weights'), model: 'laya/active', device: 'cpu', python: '/usr/bin/python3', fingerprintImpl: fakeFingerprint });
+  writeProviders(f.home, { version: 1, provider: 'laya', laya: JSON.parse(fs.readFileSync(activeReg.candidate, 'utf8')) });
+  const { reg } = await qualifiedCandidate(f, version, holdout.name);
+  const seenCheckpoints = [];
+  const inner = fakeLayaClient();
+  const layaClient = { ...inner, async infer(payload, settings, opts) { seenCheckpoints.push(settings.laya.checkpoint); return inner.infer(payload, settings, opts); } };
+  const cmp = await compareCandidate(f.home, { candidateHash: reg.checkpoint, holdoutName: holdout.name, layaClient, noActiveBaseline: true });
+  assert.equal(cmp.active, null);
+  assert.ok(!('active' in cmp.purposes.route), 'no active side must be recorded when --no-active-baseline is set');
+  assert.ok(!seenCheckpoints.includes(activeReg.checkpoint), 'the active checkpoint must never be inferred when --no-active-baseline is set');
+});
+
+// (2026-09-23 real bug) the active baseline refusing one sample (e.g. INPUT_TRUNCATED from the official
+// tokenizer admission check) must not abort the whole compare; it must be recorded as `refused` and the
+// rest of the holdout still evaluated. Also covers bug 4: content-free per-question raw stats.
+test('compare records a per-sample INPUT_TRUNCATED refusal instead of aborting, and reports refused counts', async t => {
+  const f = trainingFixture(t);
+  const version = buildRouteDataset(f);
+  const holdout = freezeHoldout(f.home, { datasetVersion: version, name: 'h1' });
+  const activeReg = registerCheckpoint(f.home, { checkpointDir: makeCheckpointDir(fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'jev-laya-'))), 'active-weights'), model: 'laya/active', device: 'cpu', python: '/usr/bin/python3', fingerprintImpl: fakeFingerprint });
+  writeProviders(f.home, { version: 1, provider: 'laya', laya: JSON.parse(fs.readFileSync(activeReg.candidate, 'utf8')) });
+  const { reg } = await qualifiedCandidate(f, version, holdout.name);
+  const inner = fakeLayaClient();
+  const counters = new Map();
+  const flakyClient = { ...inner, async infer(payload, settings, opts) {
+    const k = settings.laya.checkpoint;
+    const n = (counters.get(k) ?? 0) + 1; counters.set(k, n);
+    if (k === activeReg.checkpoint && n % 3 === 0) throw new ControlError('INPUT_TRUNCATED');
+    return inner.infer(payload, settings, opts);
+  } };
+  const cmp = await compareCandidate(f.home, { candidateHash: reg.checkpoint, holdoutName: holdout.name, layaClient: flakyClient });
+  assert.equal(cmp.active, activeReg.checkpoint);
+  assert.ok(cmp.by_question, 'compare result must report per-question raw stats');
+  assert.ok(cmp.by_question.active, 'compare result must report per-question raw stats for the active side');
+  const activeRefused = Object.values(cmp.by_question.active).reduce((s, q) => s + q.refused, 0);
+  assert.ok(activeRefused > 0, 'refused samples must be counted');
+  const candidateRefused = Object.values(cmp.by_question.candidate).reduce((s, q) => s + q.refused, 0);
+  assert.equal(candidateRefused, 0); // only the active side was made flaky
+  // A refused sample must never count as correct, and must never be covered by any threshold (raw uses threshold 0).
+  assert.ok(cmp.purposes.route.active.raw.refused > 0);
+  assert.ok(cmp.purposes.route.active.raw.n < 9); // fewer than the full 9-sample holdout are covered
 });
 
 test('promote is refused without qualification, without a matching comparison report, or on checkpoint mismatch', async t => {

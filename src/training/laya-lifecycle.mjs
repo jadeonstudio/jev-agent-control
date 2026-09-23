@@ -6,7 +6,7 @@ import { randomUUID } from 'node:crypto';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { noSymlinks, ensureDir, readText, atomicWrite } from '../storage.mjs';
-import { fail, PURPOSES, DEFAULTS } from '../constants.mjs';
+import { fail, PURPOSES, DEFAULTS, ControlError } from '../constants.mjs';
 import { HASH, digest, encode, only } from './schema.mjs';
 import { readDataset } from './dataset.mjs';
 import { createTrainingStore } from './store.mjs';
@@ -135,21 +135,53 @@ function readHoldout(home, name) {
 }
 
 // --- inference over dataset/holdout samples ------------------------------
+// Per-sample input-admission refusals from the official worker (e.g. the tokenizer budget rejecting
+// the request outright) are not a model quality signal and must not abort the whole qualify/compare
+// run. Any other error code still aborts (a real bug should not be silently swallowed as "refused").
+const INPUT_REFUSAL_CODES = new Set(['INPUT_TRUNCATED', 'INPUT_REWRITE_REFUSED']);
+function argmaxKey(probabilities) {
+  let bestKey = null, bestValue = -Infinity;
+  for (const [key, value] of Object.entries(probabilities)) if (value > bestValue) { bestValue = value; bestKey = key; }
+  return bestKey;
+}
 async function inferOne(layaClient, laya, sample, { timeoutMs = 30000, env = process.env, signal } = {}) {
   const request = validateRequest({ purpose: sample.purpose, risk: 'routine', state: sample.state, questions: { [sample.question_id]: sample.question } }, DEFAULTS);
   const payload = wireRequest(request, laya.model);
-  const raw = await layaClient.infer(payload, { laya }, { timeoutMs, env, signal });
+  let raw;
+  try {
+    raw = await layaClient.infer(payload, { laya }, { timeoutMs, env, signal });
+  } catch (e) {
+    if (e instanceof ControlError && INPUT_REFUSAL_CODES.has(e.code)) {
+      // Never covered by any qualify/compare threshold (metric -Infinity), and never counted correct.
+      return { purpose: sample.purpose, question_id: sample.question_id, correct: false, metric: -Infinity, label_source: sample.label_source, refused: true };
+    }
+    throw e;
+  }
   const relaxed = { ...DEFAULTS, minConfidence: 0, minChoiceProbability: 0, noulCertainty: 0 };
   const n = normalizeInference('laya', raw, request, relaxed, { laya });
   const answer = n.answers[sample.question_id];
-  const correct = answer.value === sample.target.value;
+  // Score questions report a continuous probability-weighted expected value in `answer.value` (e.g.
+  // 2.0257), never the integer target index -- agreement must compare the argmax label instead.
+  const correct = sample.question.type === 'score'
+    ? argmaxKey(answer.probabilities) === String(sample.target.value)
+    : answer.value === sample.target.value;
   // Threshold mapping: choice questions gate on BOTH selected probability and confidence (the
   // minChoiceProbability/minConfidence pair); noul gates on max(p,1-p) i.e. certainty away from 0.5;
   // score gates on confidence alone. A single grid value t is compared against whichever metric applies.
   const metric = sample.question.type === 'noul' ? Math.max(answer.probabilityTrue, 1 - answer.probabilityTrue)
     : sample.question.type === 'choice' ? Math.min(answer.confidence, answer.selectedProbability)
     : answer.confidence;
-  return { purpose: sample.purpose, correct, metric, label_source: sample.label_source };
+  return { purpose: sample.purpose, question_id: sample.question_id, correct, metric, label_source: sample.label_source, refused: false };
+}
+// Content-free per-question raw stats: n, raw agreement (argmax-correct / n), refused.
+function byQuestionStats(records) {
+  const buckets = {};
+  for (const r of records) {
+    const b = buckets[r.question_id] ??= { n: 0, correct: 0, refused: 0 };
+    b.n++;
+    if (r.refused) b.refused++; else if (r.correct) b.correct++;
+  }
+  return Object.fromEntries(Object.entries(buckets).map(([qid, b]) => [qid, { n: b.n, raw_agreement: b.n ? b.correct / b.n : 0, refused: b.refused }]));
 }
 // When any evaluated sample carries an 'ai_reference' label (owner decision 2026-09-23), the metric
 // this checkpoint is scored against is agreement with that reference model, never "accuracy" — see
@@ -181,8 +213,9 @@ function wilsonLowerBound(successes, n) {
 function evalSplit(records, threshold) {
   const covered = records.filter(r => r.metric >= threshold);
   const successes = covered.filter(r => r.correct).length;
+  const refused = records.filter(r => r.refused).length;
   return { n: covered.length, coverage: records.length ? covered.length / records.length : 0,
-    accuracy: covered.length ? successes / covered.length : 0, lowerBound: wilsonLowerBound(successes, covered.length) };
+    accuracy: covered.length ? successes / covered.length : 0, lowerBound: wilsonLowerBound(successes, covered.length), refused };
 }
 // Grid search 0.50..0.99 step 0.01: lowest threshold meeting selective accuracy and coverage floors.
 function selectThreshold(records, { targetAccuracy, minCoverage, minCalibration }) {
@@ -242,11 +275,12 @@ export async function qualifyCandidate(home, { candidateHash, datasetVersion, ho
   const params = { targetAccuracy, minCoverage, minCalibration, minTest, minLowerBound };
   // Must fit the provider contract's 80-character calibrationVersion limit.
   const calibrationVersion = `${datasetVersion.slice(0, 32)}:q-${digest(params).slice(0, 32)}`;
+  const allRecords = [...calibrationRecords, ...testRecords, ...holdoutRecords];
   const result = { checkpoint: candidateHash, qualified: qualifiedPurposes.length > 0, purposes: qualifiedPurposes,
     minConfidence: globalThreshold ?? 1, minChoiceProbability: globalThreshold ?? 1, noulCertainty: globalThreshold ?? 1,
     calibrationVersion, dataset_version: datasetVersion, holdout: holdoutManifest.name, holdout_sha256: holdoutManifest.sha256,
-    precision: laya.precision ?? 'fp32', params, evidence, generated_at: new Date().toISOString(),
-    ...labelSourceSummary([...calibrationRecords, ...testRecords, ...holdoutRecords]) };
+    precision: laya.precision ?? 'fp32', params, evidence, by_question: byQuestionStats(allRecords), generated_at: new Date().toISOString(),
+    ...labelSourceSummary(allRecords) };
   ensureDir(layaRoot(home), true); ensureDir(qualificationsDir(home), true);
   atomicWrite(path.join(qualificationsDir(home), `${candidateHash}.json`), JSON.stringify(result, null, 2) + '\n');
   return result;
@@ -274,18 +308,26 @@ export async function compareCandidate(home, { candidateHash, holdoutName, layaC
     const qualified = Boolean(qual?.purposes?.includes(purpose));
     return { qualified, raw: evalSplit(records, 0), selective: qualified ? evalSplit(records, qual.minConfidence) : null };
   };
-  const candidateByPurpose = groupByPurpose(await inferAll(layaClient, candidate, holdoutSamples, opts));
+  const candidateRecords = await inferAll(layaClient, candidate, holdoutSamples, opts);
+  const candidateByPurpose = groupByPurpose(candidateRecords);
   const purposes = {};
   for (const purpose of PURPOSES) purposes[purpose] = { candidate: side(candidateByPurpose[purpose] || [], candidateQual, purpose) };
-  if (active) {
-    const activeByPurpose = groupByPurpose(await inferAll(layaClient, active, holdoutSamples, opts));
-    for (const purpose of PURPOSES) purposes[purpose].active = side(activeByPurpose[purpose] || [], active.qualification, purpose);
+  // `--no-active-baseline` must skip inferring the active checkpoint entirely, not just skip the
+  // ACTIVE_BASELINE_REQUIRED guard above -- otherwise the flag would still spend a full inference pass
+  // on a checkpoint the caller explicitly asked to exclude from this comparison.
+  const activeUsed = noActiveBaseline ? null : active;
+  let activeRecords = null;
+  if (activeUsed) {
+    activeRecords = await inferAll(layaClient, activeUsed, holdoutSamples, opts);
+    const activeByPurpose = groupByPurpose(activeRecords);
+    for (const purpose of PURPOSES) purposes[purpose].active = side(activeByPurpose[purpose] || [], activeUsed.qualification, purpose);
   }
-  const report = { active: active?.checkpoint ?? null, candidate: candidateHash, holdout: holdoutManifest.name,
-    holdout_sha256: holdoutManifest.sha256, purposes, generated_at: new Date().toISOString(),
-    ...labelSourceSummary(holdoutSamples) };
+  const report = { active: activeUsed?.checkpoint ?? null, candidate: candidateHash, holdout: holdoutManifest.name,
+    holdout_sha256: holdoutManifest.sha256, purposes,
+    by_question: { candidate: byQuestionStats(candidateRecords), active: activeRecords ? byQuestionStats(activeRecords) : null },
+    generated_at: new Date().toISOString(), ...labelSourceSummary(holdoutSamples) };
   ensureDir(layaRoot(home), true); ensureDir(comparisonsDir(home), true);
-  const file = path.join(comparisonsDir(home), `${active?.checkpoint ?? 'none'}__${candidateHash}__${holdoutManifest.name}.json`);
+  const file = path.join(comparisonsDir(home), `${activeUsed?.checkpoint ?? 'none'}__${candidateHash}__${holdoutManifest.name}.json`);
   atomicWrite(file, JSON.stringify(report, null, 2) + '\n');
   return report;
 }
