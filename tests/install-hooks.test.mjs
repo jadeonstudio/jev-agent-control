@@ -278,3 +278,29 @@ test('Codex trust status reads per-hook [hooks.state."<file>:<event>:<group>:<ha
   fs.writeFileSync(config, base + entry('pre_tool_use:1:0') + `\n[hooks.state."${hooksFile}:subagent_start:0:0"]\ntrusted_hash = "sha256:00"\n[hooks.state."${hooksFile}:subagent_stop:0:0"]\ntrusted_hash = "sha256:00"\n`);
   assert.equal(status(), 'trust-entry-present-unverified');
 });
+
+test('Codex pre-spawn matcher covers the namespaced spawn_agent tool (0.154.0 did not fire PreToolUse for matcher "Agent")', t => {
+  const f = setup(t);
+  f.install({ target: 'codex', hooks: true });
+  const groups = JSON.parse(fs.readFileSync(codexHooks(f.env), 'utf8')).hooks.PreToolUse;
+  const re = new RegExp(`^(?:${groups.at(-1).matcher})$`);
+  for (const name of ['Agent', 'spawn_agent', 'agents.spawn_agent']) assert.ok(re.test(name), name);
+});
+test('changing the managed matcher upgrades an existing owned group in place', t => {
+  const f = setup(t);
+  f.install({ target: 'codex', hooks: true });
+  const file = codexHooks(f.env);
+  const doc = JSON.parse(fs.readFileSync(file, 'utf8'));
+  doc.hooks.PreToolUse.at(-1).matcher = 'Agent';
+  // Simulate the previous release's recorded group so the upgrade path is exercised.
+  const recordDir = path.join(f.home, 'installations');
+  for (const name of fs.readdirSync(recordDir)) {
+    const rec = JSON.parse(fs.readFileSync(path.join(recordDir, name), 'utf8'));
+    if (rec.path === `${file}::hooks::PreToolUse`) { rec.value.matcher = 'Agent'; atomicWrite(path.join(recordDir, name), JSON.stringify(rec, null, 2) + '\n'); }
+  }
+  atomicWrite(file, JSON.stringify(doc, null, 2) + '\n');
+  const r = f.install({ target: 'codex', hooks: true });
+  assert.equal(r.ok, true);
+  assert.notEqual(JSON.parse(fs.readFileSync(file, 'utf8')).hooks.PreToolUse.at(-1).matcher, 'Agent');
+  assert.equal(JSON.parse(fs.readFileSync(file, 'utf8')).hooks.PreToolUse.length, 1);
+});

@@ -21,7 +21,8 @@ const HOOK_EVENTS_BY_HOST = Object.freeze({
     { key: 'SubagentStop', event: 'subagent-stop' },
   ],
   codex: [
-    { key: 'PreToolUse', event: 'pre-spawn', matcher: 'Agent' },
+    // Measured 2026-09-23 on codex-cli 0.154.0: matcher "Agent" never fired for agents.spawn_agent despite the documented alias.
+    { key: 'PreToolUse', event: 'pre-spawn', matcher: 'Agent|.*spawn_agent.*' },
     { key: 'SubagentStart', event: 'subagent-start' },
     { key: 'SubagentStop', event: 'subagent-stop' },
   ],
