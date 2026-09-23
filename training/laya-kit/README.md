@@ -1,8 +1,12 @@
 # training/laya-kit -- Laya Kaggle T4x2 학습 준비 키트
 
-이 폴더는 **학습을 실행하지 않는 준비물**이다. `jev-agent-control` 저장소는 온라인 학습이나
-자동 fine-tuning/checkpoint 승격을 하지 않는다(`docs/TRAINING_DATA.md`). 실제 학습은 사람이
-Kaggle(또는 동등한 2x NVIDIA T4 DDP 머신)에서 이 폴더를 업로드해 직접 실행해야 한다.
+`jev-agent-control` 저장소는 온라인 학습이나 자동 fine-tuning/checkpoint 승격을 하지
+않는다(`docs/TRAINING_DATA.md`). 공식 2xT4 DDP 경로(`train_from_export.py`, torchrun+NCCL)는
+사람이 Kaggle(또는 동등한 2x NVIDIA T4 DDP 머신)에 이 폴더를 업로드해 직접 실행해야 하는
+**준비물**이다. `--local` 플래그(§ "Mac에서 로컬로 돌릴 수 있는가")를 쓰면 같은 스크립트가
+Apple Silicon MPS(또는 CPU)에서 torchrun/NCCL/DDP 없이 단일 프로세스로 **실제로 학습을
+실행**한다 -- 이 경우도 checkpoint 등록(`laya register`)·promote는 여전히 사람이 명시
+승인한다.
 
 고정된 공식 자료:
 - 저장소 커밋: `NandhaKishorM/laya@42626c348753fbb17572a813127df2278a1ec527`
@@ -197,18 +201,62 @@ owner 결정(2026-09-23): fine-tune 기준 checkpoint는 **multilingual**(mmBERT
 - 비용: Kaggle 무료 GPU 티어를 그대로 쓰면 추가 비용은 없다. Kaggle Pro/추가 컴퓨팅
   구매 여부는 사용자 계정 정책이며 이 kit이 강제하지 않는다.
 
-## Mac에서 로컬로 돌릴 수 있는가 (MPS)
+## Mac에서 로컬로 돌릴 수 있는가 (MPS) -- `--local` 모드 (2026-09-23 구현·실측)
 
 - 공식 절차는 `torch.distributed` NCCL 백엔드와 `torchrun --nproc_per_node=2`로 **CUDA
   DDP 전용**이다. NCCL은 NVIDIA GPU 간 통신 전용이므로 Apple Silicon의 MPS 장치에서는
   이 경로가 그대로 동작하지 않는다.
-- 이번 작업에서 Mac MPS 단일 장치로 축소한 학습 spike는 수행하지 않았다. MPS 단일
-  장치에서 RLCD+GRPO 루프가 동작하는지, 어느 정도 시간이 걸리는지는 **UNKNOWN**이며,
-  이 kit의 no-go 판정 근거로 쓸 수 없다. MPS 경로가 필요하면 별도 작업으로 실제
-  spike를 먼저 돌려야 한다.
+- `train_from_export.py --local`이 이 문제를 우회한다: `torchrun`/NCCL/DDP 없이 단일
+  프로세스로 **동일한** loss(RLCD+GRPO)·optimizer(AdamW, encoder/head 분리 LR)·cosine LR
+  schedule·epochs(4)·per-device batch size·seed를 재사용한다(`TRAIN_DDP_SCRIPT` 내부를
+  `run_training_loop()`/`finalize_and_save()`로 리팩터해 DDP 경로(`main_ddp`, 그대로
+  유지)와 로컬 경로(`main_local`, world_size=1/rank=0)가 같은 함수를 호출). `datasets`
+  패키지 없이(로컬 laya venv에는 미설치) 표준 라이브러리 `json`만으로 export의
+  train/calibration/test.jsonl을 읽는다(`load_jsonl_rows`).
+- **실행 예시** (multilingual base checkpoint, 이 저장소 기준):
+  ```sh
+  /Users/jangjiyong/.local/share/laya/.venv/bin/python training/laya-kit/train_from_export.py \
+      --export-dir exports/<hash>/laya \
+      --model-dir /Users/jangjiyong/.local/share/laya/models/multilingual/multilingual \
+      --output-dir <출력-디렉터리> \
+      --local --device mps
+  ```
+  - `--device mps|cpu` (기본 mps), `--grad-accum N`(기본: DDP 레시피의 effective global
+    batch를 그대로 유지하도록 `--batch-size`로부터 자동 계산 -- 기본 batch-size 8일 때
+    grad-accum 8, 즉 8*8=64로 DDP의 8*4*2=64와 동일), `--batch-size N`(기본 8, OOM 시
+    줄이면 grad-accum이 비례해 자동으로 커져 effective batch를 유지), `--mps-autocast
+    bf16|off`(기본 off -- MPS fp16 autocast는 학습에 불안정하다고 실측됨(§ B3), bf16은
+    opt-in), `--max-steps N`(smoke 검증 전용, 지정한 micro-step 수만큼만 돌고 멈춤).
+  - `fit_task_head()`/`resolve_effective_cfg()`(입력 예산 맞춤·admission 기준)는 DDP
+    경로와 완전히 동일하게 적용된다(분기 없음).
+  - 메모리 안전: epoch마다 `torch.mps.driver_allocated_memory()`를 로그(`[mem] epoch N
+    mps_driver_allocated_mib=...`, MPS에 진짜 peak 카운터가 없어 best-effort 근사치).
+    OOM이 나면(`RuntimeError`에 "out of memory") 학습을 멈추고 `--batch-size`를 반으로
+    줄이고 `--grad-accum`을 비례해서 늘리라는 구체적 메시지를 낸다.
+  - 산출물: `model.safetensors`(fp16, notebook과 동일), `encoder/`, `tokenizer/`,
+    `rl_agent_config.json`(model_name/base_model_dir_name/exporter_version 포함, DDP와
+    동일 레이아웃), `training_metadata.json`(`mode:"local"`, `device`, 하이퍼파라미터에
+    실제 micro_batch/grad_accum 포함, `local_run`에 device/grad_accum/epochs_completed/
+    wall_time_s), 그리고 로컬 전용 `local_training_run.json`.
+- **Smoke 실측 (2026-09-23, M4 Pro, multilingual base, 합성 export 12/6/6행, `--local
+  --device mps`)**: 합성 데이터로 12개 train 행 × 질문 3개 = 36 학습 시퀀스.
+  `--max-steps 20`(micro-batch 20개, batch-size 8/grad-accum 8) 기준 총 11.953초 →
+  약 **0.60초/micro-step**(첫 step은 MPS 커널 컴파일로 약 1.8초까지 느려짐 -- 정상
+  구간은 이후). 체크포인트는 `laya.agent.Agent(output_dir, device='mps')`로 즉시
+  로드돼 route 형태 질문(`intent` choice)에 정상 응답했다(`predict()` 0.64초).
+  `check_tokenizer_admission`도 정상 통과(0/54 truncated).
+- **예상 소요 시간 (owner 목표 규모, 투영치)**: owner 계획(`docs/plan/2026-09-23-laya-local-performance.md`)의
+  실제 데이터 규모는 작업 문장 약 3,000개 × 질문 3개 = **약 9,000개 학습 시퀀스**(잘림
+  없다고 가정, smoke에서 실측 잘림률 0%와 일치). 공식 epochs=4, batch-size=8 기준
+  micro-batch 수 = `ceil(9000/8) * 4 = 4,500`. smoke에서 잰 정상 구간 0.60초/step을 그대로
+  곱하면 `4,500 * 0.60s ≈ 2,700초 ≈ 45분`(**학습 루프만의 투영치** -- 모델 로드
+  ~26초, calibration 온도 피팅, test 평가(케이스당 약 0.6초)는 별도로 더해야 하며, 실제
+  9,000개 시퀀스에서의 MPS 스로틀링·열 관리 영향은 관측하지 않았으므로 실제 값과 다를 수
+  있다). 공식 notebook의 "~4 to 6 minutes"(2×T4 DDP, world_size=2)와 비교하면 로컬 단일
+  MPS 프로세스가 약 7~11배 더 걸리는 셈이나, 비용은 0이고 Kaggle GPU 할당량 소모도 없다.
 - `docs/TRAINING_DATA.md`의 `providers.json` 예시에 `"device": "mps"`가 있는 것은
-  **추론(inference) 시점**의 로컬 Laya worker 장치 설정이며, 이 학습 kit의 DDP
-  학습 절차와는 별개다. 혼동하지 않는다.
+  **추론(inference) 시점**의 로컬 Laya worker 장치 설정이며, 이 학습 kit의 `--local`
+  학습 경로와는 별개다(다만 같은 물리 장치를 쓴다). 혼동하지 않는다.
 
 ## 반복 fine-tune의 망각(catastrophic forgetting) 위험과 holdout 게이트
 

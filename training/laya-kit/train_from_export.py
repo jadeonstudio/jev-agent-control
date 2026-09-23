@@ -246,6 +246,75 @@ def resolve_effective_cfg(base_cfg, max_len=DEFAULT_FINAL_MAX_LEN, head_max_len=
     return effective
 
 
+# ---------------------------------------------------------------------------
+# jev-change: --local (single-process, no torchrun/NCCL/DDP) mode support.
+# The official recipe's effective global batch is MICRO_BATCH(8) * GRAD_ACCUM(4)
+# * DDP_WORLD_SIZE(2) = 64. In --local mode world_size is always 1 (no DDP rank
+# split), so to keep the SAME effective global batch (and therefore the same
+# optimizer update granularity / LR schedule shape) the default --grad-accum is
+# scaled up by the DDP world size the recipe assumes, unless the operator
+# explicitly overrides --grad-accum.
+# ---------------------------------------------------------------------------
+DEFAULT_MICRO_BATCH = 8
+DEFAULT_DDP_GRAD_ACCUM = 4
+DEFAULT_DDP_WORLD_SIZE = 2
+EFFECTIVE_GLOBAL_BATCH = DEFAULT_MICRO_BATCH * DEFAULT_DDP_GRAD_ACCUM * DEFAULT_DDP_WORLD_SIZE  # 64
+
+
+def resolve_local_batch_and_grad_accum(batch_size_arg, grad_accum_arg):
+    """Resolve --batch-size/--grad-accum for --local mode.
+
+    Default --batch-size is DEFAULT_MICRO_BATCH (8, same as the DDP MICRO_BATCH).
+    Default --grad-accum (when not explicitly given) is computed so that
+    batch_size * grad_accum == EFFECTIVE_GLOBAL_BATCH (64) -- i.e. losing DDP's
+    world_size=2 is compensated by doubling grad-accum, and shrinking
+    --batch-size (e.g. to dodge an OOM) proportionally grows grad-accum to keep
+    the same effective global batch. An explicit --grad-accum always wins.
+    """
+    batch_size = batch_size_arg if batch_size_arg is not None else DEFAULT_MICRO_BATCH
+    if batch_size < 1:
+        die(f"--batch-size must be >= 1, got {batch_size}")
+    if grad_accum_arg is not None:
+        if grad_accum_arg < 1:
+            die(f"--grad-accum must be >= 1, got {grad_accum_arg}")
+        return batch_size, grad_accum_arg
+    grad_accum = max(1, round(EFFECTIVE_GLOBAL_BATCH / batch_size))
+    return batch_size, grad_accum
+
+
+def format_oom_message(batch_size, grad_accum):
+    """Build the clear-error suggestion for a local-mode OOM. Kept as a pure,
+    independently testable function; TRAIN_DDP_SCRIPT's main_local() embeds the
+    identical logic inline (it must stay a standalone script for Kaggle/local
+    subprocess execution and cannot import this module) -- see
+    tests/test_laya_kit_local_mode.py for the parity check between the two."""
+    suggested_batch = max(1, batch_size // 2)
+    scale = max(1, batch_size // suggested_batch)
+    suggested_grad_accum = grad_accum * scale
+    return (
+        f"out of memory at --batch-size={batch_size} --grad-accum={grad_accum}. "
+        f"Retry with --batch-size {suggested_batch} --grad-accum {suggested_grad_accum} "
+        "(keeps the same effective global batch)."
+    )
+
+
+def load_jsonl_rows(path):
+    """stdlib-only JSONL reader for --local mode (the laya venv does not have the
+    `datasets` package installed). Returns the SAME row shape `datasets.load_dataset`
+    would hand back per-row: a dict with string-valued "state"/"questions"/"gold"
+    keys (see check_export.py's check_row_columns), which preprocess_split() already
+    consumes via row["state"]/row["questions"]/row["gold"] dict indexing regardless
+    of whether `rows` is a datasets.Dataset or a plain list of dicts."""
+    rows = []
+    with open(path, encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            rows.append(json.loads(line))
+    return rows
+
+
 TRUNCATION_MARK = " …[truncated]"
 
 def fit_task_head(agent, state, questions):
@@ -449,14 +518,29 @@ TRAIN_DDP_SCRIPT = r'''
 # from the pinned notebook with only the jev-change noted at the top of
 # train_from_export.py (calibration items come from CALIB_ITEMS_PATH, not an
 # in-training-set slice).
+#
+# jev-change: the per-batch loss/optimizer/schedule loop (official-notebook-cell
+# 4's inner training loop) and the post-training calibration+save step are
+# extracted into run_training_loop()/finalize_and_save() so --local mode
+# (single process, no torchrun/NCCL/DDP -- see main_local()) can reuse the
+# IDENTICAL math with world_size=1/rank=0. main_ddp() below is byte-for-byte
+# the same DDP wiring and hyperparameters as before this refactor; only the
+# loop body moved into a shared function.
 import os, sys, time, json, random, math
 import numpy as np
 import torch
-import torch.distributed as dist
-from torch.nn.parallel import DistributedDataParallel as DDP
 from safetensors.torch import load_file, save_file
 from transformers import AutoTokenizer
 from laya.common import build_model, proper_reward, QTYPES
+
+EPOCHS = 4
+MICRO_BATCH = 8       # 8 sequences per forward pass per GPU/process
+GROUP_SIZE = 4         # GRPO baseline samples
+LR_ENCODER = 2.5e-5    # Encoder adaptation rate
+LR_HEAD = 1.0e-4       # Head adaptation rate
+SIGMA_START = 0.4      # Exploration noise
+SIGMA_END = 0.1
+
 
 def collate_train_batch(items, pad_id):
     n, L = len(items), max(len(it["ids"]) for it in items)
@@ -483,6 +567,7 @@ def collate_train_batch(items, pad_id):
         "label": torch.tensor([it["label"] for it in items])
     }
 
+
 def fit_one_temp(sel):
     if len(sel) < 10:
         return 1.0
@@ -502,14 +587,217 @@ def fit_one_temp(sel):
     opt.step(closure)
     return float(torch.clamp(log_t.exp(), 0.1, 10.0).item())
 
-def main():
-    dist.init_process_group("nccl")
-    rank = dist.get_rank()
-    world_size = dist.get_world_size()
-    local_rank = int(os.environ.get("LOCAL_RANK", "0"))
-    torch.cuda.set_device(local_rank)
-    device = torch.device("cuda", local_rank)
 
+def build_optimizer_and_scheduler(named_params, n_items, micro_batch, grad_accum, epochs):
+    enc_params = [p for n, p in named_params if "encoder." in n]
+    head_params = [p for n, p in named_params if "encoder." not in n]
+    optimizer = torch.optim.AdamW([
+        {"params": enc_params, "lr": LR_ENCODER},
+        {"params": head_params, "lr": LR_HEAD}
+    ], weight_decay=0.01)
+    total_updates = (n_items // (micro_batch * grad_accum)) * epochs
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=max(1, total_updates), eta_min=1e-6)
+    return optimizer, scheduler
+
+
+def oom_suggestion(batch_size, grad_accum):
+    # jev-change: --local memory safety. Kept textually identical to
+    # train_from_export.py's format_oom_message() (this script must stay a
+    # standalone file runnable by torchrun/python3 on its own, so it cannot
+    # import that module) -- tests/test_laya_kit_local_mode.py checks parity.
+    suggested_batch = max(1, batch_size // 2)
+    scale = max(1, batch_size // suggested_batch)
+    suggested_grad_accum = grad_accum * scale
+    return (
+        f"out of memory at --batch-size={batch_size} --grad-accum={grad_accum}. "
+        f"Retry with --batch-size {suggested_batch} --grad-accum {suggested_grad_accum} "
+        "(keeps the same effective global batch)."
+    )
+
+
+def run_training_loop(forward_fn, items, params_for_clip, optimizer, scheduler, tok, *,
+                       device, epochs, micro_batch, grad_accum, group_size, sigma_start, sigma_end,
+                       rank, world_size, use_scaler, scaler, autocast_device, autocast_dtype,
+                       autocast_enabled, max_steps, mem_log_fn, log_prefix):
+    """official-notebook-cell 4's inner training loop, generalized over
+    (forward_fn, world_size, autocast/scaler settings) so it is IDENTICAL for
+    DDP (world_size=2, forward_fn=ddp_model, cuda fp16 autocast+GradScaler) and
+    --local (world_size=1, forward_fn=model, fp32 by default / optional MPS
+    bf16 autocast, no GradScaler)."""
+    t0 = time.time()
+    global_step = 0
+    epochs_completed = 0
+    for epoch in range(epochs):
+        random.seed(42 + epoch + rank)
+        random.shuffle(items)
+        epoch_loss, n_batches = 0.0, 0
+        optimizer.zero_grad(set_to_none=True)
+        accum_step = 0
+
+        progress = epoch / max(1, epochs - 1)
+        sigma = sigma_start + (sigma_end - sigma_start) * progress
+
+        for b_idx in range(0, len(items), micro_batch):
+            chunk = items[b_idx:b_idx + micro_batch]
+            if not chunk:
+                continue
+
+            batch = collate_train_batch(chunk, tok.pad_token_id)
+
+            try:
+                if autocast_enabled:
+                    with torch.autocast(autocast_device, dtype=autocast_dtype):
+                        logits, act = forward_fn(
+                            batch["input_ids"].to(device),
+                            batch["attention_mask"].to(device),
+                            batch["marker_pos"].to(device),
+                            batch["marker_mask"].to(device),
+                            batch["qtype"].to(device)
+                        )
+                else:
+                    logits, act = forward_fn(
+                        batch["input_ids"].to(device),
+                        batch["attention_mask"].to(device),
+                        batch["marker_pos"].to(device),
+                        batch["marker_mask"].to(device),
+                        batch["qtype"].to(device)
+                    )
+
+                logits = logits.float()
+                mask = batch["marker_mask"].to(device)
+                k = mask.sum(-1, keepdim=True).float()
+                target = batch["target"].to(device)
+
+                eps = torch.randn((group_size,) + logits.shape, device=device) * sigma * mask
+                eps = (eps - eps.sum(-1, keepdim=True) / k) * mask
+                z = logits.detach().unsqueeze(0) + eps
+                q = torch.softmax(z.masked_fill(~mask, -1e4), -1)
+
+                with torch.no_grad():
+                    r = proper_reward(q, target.unsqueeze(0), batch["qtype"].to(device), mask, w_sph=0.75, w_rps=1.0)
+                    adv = r - r.mean(0, keepdim=True)
+                    adv = adv / (adv.std() + 1e-6)
+
+                logp = -(((z - logits.unsqueeze(0)) ** 2) * mask).sum(-1) / (2 * sigma ** 2)
+                loss_rl = -(adv * logp).mean()
+                loss_ce = -(target * torch.log_softmax(logits.masked_fill(~mask, -1e4), -1)).sum(-1).mean()
+                loss = (loss_rl + 1.0 * loss_ce) / grad_accum + 0.0 * act.sum()
+
+                if use_scaler:
+                    scaler.scale(loss).backward()
+                else:
+                    loss.backward()
+            except RuntimeError as exc:
+                if "out of memory" in str(exc).lower():
+                    print(f"[FATAL] {oom_suggestion(micro_batch, grad_accum)}", file=sys.stderr)
+                    sys.exit(1)
+                raise
+
+            accum_step += 1
+
+            if accum_step % grad_accum == 0 or (b_idx + micro_batch) >= len(items):
+                if use_scaler:
+                    scaler.unscale_(optimizer)
+                    torch.nn.utils.clip_grad_norm_(params_for_clip, 1.0)
+                    scaler.step(optimizer)
+                    scaler.update()
+                else:
+                    torch.nn.utils.clip_grad_norm_(params_for_clip, 1.0)
+                    optimizer.step()
+                scheduler.step()
+                optimizer.zero_grad(set_to_none=True)
+
+            epoch_loss += loss.item() * grad_accum
+            n_batches += 1
+            global_step += 1
+
+            if rank == 0 and (n_batches % 50) == 0:
+                cur_lr = scheduler.get_last_lr()[0]
+                print(f"  {log_prefix} Epoch {epoch+1}/{epochs} | Step {n_batches} | Loss: {loss.item()*grad_accum:.4f} | Reward: {r.mean().item():.3f} | LR: {cur_lr:.2e}")
+
+            if max_steps and global_step >= max_steps:
+                if rank == 0:
+                    print(f"{log_prefix} [smoke] reached --max-steps={max_steps}, stopping early")
+                if mem_log_fn:
+                    mem_log_fn(epoch)
+                return {"epochs_completed": epochs_completed, "global_step": global_step,
+                        "elapsed_s": time.time() - t0, "stopped_early": True}
+
+        epochs_completed = epoch + 1
+        if mem_log_fn:
+            mem_log_fn(epoch)
+        if rank == 0:
+            print(f"=== {log_prefix} Epoch {epoch+1}/{epochs} Completed in {time.time()-t0:.1f}s | Avg Loss: {epoch_loss/max(1, n_batches):.4f} ===")
+
+    return {"epochs_completed": epochs_completed, "global_step": global_step,
+            "elapsed_s": time.time() - t0, "stopped_early": False}
+
+
+def finalize_and_save(model, tok, calib_items_path, output_dir, model_name, base_model_dir_name,
+                       exporter_version, cfg, *, device, autocast_device, autocast_dtype, autocast_enabled):
+    """official-notebook-cell 4's post-training calibration-temperature-fit + save
+    step, extracted so both main_ddp() (rank 0 only) and main_local() (always,
+    world_size=1) call the IDENTICAL save path -- same checkpoint layout
+    (model.safetensors fp16, encoder/, tokenizer/, rl_agent_config.json)."""
+    print("\nFitting post-training calibration temperatures...")
+    model.eval()
+    # jev-change: real held-out calibration.jsonl items, not every-15th
+    # training item.
+    calib_items = torch.load(calib_items_path, weights_only=False)
+    calib_preds = []
+    with torch.no_grad():
+        for c_idx in range(0, len(calib_items), 16):
+            c_chunk = calib_items[c_idx:c_idx + 16]
+            cb = collate_train_batch(c_chunk, tok.pad_token_id)
+            if autocast_enabled:
+                with torch.autocast(autocast_device, dtype=autocast_dtype):
+                    l_sub, _ = model(
+                        cb["input_ids"].to(device),
+                        cb["attention_mask"].to(device),
+                        cb["marker_pos"].to(device),
+                        cb["marker_mask"].to(device),
+                        cb["qtype"].to(device)
+                    )
+            else:
+                l_sub, _ = model(
+                    cb["input_ids"].to(device),
+                    cb["attention_mask"].to(device),
+                    cb["marker_pos"].to(device),
+                    cb["marker_mask"].to(device),
+                    cb["qtype"].to(device)
+                )
+            l_np = l_sub.float().cpu().numpy()
+            for r_idx, it in enumerate(c_chunk):
+                k = len(it["markers"])
+                calib_preds.append((it["qtype"], l_np[r_idx, :k], it["target"]))
+
+    fitted_temps = [1.2, 1.2, 1.2]
+    try:
+        for qt in range(3):
+            sel = [(z, t) for q_type, z, t in calib_preds if q_type == qt]
+            if sel:
+                fitted_temps[qt] = fit_one_temp(sel)
+        print("Fitted calibration temperatures (choice, score, noul):", [round(t, 3) for t in fitted_temps])
+    except Exception as e:
+        print("Temperature fitting fallback:", e)
+
+    os.makedirs(output_dir, exist_ok=True)
+    sd = {k: v.half().contiguous().cpu() for k, v in model.state_dict().items()}
+    save_file(sd, os.path.join(output_dir, "model.safetensors"))
+    model.encoder.config.save_pretrained(os.path.join(output_dir, "encoder"))
+    tok.save_pretrained(os.path.join(output_dir, "tokenizer"))
+
+    cfg["fine_tuned"] = True
+    cfg["model_name"] = model_name
+    cfg["base_model_dir_name"] = base_model_dir_name
+    cfg["exporter_version"] = exporter_version
+    cfg["temperature"] = fitted_temps
+    with open(os.path.join(output_dir, "rl_agent_config.json"), "w") as f:
+        json.dump(cfg, f, indent=2)
+    print(f"Model successfully saved to {output_dir}!")
+
+
+def load_common_argv():
     model_dir = sys.argv[1]
     output_dir = sys.argv[2]
     train_items_path = sys.argv[3]
@@ -523,6 +811,25 @@ def main():
     model_name = sys.argv[5]
     base_model_dir_name = sys.argv[6]
     exporter_version = sys.argv[7]
+    # jev-change: argv[8] selects "ddp" (default, unchanged invocation -- see
+    # train_from_export.py's torchrun cmd, still exactly 7 args) or "local".
+    mode = sys.argv[8] if len(sys.argv) > 8 else "ddp"
+    return model_dir, output_dir, train_items_path, calib_items_path, model_name, base_model_dir_name, exporter_version, mode
+
+
+def main_ddp():
+    import torch.distributed as dist
+    from torch.nn.parallel import DistributedDataParallel as DDP
+
+    dist.init_process_group("nccl")
+    rank = dist.get_rank()
+    world_size = dist.get_world_size()
+    local_rank = int(os.environ.get("LOCAL_RANK", "0"))
+    torch.cuda.set_device(local_rank)
+    device = torch.device("cuda", local_rank)
+
+    (model_dir, output_dir, train_items_path, calib_items_path, model_name,
+     base_model_dir_name, exporter_version, _mode) = load_common_argv()
 
     with open(os.path.join(model_dir, "rl_agent_config.json")) as f:
         cfg = json.load(f)
@@ -547,151 +854,135 @@ def main():
     all_items = torch.load(train_items_path, weights_only=False)
     my_items = all_items[rank::world_size]
 
-    EPOCHS = 4
-    MICRO_BATCH = 8      # 8 sequences per forward pass per GPU
-    GRAD_ACCUM = 4       # Effective batch across 2 GPUs = 64 sequences (8 * 2 * 4)
-    GROUP_SIZE = 4       # GRPO baseline samples
-    LR_ENCODER = 2.5e-5  # Encoder adaptation rate
-    LR_HEAD = 1.0e-4     # Head adaptation rate
-    SIGMA_START = 0.4    # Exploration noise
-    SIGMA_END = 0.1
+    GRAD_ACCUM = 4  # Effective batch across 2 GPUs = 64 sequences (8 * 2 * 4)
 
-    enc_params = [p for n, p in ddp_model.named_parameters() if "encoder." in n]
-    head_params = [p for n, p in ddp_model.named_parameters() if "encoder." not in n]
-
-    optimizer = torch.optim.AdamW([
-        {"params": enc_params, "lr": LR_ENCODER},
-        {"params": head_params, "lr": LR_HEAD}
-    ], weight_decay=0.01)
-
-    total_updates = (len(my_items) // (MICRO_BATCH * GRAD_ACCUM)) * EPOCHS
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=max(1, total_updates), eta_min=1e-6)
+    optimizer, scheduler = build_optimizer_and_scheduler(
+        list(ddp_model.named_parameters()), len(my_items), MICRO_BATCH, GRAD_ACCUM, EPOCHS)
     scaler = torch.amp.GradScaler("cuda", enabled=True)
 
     if rank == 0:
         print(f"Starting 2xT4 DDP training: {len(all_items)} total items | {len(my_items)} per rank | {EPOCHS} epochs")
-    t0 = time.time()
 
-    for epoch in range(EPOCHS):
-        random.seed(42 + epoch + rank)
-        random.shuffle(my_items)
-        epoch_loss, n_batches = 0.0, 0
-        optimizer.zero_grad(set_to_none=True)
-        accum_step = 0
-
-        progress = epoch / max(1, EPOCHS - 1)
-        sigma = SIGMA_START + (SIGMA_END - SIGMA_START) * progress
-
-        for b_idx in range(0, len(my_items), MICRO_BATCH):
-            chunk = my_items[b_idx:b_idx + MICRO_BATCH]
-            if not chunk:
-                continue
-
-            batch = collate_train_batch(chunk, tok.pad_token_id)
-
-            with torch.autocast("cuda", dtype=torch.float16):
-                logits, act = ddp_model(
-                    batch["input_ids"].to(device),
-                    batch["attention_mask"].to(device),
-                    batch["marker_pos"].to(device),
-                    batch["marker_mask"].to(device),
-                    batch["qtype"].to(device)
-                )
-
-            logits = logits.float()
-            mask = batch["marker_mask"].to(device)
-            k = mask.sum(-1, keepdim=True).float()
-            target = batch["target"].to(device)
-
-            eps = torch.randn((GROUP_SIZE,) + logits.shape, device=device) * sigma * mask
-            eps = (eps - eps.sum(-1, keepdim=True) / k) * mask
-            z = logits.detach().unsqueeze(0) + eps
-            q = torch.softmax(z.masked_fill(~mask, -1e4), -1)
-
-            with torch.no_grad():
-                r = proper_reward(q, target.unsqueeze(0), batch["qtype"].to(device), mask, w_sph=0.75, w_rps=1.0)
-                adv = r - r.mean(0, keepdim=True)
-                adv = adv / (adv.std() + 1e-6)
-
-            logp = -(((z - logits.unsqueeze(0)) ** 2) * mask).sum(-1) / (2 * sigma ** 2)
-            loss_rl = -(adv * logp).mean()
-            loss_ce = -(target * torch.log_softmax(logits.masked_fill(~mask, -1e4), -1)).sum(-1).mean()
-            loss = (loss_rl + 1.0 * loss_ce) / GRAD_ACCUM + 0.0 * act.sum()
-
-            scaler.scale(loss).backward()
-            accum_step += 1
-
-            if accum_step % GRAD_ACCUM == 0 or (b_idx + MICRO_BATCH) >= len(my_items):
-                scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_(ddp_model.parameters(), 1.0)
-                scaler.step(optimizer)
-                scaler.update()
-                scheduler.step()
-                optimizer.zero_grad(set_to_none=True)
-
-            epoch_loss += loss.item() * GRAD_ACCUM
-            n_batches += 1
-
-            if rank == 0 and (n_batches % 50) == 0:
-                cur_lr = scheduler.get_last_lr()[0]
-                print(f"  Epoch {epoch+1}/{EPOCHS} | Step {n_batches} | Loss: {loss.item()*GRAD_ACCUM:.4f} | Reward: {r.mean().item():.3f} | LR: {cur_lr:.2e}")
-
-        if rank == 0:
-            print(f"=== Epoch {epoch+1}/{EPOCHS} Completed in {time.time()-t0:.1f}s | Avg Loss: {epoch_loss/max(1, n_batches):.4f} ===")
+    run_training_loop(
+        ddp_model, my_items, ddp_model.parameters(), optimizer, scheduler, tok,
+        device=device, epochs=EPOCHS, micro_batch=MICRO_BATCH, grad_accum=GRAD_ACCUM, group_size=GROUP_SIZE,
+        sigma_start=SIGMA_START, sigma_end=SIGMA_END, rank=rank, world_size=world_size,
+        use_scaler=True, scaler=scaler, autocast_device="cuda", autocast_dtype=torch.float16,
+        autocast_enabled=True, max_steps=0, mem_log_fn=None, log_prefix="[ddp]")
 
     dist.barrier()
 
     if rank == 0:
-        print("\nFitting post-training calibration temperatures...")
         del optimizer, scaler, scheduler
         torch.cuda.empty_cache()
-        model.eval()
-        # jev-change: real held-out calibration.jsonl items, not every-15th
-        # training item.
-        calib_items = torch.load(calib_items_path, weights_only=False)
-        calib_preds = []
-        with torch.no_grad():
-            for c_idx in range(0, len(calib_items), 16):
-                c_chunk = calib_items[c_idx:c_idx + 16]
-                cb = collate_train_batch(c_chunk, tok.pad_token_id)
-                with torch.autocast("cuda", dtype=torch.float16):
-                    l_sub, _ = model(
-                        cb["input_ids"].to(device),
-                        cb["attention_mask"].to(device),
-                        cb["marker_pos"].to(device),
-                        cb["marker_mask"].to(device),
-                        cb["qtype"].to(device)
-                    )
-                l_np = l_sub.float().cpu().numpy()
-                for r, it in enumerate(c_chunk):
-                    k = len(it["markers"])
-                    calib_preds.append((it["qtype"], l_np[r, :k], it["target"]))
-
-        fitted_temps = [1.2, 1.2, 1.2]
-        try:
-            for qt in range(3):
-                sel = [(z, t) for q_type, z, t in calib_preds if q_type == qt]
-                if sel:
-                    fitted_temps[qt] = fit_one_temp(sel)
-            print("Fitted calibration temperatures (choice, score, noul):", [round(t, 3) for t in fitted_temps])
-        except Exception as e:
-            print("Temperature fitting fallback:", e)
-        os.makedirs(output_dir, exist_ok=True)
-        sd = {k: v.half().contiguous().cpu() for k, v in model.state_dict().items()}
-        save_file(sd, os.path.join(output_dir, "model.safetensors"))
-        model.encoder.config.save_pretrained(os.path.join(output_dir, "encoder"))
-        tok.save_pretrained(os.path.join(output_dir, "tokenizer"))
-
-        cfg["fine_tuned"] = True
-        cfg["model_name"] = model_name
-        cfg["base_model_dir_name"] = base_model_dir_name
-        cfg["exporter_version"] = exporter_version
-        cfg["temperature"] = fitted_temps
-        with open(os.path.join(output_dir, "rl_agent_config.json"), "w") as f:
-            json.dump(cfg, f, indent=2)
-        print(f"Model successfully saved to {output_dir}!")
+        finalize_and_save(model, tok, calib_items_path, output_dir, model_name, base_model_dir_name,
+                           exporter_version, cfg, device=device, autocast_device="cuda",
+                           autocast_dtype=torch.float16, autocast_enabled=True)
 
     dist.destroy_process_group()
+
+
+def main_local():
+    # jev-change: --local mode (Apple Silicon MPS, or CPU) -- single process,
+    # no torchrun/NCCL/DDP. Reuses run_training_loop()/finalize_and_save() with
+    # world_size=1/rank=0 and forward_fn=model (no DDP wrapper) so the loss,
+    # optimizer, LR schedule, epochs, per-device batch size and seed are the
+    # SAME as main_ddp(); only process/device wiring and precision differ.
+    (model_dir, output_dir, train_items_path, calib_items_path, model_name,
+     base_model_dir_name, exporter_version, _mode) = load_common_argv()
+    device_name = sys.argv[9] if len(sys.argv) > 9 else "mps"
+    grad_accum = int(sys.argv[10]) if len(sys.argv) > 10 else 8
+    micro_batch = int(sys.argv[11]) if len(sys.argv) > 11 else MICRO_BATCH
+    mps_autocast = sys.argv[12] if len(sys.argv) > 12 else "off"
+    max_steps = int(sys.argv[13]) if len(sys.argv) > 13 else 0
+
+    if device_name == "mps" and not torch.backends.mps.is_available():
+        print("[FATAL] --device mps requested but torch.backends.mps.is_available() is False", file=sys.stderr)
+        sys.exit(1)
+    device = torch.device(device_name)
+
+    with open(os.path.join(model_dir, "rl_agent_config.json")) as f:
+        cfg = json.load(f)
+    cfg["gradient_checkpointing"] = True
+    cfg["max_tokens_per_batch"] = 4096
+    cfg["max_len"] = 1024
+    cfg["head_max_len"] = 256
+
+    tok = AutoTokenizer.from_pretrained(os.path.join(model_dir, "tokenizer"))
+    model = build_model(cfg, encoder_dir=os.path.join(model_dir, "encoder"))
+
+    weights = load_file(os.path.join(model_dir, "model.safetensors"))
+    model.load_state_dict(weights, strict=True)
+
+    model.encoder.gradient_checkpointing_enable(gradient_checkpointing_kwargs={"use_reentrant": False})
+    model.head_checkpointing = True
+    model.to(device)
+    model.train()
+
+    all_items = torch.load(train_items_path, weights_only=False)
+    my_items = list(all_items)  # world_size=1: no DDP rank split, every item is "mine"
+
+    optimizer, scheduler = build_optimizer_and_scheduler(
+        list(model.named_parameters()), len(my_items), micro_batch, grad_accum, EPOCHS)
+
+    # jev-change: MPS fp16 autocast is unreliable for training (mixed-dtype
+    # matmul asserts observed on this hardware during inference spikes --
+    # see docs/plan/2026-09-23-laya-local-performance.md B3). Default is plain
+    # fp32 training; --mps-autocast bf16 is opt-in. No GradScaler is used
+    # (bf16/fp32 do not need loss scaling the way fp16 does).
+    autocast_enabled = mps_autocast == "bf16"
+    autocast_dtype = torch.bfloat16 if autocast_enabled else None
+    autocast_device = "mps" if device_name == "mps" else "cpu"
+
+    print(f"[local] device={device_name} items={len(my_items)} epochs={EPOCHS} micro_batch={micro_batch} "
+          f"grad_accum={grad_accum} effective_global_batch={micro_batch*grad_accum} "
+          f"mps_autocast={mps_autocast} max_steps={max_steps or 'unlimited'}")
+
+    def mem_log_fn(epoch):
+        # jev-change: memory-safety logging (spec: log peak MPS memory per
+        # epoch). torch.mps has no peak-tracking counter as of this torch
+        # version -- driver_allocated_memory() is the best-effort proxy
+        # logged here, not a true high-water mark.
+        if device_name == "mps" and hasattr(torch, "mps"):
+            try:
+                mib = torch.mps.driver_allocated_memory() / (1024 * 1024)
+                print(f"[mem] epoch {epoch+1} mps_driver_allocated_mib={mib:.1f}")
+            except Exception as e:
+                print(f"[mem] epoch {epoch+1} mps memory read failed: {e}")
+
+    result = run_training_loop(
+        model, my_items, model.parameters(), optimizer, scheduler, tok,
+        device=device, epochs=EPOCHS, micro_batch=micro_batch, grad_accum=grad_accum, group_size=GROUP_SIZE,
+        sigma_start=SIGMA_START, sigma_end=SIGMA_END, rank=0, world_size=1,
+        use_scaler=False, scaler=None, autocast_device=autocast_device, autocast_dtype=autocast_dtype,
+        autocast_enabled=autocast_enabled, max_steps=max_steps, mem_log_fn=mem_log_fn, log_prefix="[local]")
+
+    del optimizer, scheduler
+    finalize_and_save(model, tok, calib_items_path, output_dir, model_name, base_model_dir_name,
+                       exporter_version, cfg, device=device, autocast_device=autocast_device,
+                       autocast_dtype=autocast_dtype, autocast_enabled=autocast_enabled)
+
+    # jev-change: structured local-run metadata the outer train_from_export.py
+    # main() reads back and folds into training_metadata.json (device/local
+    # mode/grad_accum/wall time -- the official notebook has no such metadata).
+    metadata_path = os.path.join(output_dir, "local_training_run.json")
+    with open(metadata_path, "w") as f:
+        json.dump({
+            "device": device_name, "mode": "local", "grad_accum": grad_accum, "micro_batch": micro_batch,
+            "effective_global_batch": micro_batch * grad_accum, "mps_autocast": mps_autocast,
+            "epochs_completed": result["epochs_completed"], "global_step": result["global_step"],
+            "stopped_early": result["stopped_early"], "wall_time_s": round(result["elapsed_s"], 3),
+        }, f, indent=2)
+    print(f"[local] wrote {metadata_path}")
+
+
+def main():
+    _mode_probe = load_common_argv()
+    mode = _mode_probe[-1]
+    if mode == "local":
+        main_local()
+    else:
+        main_ddp()
 
 if __name__ == "__main__":
     main()
@@ -704,11 +995,14 @@ if __name__ == "__main__":
 # HF `test` split, via the same row-shape (state/questions/gold JSON-string
 # columns) the export writes.
 # ---------------------------------------------------------------------------
-def evaluate_checkpoint(output_dir, export_dir, laya_module):
+def evaluate_checkpoint(output_dir, export_dir, laya_module, device="cuda"):
+    # jev-change: device is now a parameter (was hard-coded "cuda") so --local
+    # mode's evaluation step loads the fine-tuned checkpoint on the SAME device
+    # it was trained on (mps/cpu), instead of unconditionally requiring CUDA.
     import numpy as np
 
     ece_score = laya_module.common.ece_score
-    agent_ft = laya_module.Agent(output_dir, device="cuda")
+    agent_ft = laya_module.Agent(output_dir, device=device)
 
     test_path = Path(export_dir) / "test.jsonl"
     predictions = []
@@ -806,7 +1100,18 @@ def main():
     parser.add_argument("--allow-truncation", action="store_true", help="Proceed even if the truncated fraction exceeds --max-truncated-fraction")
     parser.add_argument("--dry-run", action="store_true", help="Verify export + tokenizer admission and stop before invoking torchrun (no GPU/model needed for the manifest check; still needs laya+tokenizer installed for the admission check)")
     parser.add_argument("--skip-admission-check", action="store_true", help="Skip the tokenizer admission pass entirely (NOT recommended; only for debugging the export-manifest check in isolation)")
+    parser.add_argument("--local", action="store_true", help="Single-process training (no torchrun/NCCL/DDP), for Apple Silicon MPS or CPU. Does not import `datasets` -- reads the export's JSONL splits with the stdlib json module instead.")
+    parser.add_argument("--device", choices=["mps", "cpu"], default="mps", help="--local only: torch device to train on (default mps)")
+    parser.add_argument("--grad-accum", type=int, default=None, help="--local only: gradient accumulation steps. Default keeps the same effective global batch as the official 2xT4 DDP recipe (micro_batch * grad_accum * 2 == 64) given --batch-size; an explicit value here overrides that.")
+    parser.add_argument("--batch-size", type=int, default=None, help="--local only: per-step micro batch size (default 8, same as the DDP recipe's MICRO_BATCH). If --grad-accum is not also given, it is scaled to keep the same effective global batch -- use a smaller --batch-size if training OOMs.")
+    parser.add_argument("--mps-autocast", choices=["bf16", "off"], default="off", help="--local only: MPS autocast dtype during the forward pass. Default off (fp32) -- MPS fp16 autocast is unreliable for training; bf16 is opt-in.")
+    parser.add_argument("--max-steps", type=int, default=None, help="--local only, for smoke validation: stop after this many optimizer micro-steps total instead of running full EPOCHS. Omit for a real training run.")
     args = parser.parse_args()
+
+    if args.local:
+        resolved_batch_size, resolved_grad_accum = resolve_local_batch_and_grad_accum(args.batch_size, args.grad_accum)
+    else:
+        resolved_batch_size, resolved_grad_accum = DEFAULT_MICRO_BATCH, DEFAULT_DDP_GRAD_ACCUM
 
     export_dir = Path(args.export_dir)
     output_dir = Path(args.output_dir)
@@ -821,13 +1126,22 @@ def main():
     # path above can run without laya/transformers installed).
     try:
         import torch
-        from datasets import load_dataset
         from huggingface_hub import snapshot_download
         from laya.agent import _fix_tokenizer_config
         from laya.common import build_sequence, render_options, QTYPES
         import laya as laya_module
     except ImportError as exc:
         die(f"missing dependency ({exc}). Install training/laya-kit/requirements.lock on the training machine (Kaggle), not locally.")
+
+    # jev-change: `datasets` is only required for the non-local (Kaggle DDP) path.
+    # The local laya venv does not have `datasets` installed (inference-only
+    # environment) -- --local reads the export's JSONL splits directly via
+    # load_jsonl_rows() (stdlib json) instead.
+    if not args.local:
+        try:
+            from datasets import load_dataset
+        except ImportError as exc:
+            die(f"missing dependency ({exc}). Install training/laya-kit/requirements.lock on the training machine (Kaggle), not locally, or pass --local.")
 
     model_dir = args.model_dir
     if model_dir is None:
@@ -857,15 +1171,26 @@ def main():
 
     # official-notebook-cell: 3, jev-change described at module top: read the
     # export split files via the manifest's own recorded loader instead of
-    # the public HF dataset.
-    dataset = load_dataset(
-        "json",
-        data_files={
-            "train": str(export_dir / "train.jsonl"),
-            "validation": str(export_dir / "calibration.jsonl"),
-            "test": str(export_dir / "test.jsonl"),
-        },
-    )
+    # the public HF dataset. jev-change: --local reads the same three JSONL
+    # files with the stdlib json module (load_jsonl_rows) instead of
+    # datasets.load_dataset("json", ...), since `datasets` is not installed
+    # in the local laya venv -- the resulting row shape (dict with
+    # state/questions/gold string keys) is identical either way.
+    if args.local:
+        dataset = {
+            "train": load_jsonl_rows(export_dir / "train.jsonl"),
+            "validation": load_jsonl_rows(export_dir / "calibration.jsonl"),
+            "test": load_jsonl_rows(export_dir / "test.jsonl"),
+        }
+    else:
+        dataset = load_dataset(
+            "json",
+            data_files={
+                "train": str(export_dir / "train.jsonl"),
+                "validation": str(export_dir / "calibration.jsonl"),
+                "test": str(export_dir / "test.jsonl"),
+            },
+        )
 
     train_items, train_truncated, train_total = preprocess_split(dataset["train"], tok, cfg, render_options, build_sequence, QTYPES, agent_shim)
     calib_items, calib_truncated, calib_total = preprocess_split(dataset["validation"], tok, cfg, render_options, build_sequence, QTYPES, agent_shim)
@@ -888,21 +1213,34 @@ def main():
     torch.save(calib_items, calib_items_path)
 
     if args.dry_run:
-        print("[dry-run] export + tokenizer admission verified. Stopping before torchrun.")
+        print("[dry-run] export + tokenizer admission verified. Stopping before torchrun/local training.")
         return 0
 
     ddp_script_path = output_dir / "train_ddp.py"
     ddp_script_path.write_text(TRAIN_DDP_SCRIPT, encoding="utf-8")
 
-    # official-notebook-cell: 5 ("Launch Multi-GPU Fine-Tuning with torchrun")
-    # jev-change: argv[5:] (derived_model_name, base_model_dir_name, exporter_version) let
-    # TRAIN_DDP_SCRIPT's save step record model_name/base_model_dir_name/exporter_version
-    # instead of hard-coding model_name -- see derive_model_name() above.
-    cmd = [
-        "torchrun", "--standalone", "--nproc_per_node=2", str(ddp_script_path),
-        str(resolved_model_dir), str(output_dir), str(train_items_path), str(calib_items_path),
-        derived_model_name, base_model_dir_name, str(manifest.get("exporter_version") or ""),
-    ]
+    if args.local:
+        # jev-change: --local runs the SAME embedded script with plain python3
+        # (no torchrun/NCCL/DDP) -- argv[8:] select main_local() and its
+        # device/grad-accum/batch-size/autocast/max-steps. argv[1:8] are
+        # UNCHANGED from the DDP cmd below.
+        cmd = [
+            sys.executable, str(ddp_script_path),
+            str(resolved_model_dir), str(output_dir), str(train_items_path), str(calib_items_path),
+            derived_model_name, base_model_dir_name, str(manifest.get("exporter_version") or ""),
+            "local", args.device, str(resolved_grad_accum), str(resolved_batch_size),
+            args.mps_autocast, str(args.max_steps or 0),
+        ]
+    else:
+        # official-notebook-cell: 5 ("Launch Multi-GPU Fine-Tuning with torchrun")
+        # jev-change: argv[5:] (derived_model_name, base_model_dir_name, exporter_version) let
+        # TRAIN_DDP_SCRIPT's save step record model_name/base_model_dir_name/exporter_version
+        # instead of hard-coding model_name -- see derive_model_name() above.
+        cmd = [
+            "torchrun", "--standalone", "--nproc_per_node=2", str(ddp_script_path),
+            str(resolved_model_dir), str(output_dir), str(train_items_path), str(calib_items_path),
+            derived_model_name, base_model_dir_name, str(manifest.get("exporter_version") or ""),
+        ]
     print("[train] executing:", " ".join(cmd))
     subprocess.run(cmd, check=True)
 
@@ -910,7 +1248,8 @@ def main():
 
     metrics = None
     try:
-        metrics = evaluate_checkpoint(str(output_dir), str(export_dir), laya_module)
+        metrics = evaluate_checkpoint(str(output_dir), str(export_dir), laya_module,
+                                       device=args.device if args.local else "cuda")
     except Exception as exc:  # pragma: no cover - depends on GPU runtime
         print(f"[eval] evaluation step failed or was skipped: {exc}")
 
@@ -929,8 +1268,12 @@ def main():
         "base_model_dir_name": base_model_dir_name,
         "model_subdir": args.model_subdir,
         "derived_model_name": derived_model_name,
+        # jev-change: mode/device/local-run fields record whether this checkpoint
+        # came from the official 2xT4 DDP path or --local (Apple Silicon MPS/CPU).
+        "mode": "local" if args.local else "ddp",
+        "device": args.device if args.local else "cuda",
         "hyperparameters": {
-            "epochs": 4, "micro_batch": 8, "grad_accum": 4, "group_size": 4,
+            "epochs": 4, "micro_batch": resolved_batch_size, "grad_accum": resolved_grad_accum, "group_size": 4,
             "lr_encoder": 2.5e-5, "lr_head": 1.0e-4, "sigma_start": 0.4, "sigma_end": 0.1,
             "weight_decay": 0.01, "max_len": cfg.get("max_len", 1024), "head_max_len": cfg.get("head_max_len", 256),
         },
@@ -944,6 +1287,10 @@ def main():
         "metrics": metrics,
         "trained": True,
     }
+    if args.local:
+        local_run_path = output_dir / "local_training_run.json"
+        if local_run_path.exists():
+            training_metadata["local_run"] = json.loads(local_run_path.read_text(encoding="utf-8"))
     (output_dir / "training_metadata.json").write_text(json.dumps(training_metadata, indent=2), encoding="utf-8")
     print(f"[done] wrote {output_dir / 'training_metadata.json'}")
     return 0
