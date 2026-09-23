@@ -85,13 +85,21 @@ export async function main(argv = process.argv.slice(2), env = process.env) {
     const status = engine.status();
     const clients = { codex: executableFound('codex', env), claude: executableFound('claude', env) };
     const routerWarnings = createControlLayer({ home, env, engine }).status().features.router.warnings ?? [];
+    // Metrics is read-only and best-effort here: a metrics read failure (bad logs dir, training
+    // store error, etc.) must never fail `doctor` itself, only skip the training-candidate warning.
+    let trainingCandidateWarnings = [];
+    try {
+      const ready = readMetrics(home, 7).labels?.trainingCandidateReady ?? {};
+      trainingCandidateWarnings = Object.entries(ready).filter(([, isReady]) => isReady)
+        .map(([purpose]) => `TRAINING_CANDIDATE_READY:${purpose} (observed strong-label count reached the configured minimum; this does not start training or a checkpoint promotion automatically)`);
+    } catch { /* metrics read failure must not fail doctor */ }
     output({ ...status, node: process.versions.node, platform: process.platform, clients,
       hooks: describeHookStatus({ home, env }),
       checksPerformed: ['local-config', 'credential-readiness', 'client-path'], checksNotPerformed: ['native-client-e2e', 'live-api', 'native-hook-execution'],
       warnings: [status.credential === 'missing' ? 'Configure a key locally before shadow/on.' : null,
         !clients.codex && !clients.claude ? 'No host CLI found in PATH; MCP config can still be prepared.' : null,
         env.JEV_DISABLE === '1' ? 'JEV_DISABLE=1 overrides persistent mode. Restart inherited processes after changing environment.' : null,
-        ...routerWarnings].filter(Boolean) });
+        ...routerWarnings, ...trainingCandidateWarnings].filter(Boolean) });
     if (status.configError || status.credential === 'invalid') process.exitCode = 2;
     return;
   }
