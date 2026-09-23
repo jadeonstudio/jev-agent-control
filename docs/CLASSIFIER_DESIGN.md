@@ -32,7 +32,8 @@ Jev는 모델명을 보지 않는다. `task/context`와 세 질문만 받는다.
 
 ```sh
 jev-control policy init       # 없을 때만 생성; 기존 설정 보존
-jev-control policy check      # 형식 검사일 뿐 실제 모델 지원·품질 검사가 아님
+jev-control policy check      # 형식 검사일 뿐 실제 역할 지원·품질 검사가 아님
+jev-control policy roles --host codex|claude [--dry-run] [--replace]  # 보유 역할로 profile 프리셋
 jev-control status
 jev-control router off
 jev-control router shadow
@@ -47,20 +48,22 @@ jev-control off               # 모든 API 사용의 최상위 OFF
 
 정책이 손상됐을 때 기능 `off`는 안전 기본값으로 복구할 수 있지만 이때 손상된 파일의 모델 매핑도 초기화될 수 있다. 정상 정책의 `off`는 매핑을 보존한다. 상태 변경·정책 변경·취소는 응답 적용 전 재검사한다. 이미 전송된 호출의 과금은 취소할 수 없다.
 
-## 모델/스킬 매핑: 추측하지 않기
+## 역할(role) 매핑: 추측하지 않기 (schema v2, 2026-09-23)
 
-`features.example.json`은 두 호스트의 `profiles`가 빈 상태다. 실제 이용 가능한 모델 ID는 계정·호스트 버전에 따라 다르므로 하드코딩하지 않는다. 모델이 두 종류 미만으로 확인되면 네트워크 호출 없이 `INSUFFICIENT_TARGETS`로 기존 경로를 유지한다.
+실측(2026-09-23, codex-cli 0.154.0 multi_agent_v2): Codex `spawn_agent`의 `model` 인자는 조용히 무시되고 역할 TOML(`~/.codex/agents/<role>.toml`)에 고정된 model/effort가 적용된다. 따라서 Codex에서 실행 모델을 바꾸는 유일한 수단은 **역할 선택**이며, `model` 필드는 표시용 메타데이터일 뿐이다. Claude Agent 도구는 `subagent_type`(역할)과 `model`(`haiku|sonnet|opus`만; `fable`은 escalation 전용 호출 시 override로만 쓰고 profile 기본값에는 넣지 않는다)을 함께 받는다.
 
-설치 에이전트는 라우터 활성화를 요청받았을 때 실제 호스트가 지원하는 모델·reasoning 값·스킬과 dispatch 방법을 확인해야 한다. 호스트 auth 파일이나 환경 전체를 읽어 이를 찾으면 안 된다. 확인된 값으로 다음 형태의 **로컬** 매핑을 작성한다. 다음 값들은 문법 설명용이며 실제 모델이 아니다.
+`features.json`의 `version`은 2다. `router.profiles[host]`의 각 대상(target)은 `{ role: <필수>, model?, reasoning?, skills? }`이며, `router.profiles[host].intents`에 `explain|research|edit|debug` 중 하나에 한해 tier 대신 쓸 대상을 별도로 둘 수 있다(economy/standard로 판정됐을 때만 적용; strong에는 적용하지 않는다). `features.example.json`은 두 호스트의 `profiles`가 빈 상태다. 실제 보유한 역할 이름은 계정·설치에 따라 다르므로 하드코딩하지 않는다. 등록된 서로 다른 역할이 두 종류 미만이면 네트워크 호출 없이 `INSUFFICIENT_TARGETS`로 기존 경로를 유지한다.
+
+설치 에이전트는 라우터 활성화를 요청받았을 때 실제 호스트가 보유한 역할(`~/.codex/agents/*.toml`, `~/.claude/agents/*.md`의 파일명)과 스킬을 확인해야 한다. 파일 내용은 읽지 않고 파일명만 본다. 호스트 auth 파일이나 환경 전체를 읽어 이를 찾으면 안 된다. 확인된 값으로 다음 형태의 **로컬** 매핑을 작성한다. 다음 값들은 문법 설명용이며 실제 역할이 아니다.
 
 ```json
 {
   "router": {
     "profiles": {
       "codex": {
-        "economy": {"model": "VERIFIED_ECONOMY_MODEL", "reasoning": "VERIFIED_LEVEL"},
-        "standard": {"model": "VERIFIED_STANDARD_MODEL"},
-        "strong": {"model": "VERIFIED_STRONG_MODEL", "skills": {"debug": ["verified-skill-id"]}}
+        "economy": {"role": "VERIFIED_ROLE_ID", "reasoning": "VERIFIED_LEVEL"},
+        "standard": {"role": "VERIFIED_ROLE_ID"},
+        "strong": {"role": "VERIFIED_ROLE_ID", "skills": {"debug": ["verified-skill-id"]}}
       },
       "claude": {}
     }
@@ -68,7 +71,11 @@ jev-control off               # 모든 API 사용의 최상위 OFF
 }
 ```
 
-기존 features.json 전체를 이 부분 예제로 덮어쓰지 말고 `router.profiles`만 수정한다. 요청의 `availableModels/availableSkills`도 현재 실제 목록이어야 한다. 결과 모델은 두 목록의 교집합에서만 선택한다. reasoning 값 지원 여부는 호스트 adapter가 마지막에 검증한다. 현재 주 모델 고정 요청이면 `modelLocked:true`로 보존한다. 자동 호스트 설정 편집은 없다.
+`jev-control policy roles --host codex|claude [--dry-run] [--replace]`는 기본 역할 표(economy/standard/strong → lightweight_worker(-worker)/implementer/specialist, explain intent → scout; Claude는 economy/standard/strong/explain에 각각 haiku/sonnet/opus/haiku)와 실제 보유 역할을 대조해 위 형태의 profile을 만든다. 보유하지 않은 역할은 넣지 않고 `missingRoles`로 보고하며, 사용 가능한 역할이 두 종류 미만이면 쓰지 않고 실패한다. 대상 host의 profile이 이미 비어 있지 않으면 `--replace` 없이는 덮어쓰지 않는다. `--dry-run`은 결과만 출력하고 쓰지 않는다.
+
+기존 features.json 전체를 이 부분 예제로 덮어쓰지 말고 `router.profiles`만 수정한다. 요청의 `availableRoles`(필수)와 `availableSkills`도 현재 실제 목록이어야 한다. 결과 역할은 두 목록의 교집합에서만 선택한다(`availableModels`는 선택 필드로, Codex처럼 model이 표시용 메타데이터뿐인 호스트에는 보내지 않아도 된다). reasoning 값 지원 여부는 호스트 adapter가 마지막에 검증한다. 현재 주 모델/역할 고정 요청이면 `modelLocked:true`로 보존한다. 자동 호스트 설정 편집은 없다.
+
+v1(`{model, reasoning?, skills?}`) 정책 파일은 로드 시 메모리 내에서 자동으로 v2로 이전된다(기본 역할 표 적용). Claude v1 대상의 model이 `haiku|sonnet|opus`가 아니면 이전에 실패하고, 이 경우 기존과 동일하게 라우터가 OFF로 취급되는 fail-closed 동작을 한다. 파일 자체는 이전 시점에 다시 쓰지 않으며, `router on/off`처럼 기존 쓰기 경로가 다음에 저장할 때 v2로 저장된다.
 
 ## 라우팅 정책
 

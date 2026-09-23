@@ -5,6 +5,7 @@ import { parseArgs } from 'node:util';
 import { VERSION, MAX_FRAME_BYTES, ControlError, fail } from './constants.mjs';
 import { resolveHome, setMode, getCredential, saveCredential, removeCredential, loadConfig } from './storage.mjs';
 import { createDecisionEngine } from './engine.mjs';
+import { createControlLayer } from './control-layer.mjs';
 import { startMcp } from './mcp.mjs';
 import { installationPlan, applyInstallation } from './installer.mjs';
 import { readMetrics } from './metrics.mjs';
@@ -81,11 +82,13 @@ export async function main(argv = process.argv.slice(2), env = process.env) {
   if (command === 'doctor') {
     const status = engine.status();
     const clients = { codex: executableFound('codex', env), claude: executableFound('claude', env) };
+    const routerWarnings = createControlLayer({ home, env, engine }).status().features.router.warnings ?? [];
     output({ ...status, node: process.versions.node, platform: process.platform, clients,
       checksPerformed: ['local-config', 'credential-readiness', 'client-path'], checksNotPerformed: ['native-client-e2e', 'live-api'],
       warnings: [status.credential === 'missing' ? 'Configure a key locally before shadow/on.' : null,
         !clients.codex && !clients.claude ? 'No host CLI found in PATH; MCP config can still be prepared.' : null,
-        env.JEV_DISABLE === '1' ? 'JEV_DISABLE=1 overrides persistent mode. Restart inherited processes after changing environment.' : null].filter(Boolean) });
+        env.JEV_DISABLE === '1' ? 'JEV_DISABLE=1 overrides persistent mode. Restart inherited processes after changing environment.' : null,
+        ...routerWarnings].filter(Boolean) });
     if (status.configError || status.credential === 'invalid') process.exitCode = 2;
     return;
   }

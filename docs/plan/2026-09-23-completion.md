@@ -65,7 +65,10 @@ owner가 개정을 승인했다. P0 커밋에서 `AGENTS.md`를 개정했다: �
 - [x] Claude PreToolUse(matcher Agent) updatedInput model 재작성 실측 — 적용 확정 (R3)
 - acceptance: 두 호스트에서 "역할/모델을 hook으로 바꿀 수 있는가"를 증거와 함께 확정하고 아래 실측 기록에 남긴다.
 
-### P1. 역할 단위 라우팅 (G1) — 진행 중
+### P1. 역할 단위 라우팅 (G1) — 국소 검증됨
+- 결과(2026-09-23): features.json v2(target `{role, model?, reasoning?, skills?}`, `intents` 오버라이드는 economy/standard에서만), v1 메모리 내 자동 이전(실패 시 fail-closed), `availableRoles` 필수·`availableModels` 선택, `policy roles --host` 프리셋(파일명만 탐색), status/doctor `ROUTER_PROFILE_EMPTY`·`ROUTER_ROLE_MISSING` 경고.
+- 검증: 테스트 213/213, check 45 모듈, smoke, 예제 3종, Laya worker 4/4. 실제 JEV_HOME과 같은 v1 codex profile 픽스처가 lightweight_worker/implementer/specialist로 이전됨. 실제 `~/.codex/agents`·`~/.claude/agents` 대상 `policy roles --dry-run`에서 두 호스트 모두 누락 역할 0.
+- 남은 것: 실제 JEV_HOME 정책은 아직 v1이고, 설치본이 갱신되는 P6 전까지 그대로 둔다. MCP 클라이언트가 `availableRoles`를 보내는지는 P3 hook·네이티브 세션에서 확인한다.
 - profiles를 tier → `{ role, model?, reasoning? }`로 확장, 스키마 버전 올림, 기존 codex profile 자동 이전, 이전 실패 시 fail-closed.
 - Codex: economy→lightweight_worker, standard→implementer, strong→specialist, 조사 전용 intent→scout.
 - Claude: economy→lightweight-worker/haiku, standard→implementer/sonnet, strong→specialist/opus. fable 제외.

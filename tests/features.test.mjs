@@ -5,7 +5,7 @@ import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { setup, response, ROUTE_INPUT, FILTER_INPUT } from './features-helpers.mjs';
-import { validateFeaturePolicy, setFeatureMode, loadFeaturePolicy, effectiveMode } from '../src/feature-policy.mjs';
+import { validateFeaturePolicy, setFeatureMode, loadFeaturePolicy, effectiveMode, CLAUDE_MODELS } from '../src/feature-policy.mjs';
 import { routeOrDelegate } from '../src/routing.mjs';
 import { setMode, atomicWrite } from '../src/storage.mjs';
 import { evaluatePairedRuns } from '../src/evaluation.mjs';
@@ -22,12 +22,14 @@ for (const global of ['off', 'shadow', 'on']) for (const feature of ['off', 'sha
     assert.equal(r.apply, mode === 'on'); if (mode !== 'on') assert.equal(r.route, null);
   });
 }
-run('route makes ONE pinned TypeSafe call with three independent questions; no model names on wire', async s => {
+run('route makes ONE pinned TypeSafe call with three independent questions; no role/model/skill names on wire', async s => {
   const r = await s.layer.route(copy(ROUTE_INPUT));
-  assert.equal(r.apply, true); assert.equal(r.route.tier, 'economy'); assert.equal(r.changesHostModel, false); assert.equal(r.authorizesExecution, false);
+  assert.equal(r.apply, true); assert.equal(r.route.tier, 'economy'); assert.equal(r.route.role, 'fixture-economy-role');
+  assert.equal(r.changesHostModel, false); assert.equal(r.authorizesExecution, false);
   assert.equal(s.calls.length, 1); assert.equal(s.calls[0].model, 'jev-1.13.0');
   assert.deepEqual(Object.keys(s.calls[0].questions), ['intent', 'difficulty', 'risk']);
-  assert.ok(!JSON.stringify(s.calls).includes('fixture-economy'));
+  const wire = JSON.stringify(s.calls);
+  for (const secret of ['fixture-economy', 'fixture-economy-role', 'fixture-standard-role', 'fixture-strong-role', 'fixture-search']) assert.ok(!wire.includes(secret));
 });
 for (const [name, context] of [['locked', { modelLocked: true }], ['exhaustive', { exhaustive: true }], ['whole-repo', { scope: 'repository' }],
   ['cross-module', { scope: 'cross-module' }], ['unknown-scope', { scope: 'unknown' }], ['incomplete', { complete: false }], ['retry', { previousFailures: 1 }], ['high-impact', { highImpact: true }]]) {
@@ -74,6 +76,45 @@ test('served version drift cannot authorize a route', async t => {
 run('unavailable selected target delegates instead of inventing an ID', async s => {
   const req = copy(ROUTE_INPUT); req.availableModels = ['fixture-standard', 'fixture-strong'];
   assert.equal((await s.layer.route(req)).reason, 'TARGET_UNAVAILABLE');
+});
+run('a role the host does not actually have delegates even when the model is available', async s => {
+  const req = copy(ROUTE_INPUT); req.availableRoles = ['fixture-standard-role', 'fixture-strong-role'];
+  const r = await s.layer.route(req); assert.equal(r.reason, 'TARGET_UNAVAILABLE'); assert.equal(r.route, null);
+});
+run('fewer than two distinct roles actually available delegates without a network call', async s => {
+  const req = copy(ROUTE_INPUT); req.availableRoles = ['fixture-economy-role'];
+  assert.equal((await s.layer.route(req)).reason, 'INSUFFICIENT_TARGETS'); assert.equal(s.calls.length, 0);
+});
+test('an economy/standard intent override replaces the tier target and is flagged intentOverride', async t => {
+  const s = setup({ provider: p => response(p, { intent: 'explain' }) }); t.after(s.cleanup);
+  s.policy.router.profiles.codex.intents = { explain: { role: 'fixture-explain-role', model: 'fixture-explain', reasoning: 'low' } }; s.save();
+  const req = copy(ROUTE_INPUT); req.availableRoles = [...req.availableRoles, 'fixture-explain-role']; req.availableModels = [...req.availableModels, 'fixture-explain'];
+  const r = await s.layer.route(req);
+  assert.equal(r.apply, true); assert.equal(r.route.tier, 'economy'); assert.equal(r.route.role, 'fixture-explain-role'); assert.equal(r.route.intentOverride, true);
+});
+test('an intent override target unavailable to this host reports TARGET_UNAVAILABLE, not the tier default', async t => {
+  const s = setup({ provider: p => response(p, { intent: 'explain' }) }); t.after(s.cleanup);
+  s.policy.router.profiles.codex.intents = { explain: { role: 'fixture-explain-role' } }; s.save();
+  // fixture-explain-role is never added to availableRoles here, even though the economy tier target is.
+  const r = await s.layer.route(copy(ROUTE_INPUT));
+  assert.equal(r.reason, 'TARGET_UNAVAILABLE'); assert.equal(r.route, null);
+});
+test('an intent override never applies to STRONG_DEFAULT (debug always keeps the strong tier role)', async t => {
+  const s = setup({ provider: p => response(p, { intent: 'debug' }) }); t.after(s.cleanup);
+  s.policy.router.profiles.codex.intents = { debug: { role: 'fixture-explain-role' } }; s.save();
+  const req = copy(ROUTE_INPUT); req.availableRoles = [...req.availableRoles, 'fixture-explain-role'];
+  const r = await s.layer.route(req);
+  assert.equal(r.route.tier, 'strong'); assert.equal(r.route.role, 'fixture-strong-role'); assert.equal(r.route.intentOverride, undefined);
+});
+run('router status warns about an empty host profile and a role the host no longer has', async s => {
+  s.policy.router.profiles.claude = {}; s.save();
+  const status = s.layer.status();
+  assert.ok(status.features.router.warnings.includes('ROUTER_PROFILE_EMPTY:claude'));
+  assert.ok(status.features.router.warnings.some(w => w.startsWith('ROUTER_ROLE_MISSING:codex:')));
+});
+test('claude model "fable" cannot be configured as a profile target', () => {
+  assert.ok(!CLAUDE_MODELS.includes('fable'));
+  assert.throws(() => validateFeaturePolicy({ version: 2, router: { profiles: { claude: { economy: { role: 'implementer', model: 'fable' } }, codex: {} } } }));
 });
 test('unknown skills are not returned', async t => {
   const s = setup({ provider: p => response(p, { intent: 'explain' }) }); t.after(s.cleanup);

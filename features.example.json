@@ -1,5 +1,5 @@
 {
-  "version": 1,
+  "version": 2,
   "router": {
     "mode": "off",
     "expectedModel": "jev-1.13.0",

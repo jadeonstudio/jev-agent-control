@@ -8,6 +8,7 @@ import { validateFeaturePolicy } from '../src/feature-policy.mjs';
 
 export const ROUTE_INPUT = { task: 'Fix the typo in the README heading at the supplied location.', host: 'codex', risk: 'routine',
   context: { complete: true, scope: 'local', previousFailures: 0, highImpact: false, modelLocked: false, exhaustive: false },
+  availableRoles: ['fixture-economy-role', 'fixture-standard-role', 'fixture-strong-role'],
   availableModels: ['fixture-economy', 'fixture-standard', 'fixture-strong'], availableSkills: ['fixture-search'] };
 export const FILTER_INPUT = { query: 'Evidence about database transactions', risk: 'routine', coverage: 'selective', items: [
   { id: 'keep_1', text: 'Database transaction isolation evidence' }, { id: 'drop_1', text: 'drop: an unrelated weather summary' },
@@ -38,10 +39,12 @@ export function setup({ mode = 'on', featureMode = 'on', provider, now } = {}) {
   fs.chmodSync(home, 0o700);
   const env = { HOME: home, JEV_HOME: home, TYPESAFE_API_KEY: 'offline-feature-fixture-not-real' };
   setMode(home, mode, env);
-  const policy = validateFeaturePolicy({ router: { mode: featureMode, profiles: {
-    codex: { economy: { model: 'fixture-economy', reasoning: 'low', skills: { explain: ['fixture-search'] } },
-      standard: { model: 'fixture-standard', reasoning: 'medium' }, strong: { model: 'fixture-strong', reasoning: 'high' } },
-    claude: { economy: { model: 'fixture-economy' }, standard: { model: 'fixture-standard' }, strong: { model: 'fixture-strong' } },
+  const policy = validateFeaturePolicy({ version: 2, router: { mode: featureMode, profiles: {
+    codex: { economy: { role: 'fixture-economy-role', model: 'fixture-economy', reasoning: 'low', skills: { explain: ['fixture-search'] } },
+      standard: { role: 'fixture-standard-role', model: 'fixture-standard', reasoning: 'medium' },
+      strong: { role: 'fixture-strong-role', model: 'fixture-strong', reasoning: 'high' } },
+    claude: { economy: { role: 'fixture-economy-role', model: 'haiku' }, standard: { role: 'fixture-standard-role', model: 'sonnet' },
+      strong: { role: 'fixture-strong-role', model: 'opus' } },
   } }, bulk: { mode: featureMode } });
   const save = () => atomicWrite(path.join(home, 'features.json'), JSON.stringify(policy)); save();
   const calls = [];

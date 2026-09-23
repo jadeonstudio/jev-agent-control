@@ -74,7 +74,8 @@ test('new MCP tools use real layer dispatch, preserve shadow and deny option inj
   };
   const value = async id => JSON.parse((await wait(id)).result.content[0].text);
   send(1, 'initialize', { protocolVersion: '2025-06-18', clientInfo: { name: 'feature-test', version: '1' } }); send(null, 'notifications/initialized');
-  send(2, 'tools/call', { name: 'jev_route', arguments: copy(ROUTE_INPUT) }); assert.equal((await value(2)).route.model, 'fixture-economy');
+  send(2, 'tools/call', { name: 'jev_route', arguments: copy(ROUTE_INPUT) });
+  { const v = await value(2); assert.equal(v.route.model, 'fixture-economy'); assert.equal(v.route.role, 'fixture-economy-role'); }
   send(3, 'tools/call', { name: 'jev_filter', arguments: copy(FILTER_INPUT) }); assert.deepEqual((await value(3)).rejectIds, ['drop_1']);
   setFeatureMode(s.home, 'router', 'shadow');
   send(4, 'tools/call', { name: 'jev_route', arguments: copy(ROUTE_INPUT) }); const r = await value(4); assert.equal(r.route, null); assert.equal(r.apply, false);

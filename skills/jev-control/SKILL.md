@@ -12,6 +12,7 @@ node <this-skill-directory>/scripts/run.mjs shadow
 node <this-skill-directory>/scripts/run.mjs on
 node <this-skill-directory>/scripts/run.mjs policy init
 node <this-skill-directory>/scripts/run.mjs policy check
+node <this-skill-directory>/scripts/run.mjs policy roles --host codex|claude [--dry-run] [--replace]
 node <this-skill-directory>/scripts/run.mjs router off
 node <this-skill-directory>/scripts/run.mjs router shadow
 node <this-skill-directory>/scripts/run.mjs router on
@@ -23,7 +24,7 @@ node <this-skill-directory>/scripts/run.mjs smoke
 node <this-skill-directory>/scripts/run.mjs metrics
 ```
 
-Global mode and per-feature mode combine conservatively: either OFF disables; either SHADOW prevents application. Updating code does not enable new features. Do not toggle without the user's request. `policy init` creates safe defaults without overwriting an existing policy. Router profiles start empty; map only actually available models, reasoning levels and skills after inspecting the host's supported configuration and the user's desired policy. No invented model names or silently lowered thresholds. `policy check` validates configuration, NOT model quality or availability.
+Global mode and per-feature mode combine conservatively: either OFF disables; either SHADOW prevents application. Updating code does not enable new features. Do not toggle without the user's request. `policy init` creates safe defaults without overwriting an existing policy. Router profiles start empty; each target is `{role (required), model?, reasoning?, skills?}` — map only role names (and, for Claude, `haiku|sonnet|opus`) the host actually has agent definitions for. `policy roles --host <codex|claude>` reads `~/.codex/agents/*.toml` or `~/.claude/agents/*.md` file names (never their content) and writes a preset from that; it refuses to overwrite a non-empty profile without `--replace`, and `--dry-run` writes nothing. No invented role/model names or silently lowered thresholds. `policy check` validates configuration, NOT role/model quality or availability.
 
 Reuse the existing TYPESAFE_API_KEY. If missing, ask the USER to run `key set` in a normal terminal. Never request a key in chat, pass it as an argument or display/read credentials.env, process environments, host auth files, shell history or backups. The managed key file is private plaintext, not an encrypted vault.
 

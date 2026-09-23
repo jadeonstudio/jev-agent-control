@@ -1,5 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import { performance } from 'node:perf_hooks';
+import os from 'node:os';
 import { errorCode, fail, isObject } from './constants.mjs';
 import { resolveHome, appendEvent } from './storage.mjs';
 import { containsSensitiveData } from './contracts.mjs';
@@ -7,6 +8,21 @@ import { createDecisionEngine } from './engine.mjs';
 import { loadFeaturePolicy, policyFingerprint, effectiveMode, TIERS } from './feature-policy.mjs';
 import { validateRouteInput, routeGuard, routeRequest, chooseRoute } from './routing.mjs';
 import { validateFilterInput, filterRequest, filterChoices, packFilterBatches } from './filtering.mjs';
+import { discoverHostRoles } from './host-roles.mjs';
+
+/** Advisory-only: a missing profile or a configured role the host no longer has an agent definition for. Never blocks status. */
+function routerWarnings(policy, env) {
+  const warnings = [];
+  for (const host of ['codex', 'claude']) {
+    const profile = policy.router.profiles[host] ?? {};
+    const targets = [...TIERS.map(tier => profile[tier]).filter(Boolean), ...Object.values(profile.intents ?? {})];
+    if (!targets.length) { warnings.push(`ROUTER_PROFILE_EMPTY:${host}`); continue; }
+    let discovered;
+    try { discovered = discoverHostRoles(host, { env, userHome: env.HOME || os.homedir() }); } catch { discovered = []; }
+    for (const target of targets) if (!discovered.includes(target.role)) warnings.push(`ROUTER_ROLE_MISSING:${host}:${target.role}`);
+  }
+  return warnings;
+}
 
 /** Common routing/filtering policies. Provider choice is local configuration, never another model decision. */
 export function createControlLayer({ home = resolveHome(), env = process.env, engine = createDecisionEngine({ home, env }), now = Date.now } = {}) {
@@ -22,9 +38,10 @@ export function createControlLayer({ home = resolveHome(), env = process.env, en
     try {
       const p = loadFeaturePolicy(home);
       return { ...base, features: { router: { mode: effectiveMode(base.mode, p.router.mode), configuredMode: p.router.mode,
-        expectedModel: expected(base, p.router), configuredTargets: Object.fromEntries(Object.entries(p.router.profiles).map(([host, targets]) => [host, Object.keys(targets)])) },
+        expectedModel: expected(base, p.router), configuredTargets: Object.fromEntries(Object.entries(p.router.profiles).map(([host, targets]) => [host, Object.keys(targets)])),
+        warnings: routerWarnings(p, env) },
       bulk: { mode: effectiveMode(base.mode, p.bulk.mode), configuredMode: p.bulk.mode, expectedModel: expected(base, p.bulk) } }, featurePolicyError: null };
-    } catch (error) { return { ...base, features: { router: { mode: 'off' }, bulk: { mode: 'off' } }, featurePolicyError: errorCode(error) }; }
+    } catch (error) { return { ...base, features: { router: { mode: 'off', warnings: [] }, bulk: { mode: 'off' } }, featurePolicyError: errorCode(error) }; }
   }
   function current(policy, feature, mode, revision) {
     const base = engine.status();

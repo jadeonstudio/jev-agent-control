@@ -92,7 +92,7 @@ jev-control bulk off       # 각각 off / shadow / on
 
 PATH에 없으면 `"$HOME/.local/bin/jev-control"`을 사용하세요. 전역/기능 중 하나라도 OFF면 추론하지 않고, 하나라도 SHADOW면 결과를 적용하지 않습니다. 전역 OFF가 최우선이며 `JEV_DISABLE=1`도 지원합니다. 이미 전송된 요청의 과금은 되돌릴 수 없습니다. OFF는 MCP 설명 자체를 제거하지 않으므로 컨텍스트 비용까지 없애려면 호스트 MCP를 비활성화하거나 제거합니다.
 
-같은 `JEV_HOME`에서는 정책·모드·관리 키를 공유하지만 각 호스트의 MCP·Laya worker·호출 제한은 별개입니다. 모델 매핑은 비워 두며 실제 지원 모델·reasoning·스킬·실행 경로를 확인한 값만 등록합니다. 추론 provider와 실제 코딩을 실행할 모델은 서로 다른 개념입니다. 기존 classifier-inspired 분류 정책은 유지하되 Jev는 고정 serving version, Laya는 고정 checkpoint를 검사합니다.
+같은 `JEV_HOME`에서는 정책·모드·관리 키를 공유하지만 각 호스트의 MCP·Laya worker·호출 제한은 별개입니다. router profile은 비워 두며 실제 보유한 **역할(role)**·reasoning·스킬을 확인한 값만 등록합니다(`features.json` v2, `jev-control policy roles`). Codex의 `spawn_agent`는 model 인자를 무시하고 역할 TOML의 model/effort를 그대로 쓰므로, Codex에서 실행 모델을 바꾸는 수단은 역할 선택뿐입니다. 추론 provider와 실제 코딩을 실행할 모델은 서로 다른 개념입니다. 기존 classifier-inspired 분류 정책은 유지하되 Jev는 고정 serving version, Laya는 고정 checkpoint를 검사합니다.
 
 전수조사는 `coverage:exhaustive`로 모든 자료를 보존합니다. 필터는 ID만 반환하고 원본을 삭제하지 않습니다. 메인 모델이 읽기 전 수집 경로에 연결해야 입력 감소를 기대할 수 있습니다.
 

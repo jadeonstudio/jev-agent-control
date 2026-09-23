@@ -24,16 +24,28 @@ export const ROUTE_QUESTIONS = {
 function keys(value, allowed) {
   if (!isObject(value) || Object.keys(value).some(k => !allowed.includes(k) || RESERVED.has(k))) fail('INVALID_ROUTE_REQUEST');
 }
+function profileTargets(policy, host) {
+  const profile = policy.profiles[host] ?? {};
+  return [...TIERS.map(tier => profile[tier]).filter(Boolean), ...Object.values(profile.intents ?? {})];
+}
+function targetAvailable(target, input) {
+  if (!target || !input.availableRoles.includes(target.role)) return false;
+  if (target.model !== undefined && input.availableModels !== undefined && !input.availableModels.includes(target.model)) return false;
+  return true;
+}
 export function validateRouteInput(input) {
-  keys(input, ['task', 'host', 'risk', 'context', 'availableModels', 'availableSkills']);
+  keys(input, ['task', 'host', 'risk', 'context', 'availableRoles', 'availableModels', 'availableSkills']);
   if (typeof input.task !== 'string' || !input.task.trim() || Buffer.byteLength(input.task) > 8000 ||
       !['codex', 'claude'].includes(input.host) || !['routine', 'sensitive'].includes(input.risk)) fail('INVALID_ROUTE_REQUEST');
   keys(input.context, ['complete', 'scope', 'previousFailures', 'highImpact', 'modelLocked', 'exhaustive']);
   const c = input.context;
   for (const key of ['complete', 'highImpact', 'modelLocked', 'exhaustive']) if (typeof c[key] !== 'boolean') fail('INVALID_ROUTE_REQUEST');
   if (!['local', 'cross-module', 'repository', 'unknown'].includes(c.scope) || !Number.isInteger(c.previousFailures) || c.previousFailures < 0 || c.previousFailures > 100) fail('INVALID_ROUTE_REQUEST');
-  if (!Array.isArray(input.availableModels) || input.availableModels.length > 32 || new Set(input.availableModels).size !== input.availableModels.length ||
-      input.availableModels.some(m => typeof m !== 'string' || !MODEL_ID.test(m))) fail('INVALID_ROUTE_REQUEST');
+  if (!Array.isArray(input.availableRoles) || input.availableRoles.length > 32 || new Set(input.availableRoles).size !== input.availableRoles.length ||
+      input.availableRoles.some(r => typeof r !== 'string' || !ID.test(r))) fail('INVALID_ROUTE_REQUEST');
+  if (input.availableModels !== undefined && (!Array.isArray(input.availableModels) || input.availableModels.length > 32 ||
+      new Set(input.availableModels).size !== input.availableModels.length ||
+      input.availableModels.some(m => typeof m !== 'string' || !MODEL_ID.test(m)))) fail('INVALID_ROUTE_REQUEST');
   const skills = input.availableSkills ?? [];
   if (!Array.isArray(skills) || skills.length > 128 || new Set(skills).size !== skills.length || skills.some(s => typeof s !== 'string' || !ID.test(s) || RESERVED.has(s))) fail('INVALID_ROUTE_REQUEST');
   return structuredClone({ ...input, availableSkills: skills });
@@ -45,8 +57,7 @@ export function routeGuard(input, policy) {
   if (c.exhaustive || c.scope === 'repository' || c.scope === 'cross-module') return 'SCOPE_REQUIRES_HOST';
   if (!c.complete || c.scope === 'unknown') return 'INCOMPLETE_CONTEXT';
   if (c.previousFailures > 0) return 'PRIOR_FAILURE';
-  const targets = policy.profiles[input.host] ?? {};
-  const available = new Set(Object.values(targets).map(t => t.model).filter(m => input.availableModels.includes(m)));
+  const available = new Set(profileTargets(policy, input.host).map(t => t.role).filter(role => input.availableRoles.includes(role)));
   return available.size < 2 ? 'INSUFFICIENT_TARGETS' : null;
 }
 export function routeRequest(input) {
@@ -75,10 +86,14 @@ export function chooseRoute(answers, input, policy) {
   } else if (intent.value !== 'debug' && mean <= policy.standardMaxDifficulty && deepTail <= policy.standardMaxDeepProbability) {
     tier = 'standard'; rule = 'BOUNDED_MODERATE';
   }
-  const target = policy.profiles[input.host]?.[tier];
-  if (!target || !input.availableModels.includes(target.model)) return { reason: 'TARGET_UNAVAILABLE', features };
+  const profile = policy.profiles[input.host] ?? {};
+  let target = profile[tier], intentOverride = false;
+  // A weak-role intent override never applies to STRONG_DEFAULT: difficult work must not be quietly handed to a lightweight role.
+  if (rule !== 'STRONG_DEFAULT' && profile.intents?.[intent.value]) { target = profile.intents[intent.value]; intentOverride = true; }
+  if (!targetAvailable(target, input)) return { reason: 'TARGET_UNAVAILABLE', features };
   const skills = (target.skills?.[intent.value] ?? []).filter(id => input.availableSkills.includes(id));
-  return { reason: rule, features, route: { tier, model: target.model, ...(target.reasoning ? { reasoning: target.reasoning } : {}), skills } };
+  return { reason: rule, features, route: { tier, role: target.role, ...(target.model !== undefined ? { model: target.model } : {}),
+    ...(target.reasoning ? { reasoning: target.reasoning } : {}), skills, ...(intentOverride ? { intentOverride: true } : {}) } };
 }
 export async function routeOrDelegate(layer, input, { use, delegate, signal } = {}) {
   if (typeof use !== 'function' || typeof delegate !== 'function') fail('HANDLERS_REQUIRED');
@@ -87,14 +102,15 @@ export async function routeOrDelegate(layer, input, { use, delegate, signal } = 
   return result.apply ? use(result.route, result) : delegate(result);
 }
 export const routeSchema = {
-  type: 'object', additionalProperties: false, required: ['task', 'host', 'risk', 'context', 'availableModels'], properties: {
+  type: 'object', additionalProperties: false, required: ['task', 'host', 'risk', 'context', 'availableRoles'], properties: {
     task: { type: 'string', minLength: 1, maxLength: 8000 }, host: { type: 'string', enum: ['codex', 'claude'] },
     risk: { type: 'string', enum: ['routine', 'sensitive'] },
     context: { type: 'object', additionalProperties: false, required: ['complete', 'scope', 'previousFailures', 'highImpact', 'modelLocked', 'exhaustive'], properties: {
       complete: { type: 'boolean' }, scope: { type: 'string', enum: ['local', 'cross-module', 'repository', 'unknown'] },
       previousFailures: { type: 'integer', minimum: 0, maximum: 100 }, highImpact: { type: 'boolean' }, modelLocked: { type: 'boolean' }, exhaustive: { type: 'boolean' },
     } },
-    availableModels: { type: 'array', maxItems: 32, uniqueItems: true, items: { type: 'string' }, description: 'Actual model IDs available to this host, not guessed names.' },
+    availableRoles: { type: 'array', maxItems: 32, uniqueItems: true, items: { type: 'string' }, description: 'Role names the host actually has agent definitions for (e.g. ~/.codex/agents/*.toml or ~/.claude/agents/*.md stems), not guessed names.' },
+    availableModels: { type: 'array', maxItems: 32, uniqueItems: true, items: { type: 'string' }, description: 'Optional; actual model IDs available to this host, not guessed names. Codex ignores a spawn_agent model argument, so this rarely applies there.' },
     availableSkills: { type: 'array', maxItems: 128, uniqueItems: true, items: { type: 'string' } },
   },
 };
