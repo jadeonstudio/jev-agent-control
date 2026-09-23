@@ -44,12 +44,40 @@ owner 요청: 이 Mac(Apple M4 Pro, GPU 16코어, 통합 메모리 24GB)에서 L
 - multilingual은 english보다 약 2.2배 빠르다(공식 서술과 일치).
 - 관찰(정답 라벨 없음): multilingual은 한국어 intent 12개 중 약 3개가 어긋나 보인다. multilingual·typed-decisions 모두 "운영 DB 비밀번호 교체"의 risk를 `safe`로 냈다. zero-shot risk 판단은 신뢰할 수 없으며, qualification 없이 ON에 쓰면 안 된다는 근거다.
 
+### B3. 라벨 있는 개발 세트 평가 (`scripts/laya-eval-route.py`, `scripts/fixtures/route-dev-set.json`)
+
+세트: 영어·한국어 쌍 24개씩(48). 라벨은 AI가 작성했고 사람 검토 전이다. checkpoint 비교용이며 자격 근거가 아니다. FP16(half + autocast) MPS.
+
+| checkpoint | intent 영/한 | risk 영/한 | difficulty MAE | high→safe 오판 | 3질문 지연 p50 |
+|---|---|---|---:|---:|---:|
+| english | 0.75 / 0.33 | 0.38 / 0.21 | 1.07 | 3 | 128ms |
+| multilingual | 0.58 / 0.25 | 0.33 / 0.08 | 1.22 | 5 | 53ms |
+| typed-decisions | 0.71 / 0.38 | 0.54 / 0.58 | 1.05 | 8 | 123ms |
+
+- intent 선택적 정확도(영어, english): 확신도 ≥0.7에서 13/24를 커버하고 그중 0.923이 맞다. ≥0.8에서는 10/24, 0.90.
+- "multilingual 하나로 통일" 가설은 기각. 한국어에서도 english보다 못했다.
+- 한국어 intent와 risk는 세 checkpoint 모두 zero-shot으로 쓸 수 없는 수준이다. difficulty는 평균 1단계 이상 어긋난다.
+- MPS에서 `model.half()`만 적용하면 mixed-dtype matmul에서 Metal assert로 프로세스가 죽는다. fp16은 half 가중치 + 강제 autocast(fp16)가 검증된 조합이다.
+
+### B4. Codex A/B: spawn 전 명시 `jev_route` vs 바로 spawn (codex-cli 0.154.0, `codex exec`, 각 3회, 중앙값)
+
+| | A: route 후 spawn | B: 바로 spawn | 차이 |
+|---|---:|---:|---:|
+| 입력 토큰 | 109,907 | 81,294 | +28,613 |
+| 캐시 입력 | 88,704 | 60,800 | +27,904 |
+| 캐시 안 된 입력 | 21,203 | 20,494 | +709 |
+| 출력 토큰 | 227 | 66 | +161 |
+| 시간 | 21.9s | 13.3s | +8.6s |
+
+- 명시 route 호출은 spawn 1회당 약 8.6초와 메인 모델 추가 턴(캐시 입력 약 2.8만)을 더한다. 세션 컨텍스트가 클수록 추가 턴의 캐시 읽기도 커진다.
+- 절감 근거는 없다(route 추천 0/1, zero-shot 품질 약함). 권장: Codex 관리 블록에서 route 호출 안내를 제거하고 hook 기록만 유지한다(owner 확인 후 적용).
+
 ## 단계
 
 - [x] L0 기준선·리서치
 - [ ] L1 worker 최적화: 초기화 생략(검증된 동일성), 16비트 옵션, laya 0.3.6 호환성 검증
-- [ ] L2 한국어 경로: 입력 언어로 english/multilingual 선택, 각 checkpoint 벤치마크
+- [x] L2 한국어 경로 평가: multilingual 통일 기각, 한국어는 zero-shot 불가 → fine-tune 필요 (B3)
 - [ ] L3 상주 서버: `jev-control laya serve`(Unix 소켓, 유휴 언로드, 준비 안 됐으면 즉시 NOT_READY), hook·MCP가 서버를 사용, launchd 설치기(dry-run·승인)
 - [ ] L4 품질: 라벨 있는 평가 세트로 checkpoint·Jev 비교, qualification 경로(사람 라벨 필요)
-- [ ] L5 Codex 블록 축소 + A/B 실측
+- [~] L5 Codex A/B 실측 완료(B4), 블록 변경은 owner 확인 대기
 - [ ] L6 설치본 반영·문서·커밋
