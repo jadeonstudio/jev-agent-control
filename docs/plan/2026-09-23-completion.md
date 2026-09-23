@@ -90,7 +90,13 @@ owner가 개정을 승인했다. P0 커밋에서 `AGENTS.md`를 개정했다: �
 - 최소 표본 게이트: purpose별 강한 라벨 최소 수 미달 시 build/export 거부, `--allow-small` 명시만 허용, 빈 split export 거부.
 - acceptance: 합성 시나리오 route → 실행 → runner verify → evaluate → build → export가 강한 라벨로 끝까지 이어짐. 사칭 경로(MCP, 비TTY correct, 결과 주입) 음성 테스트.
 
-### P3. 호스트 자동 연결 설치기 (G2) — 미착수
+### P3. 호스트 자동 연결 설치기 (G2) — 진행 중 (P3a hook 실행기 → P3b 설치기 순차)
+- 설계 결정(2026-09-23):
+  - **맥락 표시**: hook은 작업 범위·완결성을 알 수 없다. 임의로 local·complete로 채우면 AGENTS.md의 "맥락 오표기 금지"를 어긴다. 그래서 spawn 프롬프트/메시지에 `[jev scope=… complete=… failures=…]` 한 줄이 있을 때만 route를 부른다. 없으면 네트워크 없이 통과(`NO_CONTEXT_ANNOTATION`). 관리 지침 블록이 이 표시를 쓰도록 안내한다. 표시는 jev_route MCP 입력과 같은 에이전트 주장 수준이다.
+  - **재작성 대상 제한**: 호출자가 고른 역할이 profile 역할 집합(tier + intents)에 있을 때만 route·재작성한다. verifier·web-researcher 같은 목적 역할과 Claude 기본 `general-purpose`는 건드리지 않는다(`ROLE_NOT_ROUTABLE`).
+  - **Codex 재작성은 `agent_type`만**(R1). Codex 연결은 공식 필드가 없어 같은 session·역할의 60초 이내 대기 항목을 잇는 휴리스틱이며 이벤트에 `link:'heuristic'`로 남긴다.
+  - **P3a 결과(국소 검증됨)**: `jev-control hook --host --event`(`src/hooks.mjs`). pre-spawn(역할·맥락 표시 확인 → route → ON에서만 `allow`+`updatedInput`), post-spawn(Claude tool_use→agent 연결), subagent-start(Codex 휴리스틱 연결), subagent-stop(host_review 기록). router OFF·global OFF·`JEV_DISABLE=1`이면 모든 이벤트가 즉시 통과. 메인 검토에서 두 결함을 고쳤다. ① 잘못된 인자가 종료 코드 2를 내는 문제: Claude PreToolUse에서 exit 2는 도구 차단이므로 `hook`을 bin 진입점에서 먼저 분기해 항상 exit 0으로 끝낸다. ② `tool_name`을 확인하지 않던 문제: spawn 도구(Claude `Agent`/`Task`, Codex `spawn_agent`)가 아니면 동작하지 않는다. 테스트 261/261. 로컬 in-process 지연은 워커 측정 약 6.6ms/호출이며, Node 기동·실제 네트워크 지연은 포함하지 않는다(실측 전 UNKNOWN).
+  - **데이터 외부 전송**: provider가 jev이면 hook이 route할 때 spawn description+프롬프트 앞부분(최대 8000바이트)이 TypeSafe로 전송된다. 기존 비밀값 검사(best-effort)는 그대로 적용된다. provider가 laya이면 로컬에서 끝난다. P3b 적용 승인과 P4 SHADOW 승인 때 owner에게 이 전송을 명시한다.
 - installer `--hooks`: 소유 표식 항목만 추가·제거, 기존 hook 순서·내용 보존, 충돌 시 실패, dry-run diff.
 - Codex `~/.codex/hooks.json`: PreToolUse(spawn_agent) route 조회, SubagentStop 결과 기록.
 - Claude `~/.claude/settings.json`: PreToolUse(Agent) route 조회(ON이면 updatedInput, modelLocked 존중), SubagentStop 결과 기록.
