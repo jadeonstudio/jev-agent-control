@@ -68,3 +68,19 @@ Roll back to OFF if final outcomes degrade, fallback/rework consumes savings, p9
 ## v0.3 verification
 
 Run `node scripts/check.mjs`, `node --test tests/*.test.mjs`, `node bin/jev-control.mjs smoke`, `node examples/fast-path.mjs`, and `node examples/training-pipeline.mjs`. Optional Python boundary tests: `python3 -m unittest discover -s tests -p "test_laya_worker.py"`. They use no real model or network. Added tests cover capture OFF/consent epochs, provenance, delayed outcomes, weak-source boundaries, per-purpose evidence, orphan/corrupt events, dedup split leakage, immutable/reproducible datasets, official JSON-string export, provider metrics, worker UTF-8/termination and MCP/CLI integration. Passing these does not verify actual Laya weights/MPS, native Codex/Claude, paid API or downstream model quality. Earlier counts below describe v0.2 only; use the current test/CI summary for current counts.
+
+## 2026-09-23 completion-plan verification (see docs/plan/2026-09-23-completion.md)
+
+macOS, Node 26.5.0, codex-cli 0.154.0, Claude Code 2.1.237. Offline: `node --test tests/*.test.mjs` 312/312, `scripts/check.mjs`, `smoke`, three examples, Laya worker 4/4.
+
+Native (real host sessions, recorded in the plan's R1–R3 and P3/P4 notes):
+
+- [x] Codex spawn `model` argument is ignored; the role TOML model/effort applies (R1).
+- [x] Claude PreToolUse(`Agent`) `updatedInput` changes the subagent model (R3).
+- [x] Installed hooks fire in real Claude and Codex sessions; `uninstall --hooks-only` restores host files byte-for-byte.
+- [x] Claude annotated spawn under SHADOW: one TypeSafe route call, tool_use→agent link, SubagentStop host_review record.
+- [x] Codex 0.154.0 passes `spawn_agent.message` to hooks as an opaque token, so Codex hooks record only; Codex routing is an explicit `jev_route` call.
+- [ ] Claude ON rewrite in a native session (needs router ON; owner decision).
+- [ ] Real Laya weights through `laya qualify/compare/promote` (only synthetic checkpoints and injected workers were used).
+- [ ] Any fine-tuning run (the kit in `training/laya-kit/` was not executed).
+- [ ] Downstream task quality, cost or latency benefit of routing (SHADOW agreement is not accuracy).

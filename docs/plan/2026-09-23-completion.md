@@ -142,7 +142,8 @@ owner가 개정을 승인했다. P0 커밋에서 `AGENTS.md`를 개정했다: �
 - 강한 라벨 기준 수 도달 시 metrics·doctor 알림만, 자동 학습·교체 없음.
 - acceptance: 합성 checkpoint 픽스처로 register → qualify(합격·불합격) → promote → rollback, 고정 holdout 악화 시 promote 거부 음성 테스트.
 
-### P6. 문서·배포·인계 — 미착수
+### P6. 문서·배포·인계 — 진행 중
+- 인계 메모: `docs/handoff/2026-09-23-trader-aegis.md`(trader 미수정). 검증 현황: `docs/TESTING.md` 2026-09-23 절.
 - README, ARCHITECTURE, TRAINING_DATA 갱신, 사실 아닌 문장 같은 커밋에서 수정.
 - 설치본 절차대로 갱신, 두 호스트 doctor, checksNotPerformed 그대로 보고.
 - trader 인계 메모(문서만).
