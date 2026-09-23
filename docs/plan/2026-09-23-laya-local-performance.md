@@ -94,7 +94,7 @@ owner 요청: 이 Mac(Apple M4 Pro, GPU 16코어, 통합 메모리 24GB)에서 L
 | typed-decisions | 1024 / 256 | 2,512자 | 697자(1,439B) |
 
 - english는 한국어 토큰화 효율이 낮아 한국어 296자를 넘으면 `INPUT_TRUNCATED`로 판단하지 않는다. 실제 한국어 서브에이전트 프롬프트는 대부분 이보다 길어, english는 정확도(B3)뿐 아니라 용량 면에서도 owner 사용 패턴에 맞지 않는다.
-- 결정: fine-tune 기반 모델은 multilingual(한국어 1,440자, 2.2배 빠름, FP16 631MiB). 증류 데이터 3,000개는 짧은 문장 2,000 + 실제 프롬프트형 긴 문장 1,000으로 구성한다(생성된 짧은 문장 중앙값 55자는 실제 입력 분포와 다름). hook의 판단 입력은 예산 안 앞부분으로 명시적으로 자르고 provenance에 기록하는 방식을 추가한다(조용한 잘림 아님).
+- 결정: fine-tune 기반 모델은 multilingual(한국어 1,440자, 2.2배 빠름, FP16 631MiB). 증류 데이터 3,000개는 짧은 문장 2,000 + 실제 프롬프트형 긴 문장 1,000으로 구성한다(생성된 짧은 문장 중앙값 55자는 실제 입력 분포와 다름). hook의 판단 입력은 예산 안 앞부분으로 명시적으로 자르고 기록하는 방식을 추가한다(조용한 잘림 아님). 맞춤 모드는 `provenance.preprocessing_version`(`…-lossless-v1`/`…-task-head-v1`)으로, 요청별 잘림 여부는 provenance 밖 `inputFit`과 metrics `routeInputFitTruncated`로 남긴다(학습 decision 스키마는 provenance에 문자열 키만 허용하므로 객체를 넣으면 capture가 전부 실패한다 — 재현 테스트로 막음).
 - **구현 완료 (2026-09-23):** `workers/laya_worker.py`의 `fit_task_head()`(opt-in, `providers.json` `laya.inputFit:'task-head'`, 기본 `'lossless'`는 기존 거부 동작 유지)가 예산을 넘는 route 입력에서 `state.task`만 최장 prefix + 고정 marker(`" …[truncated]"`)로 줄이고 최종 결과를 반드시 `assert_lossless()`로 재검증한다. `training/laya-kit/train_from_export.py`는 같은 함수를 byte-identical하게 복사해 train 전처리에도 identical하게 적용한다(`tests/test_laya_kit_input_fit.py`로 parity 검증). 상세: `docs/TRAINING_DATA.md` §7. 실측 overhead(M4 Pro, `scripts/laya-budget.py --fit --runs 20`, 2,500자 EN/KO): english EN kept 1,533자/median ≈15.4–16.7ms, english KO kept 294자/median ≈16.0–17.3ms, multilingual EN 이미 무손실/median ≈2.4–2.5ms, multilingual KO kept 1,467자/median ≈16.9–17.6ms — 목표(<15ms)에 근접하거나 근소하게(약 1–2ms) 초과했다(정확성 우선으로 마지막 결과는 항상 `assert_lossless()` 재검증을 거치므로 추가 최적화보다 정확성을 택함).
 
 ### B4. Codex A/B: spawn 전 명시 `jev_route` vs 바로 spawn (codex-cli 0.154.0, `codex exec`, 각 3회, 중앙값)
@@ -117,6 +117,10 @@ owner 요청: 이 Mac(Apple M4 Pro, GPU 16코어, 통합 메모리 24GB)에서 L
 - [x] laya 0.3.6 판단: 0.3.5·0.3.6 변경은 Router·다운로드·로망스어 라우팅 위주로 jev 경로(Agent 직접 사용)와 무관하다. 0.3.4 유지(재설치 불필요), 실제 이득은 로더·정밀도·상주 서빙에서 나온다.
 - [x] L2 한국어 경로 평가: multilingual 통일 기각, 한국어는 zero-shot 불가 → fine-tune 필요 (B3)
 - [x] L3 상주 서버: `jev-control laya serve`/`laya server-status`(`src/laya-server.mjs`, Unix 소켓 `JEV_HOME/run/laya.sock` 0600·`run/` 0700, 유휴 언로드 `laya.serverIdleUnloadMs`, `wait:false`면 준비 안 됐을 때 즉시 NOT_READY+백그라운드 로드), 엔진이 소켓 있으면 자동 사용(`layaSpawn`/`layaWait` 엔진 옵션), hook은 `layaSpawn:false,wait:false`로 항상 즉시 통과, MCP·CLI는 기본 `layaSpawn:true,wait:true`. launchd 설치기 `install/uninstall --laya-agent`(macOS 전용, dry-run 승인, plist에 JEV_HOME만). doctor `layaServer` 섹션. 실측(english, MPS, fp16, `scripts/laya-server-e2e.mjs`): 서버 콜드→ready 3.2s, status 왕복 0ms, hook p50/p95 서버 있음 184/321ms(실제 3질문 추론 포함) vs 서버 없음 52/58ms(즉시 통과), 유휴 언로드로 worker RSS 464MiB→0MiB, 언로드 후 재요청 재로드 3.9s, close() 후 소켓 파일 제거 확인. 테스트: `tests/laya-server.test.mjs`(13개), `tests/install-laya-agent.test.mjs`(8개), `tests/hooks.test.mjs`의 L3 케이스.
-- [ ] L4 품질: 라벨 있는 평가 세트로 checkpoint·Jev 비교, qualification 경로(사람 라벨 필요)
-- [~] L5 Codex A/B 실측 완료(B4), 블록 변경은 owner 확인 대기
+- [~] L4 품질: teacher 증류 + 사람 검수 경로
+  - [x] 증류 파이프라인 `laya distill import|import-shadow|label|review|build|status` (7371af2): teacher 라벨은 train에만, 사람 검수는 calibration/test에만, `readDataset`이 teacher 라벨의 평가 split 유입을 `TEACHER_LABEL_IN_EVAL_SPLIT`로 거부
+  - [x] 긴 입력 task-head 맞춤과 학습·추론 입력 일치, label 연속 5회 실패 중단·run 잠금 (30aeab4)
+  - [x] 긴 문장 1차 생성분(haiku 워커 5개, 1,000개) 폐기: 기본 작업 약 10개를 "(케이스 N)"·"#N" 번호만 바꿔 반복하고 상투 문단으로 길이를 채움, 최대 약 850자. 재생성은 sonnet 워커 10개 × 100개, 직접 작성·템플릿 금지·길이 3구간·작업 유형 혼합·5-gram 유사도 검사 조건
+  - [ ] 3,000개 구성(짧은 2,000 + 긴 1,000) → teacher 라벨링(실행 직전 owner 승인) → owner TTY 검수 200 → build → Kaggle 학습(multilingual 기반, `--input-fit task-head`로 등록) → holdout·qualify·compare·promote
+- [x] L5 Codex A/B 실측(B4) 후 owner 승인으로 Codex 관리 블록에서 spawn 전 route 안내 제거, hook 기록만 유지
 - [ ] L6 설치본 반영·문서·커밋
