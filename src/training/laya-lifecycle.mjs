@@ -28,7 +28,9 @@ const historyFile = home => path.join(layaRoot(home), 'history.jsonl');
 const providersFile = home => path.join(home, 'providers.json');
 
 // Validate against the exact providers.json contract the runtime loader enforces (never a divergent copy).
-function validateLayaSettings(l) { validateProviderConfig({ version: 1, provider: 'jev', laya: structuredClone(l) }); }
+// Returns the normalized copy (defaults such as startupTimeoutMs/idleTimeoutMs/inputFit filled in). Callers that hand
+// settings to a worker must use the return value: the raw candidate file omits those defaults.
+function validateLayaSettings(l) { return validateProviderConfig({ version: 1, provider: 'jev', laya: structuredClone(l) }).laya; }
 function assertNoSymlinksDeep(root) {
   noSymlinks(root);
   const stack = [root];
@@ -198,9 +200,9 @@ export function loadCandidate(home, candidateHash) {
   if (!HASH.test(candidateHash)) fail('INVALID_CANDIDATE_HASH');
   const file = path.join(candidatesDir(home), `${candidateHash}.json`);
   let laya; try { laya = JSON.parse(readText(file, { privateFile: true, maxBytes: 8192 })); } catch { fail('LAYA_CANDIDATE_NOT_FOUND'); }
-  validateLayaSettings(laya);
-  if (laya.checkpoint !== candidateHash) fail('LAYA_CANDIDATE_MISMATCH');
-  return laya;
+  const normalized = validateLayaSettings(laya);
+  if (normalized.checkpoint !== candidateHash) fail('LAYA_CANDIDATE_MISMATCH');
+  return normalized;
 }
 export async function qualifyCandidate(home, { candidateHash, datasetVersion, holdoutName, layaClient = createLayaClient(), store,
   timeoutMs = 30000, env = process.env, signal,

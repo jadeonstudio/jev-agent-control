@@ -226,6 +226,27 @@ test('qualify passes a purpose whose calibration threshold clears test+holdout, 
   assert.deepEqual(stored, result);
 });
 
+test('qualify hands the worker client normalized candidate settings (startup/idle timeouts filled in)', async t => {
+  // 2026-09-23 real run: a registered candidate file carries no startupTimeoutMs, and the validator only
+  // normalized a clone, so the real worker client got setTimeout(undefined) and failed at once with
+  // LAYA_STARTUP_TIMEOUT. The fake client never looked at the timeouts, so no test caught it.
+  const f = trainingFixture(t);
+  const version = buildRouteDataset(f);
+  const holdout = freezeHoldout(f.home, { datasetVersion: version, name: 'h1' });
+  const reg = registerCheckpoint(f.home, { checkpointDir: makeCheckpointDir(fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'jev-laya-')))), model: 'laya/qt', device: 'cpu', python: '/usr/bin/python3', fingerprintImpl: fakeFingerprint });
+  const inner = fakeLayaClient();
+  const seen = [];
+  const layaClient = { ...inner, async infer(payload, settings, opts) { seen.push(settings.laya); return inner.infer(payload, settings, opts); } };
+  await qualifyCandidate(f.home, { candidateHash: reg.checkpoint, datasetVersion: version, holdoutName: holdout.name, layaClient,
+    targetAccuracy: .75, minCoverage: .3, minCalibration: 5, minTest: 5, minLowerBound: .5 });
+  assert.ok(seen.length > 0);
+  for (const l of seen) {
+    assert.equal(l.startupTimeoutMs, 120000);
+    assert.equal(l.idleTimeoutMs, 60000);
+    assert.equal(l.inputFit, 'lossless');
+  }
+});
+
 test('qualify fails a purpose when calibration sample count is below the minimum', async t => {
   const f = trainingFixture(t);
   const version = buildRouteDataset(f);
