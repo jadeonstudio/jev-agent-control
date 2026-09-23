@@ -706,6 +706,11 @@ def run_training_loop(forward_fn, items, params_for_clip, optimizer, scheduler, 
                     optimizer.step()
                 scheduler.step()
                 optimizer.zero_grad(set_to_none=True)
+                if device.type == "mps":
+                    # jev-change: padded batches have many distinct shapes; without releasing the MPS
+                    # caching allocator here, its working set grows until the machine swaps
+                    # (observed 2026-09-23, M4 Pro 24GB). CUDA/DDP path unchanged.
+                    torch.mps.empty_cache()
 
             epoch_loss += loss.item() * grad_accum
             n_batches += 1
@@ -713,7 +718,8 @@ def run_training_loop(forward_fn, items, params_for_clip, optimizer, scheduler, 
 
             if rank == 0 and (n_batches % 50) == 0:
                 cur_lr = scheduler.get_last_lr()[0]
-                print(f"  {log_prefix} Epoch {epoch+1}/{epochs} | Step {n_batches} | Loss: {loss.item()*grad_accum:.4f} | Reward: {r.mean().item():.3f} | LR: {cur_lr:.2e}")
+                mem = f" | MPS: {torch.mps.driver_allocated_memory() / 2**20:.0f}MiB" if device.type == "mps" else ""
+                print(f"  {log_prefix} Epoch {epoch+1}/{epochs} | Step {n_batches} | Loss: {loss.item()*grad_accum:.4f} | Reward: {r.mean().item():.3f} | LR: {cur_lr:.2e}{mem}")
 
             if max_steps and global_step >= max_steps:
                 if rank == 0:

@@ -150,6 +150,14 @@ class TrainDdpScriptLocalModeStructure(unittest.TestCase):
             self.assertNotRegex(body, r'run_training_loop\(\s*\w+,\s*\w+,\s*\w+\.parameters\(\)',
                                 f'{func} passes a one-shot generator to run_training_loop')
 
+    def test_training_loop_releases_mps_cache_every_optimizer_step(self):
+        # 2026-09-23 real run (M4 Pro 24GB, batch 4): variable padded shapes made the MPS caching
+        # allocator grow until free memory hit 8% and swap filled; releasing the cache after each
+        # optimizer step (MPS only; CUDA/DDP unchanged) keeps the working set flat.
+        body = self._extract_function_body(kit.TRAIN_DDP_SCRIPT, 'run_training_loop')
+        self.assertIn('torch.mps.empty_cache()', body)
+        self.assertRegex(body, r"device\.type\s*==\s*['\"]mps['\"]")
+
     def test_main_local_exists_and_main_ddp_exists(self):
         self.assertIn('def main_local(', kit.TRAIN_DDP_SCRIPT)
         self.assertIn('def main_ddp(', kit.TRAIN_DDP_SCRIPT)
