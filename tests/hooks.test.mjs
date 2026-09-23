@@ -326,6 +326,9 @@ test('pre-spawn only acts on subagent spawn tools; any other tool_name makes no 
   assert.equal(s.calls.length, 0);
   const ok = await processHookEvent({ host: 'codex', event: 'pre-spawn', input: codexInput({ tool_name: 'agents.spawn_agent' }), home: s.home, env: s.env, layer: s.layer });
   assert.equal(s.calls.length, 1); assert.ok(ok.telemetry);
+  // codex-cli 0.154.0 actually sends the namespace concatenated without a separator (measured 2026-09-23).
+  await processHookEvent({ host: 'codex', event: 'pre-spawn', input: codexInput({ tool_name: 'agentsspawn_agent' }), home: s.home, env: s.env, layer: s.layer });
+  assert.equal(s.calls.length, 2);
 });
 test('CLI subprocess: bad hook arguments or an old runtime never exit non-zero (exit 2 would block the host tool call)', () => {
   const home = fs.mkdtempSync(path.join(fs.realpathSync(os.tmpdir()), 'jev-hook-cli-'));

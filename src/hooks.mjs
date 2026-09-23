@@ -71,7 +71,7 @@ function profileRoleSet(policy, host) {
   return roles;
 }
 // Only subagent spawn tools are ever routed or rewritten, even if a host matcher is misconfigured.
-const SPAWN_TOOLS = { claude: name => name === 'Agent' || name === 'Task', codex: name => /^(?:[a-z_]+\.)?spawn_agent$/.test(name) || name === 'Agent' };
+const SPAWN_TOOLS = { claude: name => name === 'Agent' || name === 'Task', codex: name => /^(?:[a-z_]+\.?)?spawn_agent$/.test(name) || name === 'Agent' }; // 0.154.0 sends `agentsspawn_agent`
 function extractPreSpawn(host, input) {
   if (!isObject(input) || !isObject(input.tool_input)) return null;
   if (typeof input.tool_name !== 'string' || !SPAWN_TOOLS[host]?.(input.tool_name)) return null;
