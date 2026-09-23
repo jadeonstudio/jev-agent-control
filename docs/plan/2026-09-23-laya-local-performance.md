@@ -136,6 +136,13 @@ owner 요청: 이 Mac(Apple M4 Pro, GPU 16코어, 통합 메모리 24GB)에서 L
   - [x] Jev teacher vs Claude(평가 300): intent 0.847(ko 0.88·en 0.81), risk 0.677(ko 0.76·en 0.59), difficulty 0.377(±1 이내 0.82). 학습 2,552에서는 0.709/0.594/0.38. Jev는 risk를 덜 조심스럽게(safe→Claude caution 54건), intent에 architecture를 과하게 붙임. 목표가 Claude 수준이므로 **train 라벨도 Claude로 교체** (b0e809d)
   - [x] build(dataset 07988f22…): 전부 ai_reference, train 7,659 / calibration 423 / test 477 샘플, group 누수 제외 145, 예시 이메일 2건 제외(import·build 검사 통일, e988b85). export 검증 통과
   - [x] 학습 키트 결함 2건 발견·수정: gradient clipping이 첫 스텝 후 꺼지던 generator 버그(a474531), 24GB에서 batch 8 스왑(약 8.5초/step) → batch 4(약 0.8초/step)
-  - [~] 로컬 학습(batch 4 × grad-accum 16, fp32, 4 epoch) → register(fp16·mps·task-head) → holdout freeze → qualify(Claude 일치율) → compare(english zero-shot 대비) → 조건 충족 시 promote·서버 재시작
+  - [x] 1차 로컬 학습(d3k, train 7,659, batch 4 × grad-accum 16, fp32, 4 epoch, 5,856s): MPS 캐시 누적으로 여유 메모리 8%까지 떨어져 한 번 중단 → optimizer step마다 캐시 해제(3d3dc4f) 후 0.76~0.8s/step 안정
+  - [x] 1차 후보 f15827a4… 평가: qualify 불합격. 원인 조사에서 평가기 결함 3건 발견·수정(102e300: score 질문이 연속 기댓값과 비교돼 항상 오답, --no-active-baseline 무시, 입력 거부 1건이 compare 전체 중단)과 후보 설정 기본값 누락(d5539b4, 실제 worker에서 즉시 LAYA_STARTUP_TIMEOUT)
+  - [x] 1차 후보 Claude 일치율(test 159문장): intent 0.72, difficulty 0.58(±1 0.84), risk 0.60 / train 부분집합: 0.99/0.92/0.95 → 과적합. train에 긴 문장이 558개(22%)뿐이던 것이 원인
+  - [x] Claude 자기 일치율(평가 300, 독립 2회): intent 0.977, difficulty 0.913, risk 0.940 — 목표 상한은 높다
+  - [x] 라벨링 에이전트가 긴 파일을 한 번에 출력해 잘린 텍스트로 판단한 사례 확인. 한 part 비교에서 부분 vs 전체 읽기 일치 intent 0.94 / difficulty 0.86 / risk 0.90. 평가 300은 전체 읽기로 재라벨링(1·2차 대비 difficulty 0.88~0.90, risk 0.92 일치), 학습 라벨은 잡음 감수(해당 part 30은 전체 읽기로 교체)
+  - [x] 2차 데이터: 새 긴 문장 1,800개(18개 새 도메인, sonnet 워커, 세션 한도로 13개 워커가 중간 종료됐으나 점검 통과분 사용) + Claude 학습 라벨. run d4 → dataset 30c025bc…: train 13,053 / calibration 423 / test 477 (평가 문장은 1차와 동일)
+  - [x] 학습 키트: epoch별 calibration 일치율로 최고 epoch 선택(5d57aa3), 자체 평가 label 키·정수 확률 오류 수정
+  - [~] 2차 로컬 학습(d4) → register → holdout freeze → qualify → compare(english 대비) → 조건 충족 시 promote·서버 재시작
 - [x] L5 Codex A/B 실측(B4) 후 owner 승인으로 Codex 관리 블록에서 spawn 전 route 안내 제거, hook 기록만 유지
 - [ ] L6 설치본 반영·문서·커밋
