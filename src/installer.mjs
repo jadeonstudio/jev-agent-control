@@ -72,15 +72,17 @@ function mdPatch(text, block, remove, recordedBlock) {
 }
 /** The one short managed instruction block the installer may append to a host's global instruction file. */
 export function instructionBlock(host) {
-  const roleHint = host === 'codex'
-    ? 'Codex 예: lightweight_worker/implementer/specialist/scout'
-    : 'Claude 예: lightweight-worker/implementer/specialist/scout';
-  return [BLOCK_BEGIN,
-    '## jev-agent-control (설치기 관리 블록)',
-    '- 작업자 역할(economy/standard/strong/scout)로 서브에이전트를 띄울 때 프롬프트 첫 줄에 `[jev scope=<local|cross-module|repository|unknown> complete=<yes|no> failures=<n>]`를 사실대로 적는다. 모르면 scope=unknown, complete=no. 이 줄이 있어야 hook이 역할·모델을 판단한다. (' + roleHint + ')',
+  const decide = '- 좁은 선택·재시도·에스컬레이션 판단은 `jev_decide`를 쓰고 `apply=true`일 때만 따른다. 가능하면 trace(task_id, snapshot_id)를 넘긴다.';
+  // codex-cli 0.154.0 hands hooks spawn_agent.message as an opaque token (measured 2026-09-23), so a Codex hook cannot
+  // read the task or a context line; Codex routing stays an explicit jev_route call before spawning.
+  const body = host === 'codex' ? [
+    '- 작업자 역할(lightweight_worker/implementer/specialist/scout)로 서브에이전트를 띄우기 전에 `jev_route`를 호출한다. `availableRoles`에는 실제 `~/.codex/agents/*.toml` 역할 이름을, context에는 사실대로의 범위·완결성·이전 실패를 넣는다. `apply=true`일 때만 `route.role`을 `agent_type`으로 쓰고, 아니면 원래 판단대로 띄운다.',
+    '- Codex hook은 spawn 메시지를 읽을 수 없어 역할을 대신 판단하지 않는다(기록만 한다). 사용자가 역할·모델을 지정했으면 그대로 둔다.',
+  ] : [
+    '- 작업자 역할(lightweight-worker/implementer/specialist/scout)로 서브에이전트를 띄울 때 프롬프트 첫 줄에 `[jev scope=<local|cross-module|repository|unknown> complete=<yes|no> failures=<n>]`를 사실대로 적는다. 모르면 scope=unknown, complete=no. 이 줄이 있어야 hook이 역할·모델을 판단한다.',
     '- 역할·모델 판단은 hook이 자동으로 처리한다. 사용자가 모델을 지정했으면 그대로 둔다.',
-    '- 좁은 선택·재시도·에스컬레이션 판단은 `jev_decide`를 쓰고 `apply=true`일 때만 따른다. 가능하면 trace(task_id, snapshot_id)를 넘긴다.',
-    BLOCK_END].join('\n');
+  ];
+  return [BLOCK_BEGIN, '## jev-agent-control (설치기 관리 블록)', ...body, decide, BLOCK_END].join('\n');
 }
 function hookCommand(cli, host, event, home) {
   return `${sh(process.execPath)} ${sh(cli)} hook --host ${sh(host)} --event ${sh(event)} --home ${sh(home)}`;

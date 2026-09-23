@@ -304,3 +304,15 @@ test('changing the managed matcher upgrades an existing owned group in place', t
   assert.notEqual(JSON.parse(fs.readFileSync(file, 'utf8')).hooks.PreToolUse.at(-1).matcher, 'Agent');
   assert.equal(JSON.parse(fs.readFileSync(file, 'utf8')).hooks.PreToolUse.length, 1);
 });
+
+test('instruction blocks match what each host hook can actually see', t => {
+  const f = setup(t);
+  f.install({ hooks: true });
+  const codexBlock = fs.readFileSync(codexAgents(f.env), 'utf8');
+  const claudeBlock = fs.readFileSync(claudeMd(f.user), 'utf8');
+  // codex-cli 0.154.0 hands hooks an opaque spawn message, so Codex must call jev_route itself before spawning.
+  assert.match(codexBlock, /jev_route/);
+  assert.match(codexBlock, /agent_type/);
+  assert.doesNotMatch(codexBlock, /\[jev scope=/);
+  assert.match(claudeBlock, /\[jev scope=/);
+});

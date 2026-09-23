@@ -106,7 +106,10 @@ owner가 개정을 승인했다. P0 커밋에서 `AGENTS.md`를 개정했다: �
       ① matcher `Agent`는 0.154.0에서 `spawn_agent`에 발화하지 않았다(공식 문서의 별칭 서술과 다름) → `Agent|.*spawn_agent.*`(e91594f), owner 재승인.
       ② 실제 PreToolUse `tool_name`은 `agentsspawn_agent`(구분자 없는 네임스페이스)였다. 새 진단 기록(a5e9324)이 `INVALID_HOOK_INPUT tool_name=agentsspawn_agent`로 드러냄 → 인식 수정(3b7975e).
       최종 확인: pre-spawn(`lightweight_worker` 인식 → `NO_CONTEXT_ANNOTATION`), subagent-start(`NO_PENDING_MATCH`), subagent-stop(`NO_LINKED_DECISION`) 각 약 1ms, TypeSafe 호출 0, 확인 후 global OFF.
-    - 아직 네이티브로 확인하지 않은 것: 맥락 표시가 있는 spawn의 실제 route·SHADOW 기록·ON 재작성, Codex pending 연결, Claude post-spawn의 `agentId` 추출. 모두 TypeSafe 호출이 필요해 P4 SHADOW 승인 뒤 확인한다.
+    - P4 SHADOW 시작 후 route 경로 네이티브 확인(2026-09-23, owner 승인):
+      - Claude(동작 검증됨): 맥락 표시가 있는 `implementer` spawn → TypeSafe 1회(0.71초) → `UNCERTAIN_DIMENSIONS`(추천 없음) → post-spawn `LINKED`(agentId 추출) → subagent-stop `RECORDED`(host_review). 비용 $0.209.
+      - Codex(불가 확정): 0.154.0은 hook에 `spawn_agent.message`를 불투명 토큰(`gAAAA…`)으로 넘긴다. 새 진단 `prompt_form:'opaque'`로 확인(9c90627). Codex hook은 작업 내용·맥락 표시를 읽을 수 없어 역할을 판단하지 않는다. Codex G1은 관리 블록 안내대로 spawn 전 `jev_route` 명시 호출로만 가능하고(기억 의존), hook은 SubagentStart/Stop 기록과 역할 분포만 담당한다. Codex 관리 블록 문구를 이 사실에 맞게 바꿨다.
+      - 아직 미확인: ON 재작성(Claude), Codex pending 연결(Codex route가 hook에서 일어나지 않으므로 해당 없음).
     - 한계: hook 명령과 기존 MCP 설정 모두 Homebrew 버전 경로 node(`/opt/homebrew/Cellar/node/26.5.0_1/bin/node`)를 쓴다. `brew upgrade node` 후에는 재설치가 필요하다.
   - **데이터 외부 전송**: provider가 jev이면 hook이 route할 때 spawn description+프롬프트 앞부분(최대 8000바이트)이 TypeSafe로 전송된다. 기존 비밀값 검사(best-effort)는 그대로 적용된다. provider가 laya이면 로컬에서 끝난다. P3b 적용 승인과 P4 SHADOW 승인 때 owner에게 이 전송을 명시한다.
 - installer `--hooks`: 소유 표식 항목만 추가·제거, 기존 hook 순서·내용 보존, 충돌 시 실패, dry-run diff.
@@ -117,7 +120,7 @@ owner가 개정을 승인했다. P0 커밋에서 `AGENTS.md`를 개정했다: �
 - Claude MCP·스킬 `install --target claude`, 새 세션에서 `jev_agent_control` 노출 확인.
 - acceptance: 두 호스트 dry-run → 승인 → 적용 → 새 세션 hook 발화·기록 확인 → uninstall 원복 → 재적용. 기존 hook 해시 보존.
 
-### P4. SHADOW 운영과 측정 — 측정 코드 국소 검증됨(a0b2162), SHADOW 운영은 owner 승인 대기
+### P4. SHADOW 운영과 측정 — SHADOW 운영 중(2026-09-23 owner 승인, global SHADOW·router on·Claude profile 추가), ON 기준 미충족(표본 수집 중)
 - ON 전환 기준(사전 등록, 2026-09-23). SHADOW는 추천을 적용하지 않으므로 "추천을 따랐을 때의 결과"를 직접 관측할 수 없다. 이 한계를 전제로, 아래를 모두 만족할 때만 owner에게 ON을 제안한다. 전환 결정은 owner가 한다.
   1. 표본: 호스트별로 route 추천이 나온 pre-spawn이 100건 이상이다(`metrics.hooks.recommendations`).
   2. 불일치 검토: 추천 역할이 실제 역할보다 약한(하향) 불일치 중 30건 이상을 사람 교정(`training correct`)이나 사전 등록 runner 결과로 검토했고, 그중 "추천 역할로 충분했다"는 판정이 90% 이상이다. 30건 미만이면 판단하지 않는다(UNKNOWN).
@@ -152,6 +155,7 @@ owner가 개정을 승인했다. P0 커밋에서 `AGENTS.md`를 개정했다: �
 | 2026-09-23 | Claude 설치 방식 | 결정: `--no-skills`로 MCP·hook·블록만 설치(claude-forge 저장소에 쓰지 않음) |
 | 2026-09-23 | 네이티브 발화 확인 | 승인: 맥락 표시 없는 spawn으로 잠깐 SHADOW 확인 후 OFF 복귀 |
 | 2026-09-23 | Codex matcher 변경 | 승인: `Agent|.*spawn_agent.*`로 재설치, owner `/hooks` 재승인 |
+| 2026-09-23 | P4 SHADOW 시작 | 승인: global SHADOW, `policy roles --host claude`로 실제 features.json에 Claude profile 추가, 맥락 표시 spawn route 네이티브 확인 |
 | 2026-09-23 | 단계 연속 진행 | 승인: P0→P6 연속. 전역 설정 쓰기·과금 호출·SHADOW/ON 전환·클라우드 학습은 게이트에서 멈춤 |
 
 ## 실측 기록
