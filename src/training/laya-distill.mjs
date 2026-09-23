@@ -90,6 +90,20 @@ function detectLang(s) { return /[가-힣]/.test(s) ? 'ko' : 'en'; }
 function buildTaskRequest(task) {
   return { purpose: 'route', risk: 'routine', state: { task, context: structuredClone(FIXED_ROUTE_CONTEXT) }, questions: structuredClone(ROUTE_QUESTIONS) };
 }
+// Shared sensitive-content screen used at both import time (distillImport/distillImportShadow) and
+// build time (buildDistillDataset), so the two stages never disagree about what "sensitive" means
+// (2026-09-23 bug fix: `distillImport` screened with only `containsSensitiveData`, which misses
+// emails/phones/RRNs that `safeContent`'s stricter regexes catch, so a task could import clean and
+// then fail the WHOLE build later). Runs the exact `safeContent` check `buildDistillDataset` already
+// applies to the final sample's `state`, against the same `{ task, context: FIXED_ROUTE_CONTEXT }`
+// shape, and returns the thrown error (or null if the state is clean) instead of throwing itself, so
+// callers can decide whether a given failure means "skip as sensitive" or "fail loudly" (a genuine
+// schema bug, e.g. TRAINING_SENSITIVE_OR_OVERSIZED's oversize/forbidden-key checks misfiring, must
+// never be swallowed as if the content were merely sensitive).
+function screenTaskState(taskText) {
+  try { safeContent({ state: { task: taskText, context: FIXED_ROUTE_CONTEXT } }); return null; }
+  catch (e) { return e; }
+}
 
 // --- import ---------------------------------------------------------------
 export function distillImport(home, { run, inputFile, readFileImpl = (f) => fs.readFileSync(f, 'utf8') } = {}) {
@@ -122,7 +136,10 @@ export function distillImport(home, { run, inputFile, readFileImpl = (f) => fs.r
       // Short synthetic augmentation items can be marked reviewable:false so the human-reviewed
       // calibration/test set reflects realistic long agent prompts; they only ever ground train.
       if (parsed.reviewable !== undefined && typeof parsed.reviewable !== 'boolean') fail('INVALID_DISTILL_TASK_LINE');
-      if (containsSensitiveData(parsed)) { skippedSensitive++; continue; }
+      // Skip as sensitive on EITHER screen: containsSensitiveData (credential-shaped patterns) or the
+      // stricter safeContent screen (also emails/phones/RRNs/key-prefixes), so an import-time skip
+      // always matches what buildDistillDataset would later accept for this same task.
+      if (containsSensitiveData(parsed) || screenTaskState(parsed.task)) { skippedSensitive++; continue; }
       const normalized = normalizeTaskText(parsed.task);
       const task_id = digest({ lang: parsed.lang, text: normalized });
       if (seen.has(task_id)) { skippedDuplicate++; continue; }
@@ -149,7 +166,7 @@ export function distillImportShadow(home, { run, trainingStore } = {}) {
       scannedDecisions++;
       const task = e.data.request.state?.task;
       if (typeof task !== 'string' || !task.trim()) continue;
-      if (containsSensitiveData({ task })) { skippedSensitive++; continue; }
+      if (containsSensitiveData({ task }) || screenTaskState(task)) { skippedSensitive++; continue; }
       const lang = detectLang(task);
       const task_id = digest({ lang, text: normalizeTaskText(task) });
       if (seen.has(task_id)) { skippedDuplicate++; continue; }
@@ -404,8 +421,17 @@ export function buildDistillDataset(home, { run, trainingStore } = {}) {
       const ref = referenceById.get(task.task_id);
       if (ref && ref.role === 'eval') reviewedGroupKeys.add(task.group ?? task.task_id);
     }
-    let excludedGroupLeak = 0;
+    let excludedGroupLeak = 0, excludedUnsafe = 0;
     for (const task of [...tasks].sort((a, b) => a.task_id.localeCompare(b.task_id))) {
+      // Re-run the same screen distillImport/distillImportShadow apply at import time, so a task
+      // that slipped past an older/weaker import screen (pre-fix data) never fails the WHOLE build —
+      // it is excluded on its own (no samples for ANY of its questions) and counted, never thrown.
+      // A non-sensitivity failure (a genuine schema bug) still fails loudly.
+      const screenErr = screenTaskState(task.task);
+      if (screenErr) {
+        if (errorCode(screenErr) !== 'TRAINING_SENSITIVE_OR_OVERSIZED') throw screenErr;
+        excludedUnsafe++; continue;
+      }
       const teacher = teacherById.get(task.task_id);
       const reviewed = reviewById.get(task.task_id);
       const reference = referenceById.get(task.task_id);
@@ -469,7 +495,7 @@ export function buildDistillDataset(home, { run, trainingStore } = {}) {
     const data = samples.map(encode).join('\n') + (samples.length ? '\n' : '');
     const data_sha256 = digest(data);
     const version = digest({ kind: 'distill', run, data_sha256 });
-    const counts = { split: {}, lang: {}, label_source: {}, label_source_by_split: {}, excluded_group_leak: excludedGroupLeak };
+    const counts = { split: {}, lang: {}, label_source: {}, label_source_by_split: {}, excluded_group_leak: excludedGroupLeak, excluded_unsafe: excludedUnsafe };
     for (const s of samples) {
       counts.split[s.split] = (counts.split[s.split] ?? 0) + 1;
       counts.label_source[s.label_source] = (counts.label_source[s.label_source] ?? 0) + 1;

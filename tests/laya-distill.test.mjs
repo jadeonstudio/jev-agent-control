@@ -78,6 +78,21 @@ test('distill import validates schema, screens sensitive lines, and deduplicates
   assert.match(lines[0].task_id, /^[0-9a-f]{64}$/);
 });
 
+test('distill import skips a task containing an example email address, even though containsSensitiveData alone would not catch it (safeContent shares the screen with buildDistillDataset)', t => {
+  const home = fixture(t);
+  const file = writeInputFile(t, [
+    { lang: 'en', task: 'Escalate this to test@company.com if the router keeps failing' }, // email: containsSensitiveData misses it, safeContent does not
+    { lang: 'en', task: 'Add a retry to the fetch call' },
+  ]);
+  const r = distillImport(home, { run: 'run1', inputFile: file });
+  assert.equal(r.total, 2);
+  assert.equal(r.added, 1);
+  assert.equal(r.skippedSensitive, 1);
+  const lines = fs.readFileSync(path.join(runDir(home, 'run1'), 'tasks.jsonl'), 'utf8').trim().split('\n').map(JSON.parse);
+  assert.equal(lines.length, 1);
+  assert.ok(!lines.some(l => l.task.includes('test@company.com')));
+});
+
 test('distill import rejects malformed lines and out-of-range language/length', t => {
   const home = fixture(t);
   assert.throws(() => distillImport(home, { run: 'run1', inputFile: writeInputFile(t, [{ lang: 'fr', task: 'x' }]) }), /INVALID_DISTILL_TASK_LINE/);
@@ -558,6 +573,25 @@ test('build is idempotent and writes into the shared training store root usable 
   assert.ok(holdout.sample_count >= 0);
   const laya = exportDataset(store, first.dataset_version, 'laya');
   assert.equal(laya.dataset_version, first.dataset_version);
+});
+
+test('build excludes a task whose state fails the shared safe-content screen instead of failing the whole build, and reports it in counts.excluded_unsafe', async t => {
+  const home = fixture(t);
+  distillImport(home, { run: 'run1', inputFile: writeInputFile(t, [{ lang: 'en', task: 'Add a retry to the fetch call' }]) });
+  // Simulate pre-fix data: a task that slipped past an older/weaker import screen and landed in
+  // tasks.jsonl directly (distillImport itself now blocks this — see the import test above).
+  const dir = runDir(home, 'run1');
+  const unsafeTask = { task_id: digest({ lang: 'en', text: 'Escalate to test@company.com about the outage' }), lang: 'en', domain: null,
+    task: 'Escalate to test@company.com about the outage', group: null, reviewable: true, source: 'synthetic', egress: 'allowed', added_at: new Date().toISOString() };
+  fs.appendFileSync(path.join(dir, 'tasks.jsonl'), JSON.stringify(unsafeTask) + '\n');
+  await distillLabel(home, { run: 'run1', confirmEgress: true, key: 'k', provider: async () => teacherRaw('jev-1.13.0'), sleepImpl: async () => {} });
+  const built = buildDistillDataset(home, { run: 'run1' }); // must not throw TRAINING_SENSITIVE_OR_OVERSIZED for the whole build
+  const store = createTrainingStore({ home });
+  const { samples } = readDataset(store, built.dataset_version);
+  assert.ok(samples.length > 0);
+  assert.ok(!samples.some(s => s.raw_refs.distill.task_id === unsafeTask.task_id)); // no samples for the unsafe task at all
+  const manifest = JSON.parse(fs.readFileSync(built.manifest, 'utf8'));
+  assert.equal(manifest.counts.excluded_unsafe, 1);
 });
 
 test('distill status reports counts only, never task content', async t => {
