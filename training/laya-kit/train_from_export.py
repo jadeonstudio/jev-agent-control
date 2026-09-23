@@ -137,6 +137,128 @@ def verify_export_manifest(export_dir: Path) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# jev-change: copied verbatim from workers/laya_worker.py (this kit must stay
+# standalone for Kaggle, so it cannot import that module). `fit_task_head()`
+# is the same opt-in "task-head fit" the inference worker applies when
+# `providers.json` sets `laya.inputFit: 'task-head'` -- see
+# docs/TRAINING_DATA.md section 7 and workers/laya_worker.py. Applying the
+# IDENTICAL fit here, before building each training item, keeps train-time
+# preprocessing consistent with what inference actually sends when a
+# checkpoint is registered with that opt-in; tests/test_laya_kit_input_fit.py
+# asserts both copies produce identical output on synthetic cases.
+# ---------------------------------------------------------------------------
+def assert_lossless(agent, state, questions):
+    from laya.common import render_options, serialize_state, build_sequence
+    tok = agent.tok
+    max_len, head_max = agent.cfg.get("max_len", 512), agent.cfg.get("head_max_len", 192)
+    for question in questions.values():
+        q = agent._to_internal(question)
+        fields = [q["ins"], serialize_state(state), *render_options(q)]
+        if any(tok.mask_token in value for value in fields):
+            raise ValueError("INPUT_REWRITE_REFUSED")
+        head = tok("%s question: %s" % (q["t"], q["ins"]), add_special_tokens=False)["input_ids"]
+        options = [tok(" " + option, add_special_tokens=False)["input_ids"] for option in render_options(q)]
+        if any(len(option) > 48 for option in options):
+            raise ValueError("INPUT_TRUNCATED")
+        budget = head_max - sum(len(option) + 1 for option in options)
+        state_tokens = tok(serialize_state(state), add_special_tokens=False)["input_ids"]
+        expected = len(head) + sum(len(option) + 1 for option in options) + len(state_tokens) + 4
+        if budget < 16 or len(head) > max(8, budget) or expected > max_len:
+            raise ValueError("INPUT_TRUNCATED")
+        sequence, markers = build_sequence(tok, state, q, max_len, head_max)
+        if len(sequence) != expected or len(markers) != len(options):
+            raise ValueError("INPUT_TRUNCATED")
+
+TRUNCATION_MARK = " …[truncated]"
+
+def fit_task_head(agent, state, questions):
+    """Default lossless refusal stays the behavior of assert_lossless(); this is the opt-in path
+    (see providers.json `laya.inputFit`) that instead finds the longest character prefix of
+    state["task"] that still fits ALL given questions losslessly, leaving every other state key
+    (context) untouched. Never truncates questions/instructions/options. Correctness is always
+    verified by assert_lossless before returning; token-based estimation below only narrows the
+    search window, it never decides the final answer.
+    """
+    try:
+        assert_lossless(agent, state, questions)
+        return state, {"truncated": False}
+    except ValueError as e:
+        original_error = e
+    if str(original_error) == "INPUT_REWRITE_REFUSED" or not (isinstance(state, dict) and isinstance(state.get("task"), str)):
+        raise original_error
+    task = state["task"]
+    original_chars = len(task)
+
+    def candidate(p):
+        return {**state, "task": task[:p].rstrip() + TRUNCATION_MARK}
+
+    def fits(p):
+        try:
+            assert_lossless(agent, candidate(p), questions)
+            return True
+        except ValueError:
+            return False
+
+    # Narrow with a cheap analytic token-budget estimate before a short gallop+binary search. Each
+    # fits() probe below re-runs assert_lossless() in full (head/options/state tokenize +
+    # build_sequence), which is by far the most expensive step, so the estimate's job is to make
+    # that search cover only a handful of characters instead of the whole task -- it is never
+    # itself the answer, and fits(0) is always reached as a real probe below (never skipped), so
+    # "no prefix passes" is still detected and raises the original error, exactly as before.
+    try:
+        from laya.common import render_options, serialize_state
+        tok, max_len = agent.tok, agent.cfg.get("max_len", 512)
+        min_state_budget = None
+        for question in questions.values():
+            q = agent._to_internal(question)
+            head = tok("%s question: %s" % (q["t"], q["ins"]), add_special_tokens=False)["input_ids"]
+            options = [tok(" " + option, add_special_tokens=False)["input_ids"] for option in render_options(q)]
+            state_budget = max_len - len(head) - sum(len(o) + 1 for o in options) - 4
+            min_state_budget = state_budget if min_state_budget is None else min(min_state_budget, state_budget)
+        base_tokens = len(tok(serialize_state(candidate(0)), add_special_tokens=False)["input_ids"])
+        task_tokens = max(1, len(tok(task, add_special_tokens=False)["input_ids"]))
+        chars_per_token = original_chars / task_tokens
+        remaining_tokens = max(0, min_state_budget - base_tokens)
+        guess = min(original_chars, max(0, int(remaining_tokens * chars_per_token)))
+    except Exception:
+        guess = 0
+
+    # Gallop out from the guess (doubling step) to bracket the true boundary in a few probes, then
+    # binary search only that small bracket -- not the whole [0, original_chars] range, which is
+    # what made an unbracketed binary search from a lone guess cost extra probes in practice.
+    if fits(guess):
+        lo, hi, probe, step = guess, original_chars, guess, 1
+        while probe < hi:
+            probe = min(hi, probe + step)
+            if fits(probe):
+                lo = probe
+                step *= 2
+            else:
+                hi = probe
+                break
+    else:
+        hi, probe, step, lo = guess, guess, 1, None
+        while True:
+            probe = max(0, probe - step)
+            if fits(probe):
+                lo = probe
+                break
+            hi = probe
+            if probe == 0:
+                break
+            step *= 2
+        if lo is None:
+            raise original_error
+    while lo < hi:
+        mid = (lo + hi + 1) // 2
+        if fits(mid):
+            lo = mid
+        else:
+            hi = mid - 1
+    return candidate(lo), {"truncated": True, "original_chars": original_chars, "kept_chars": lo}
+
+
+# ---------------------------------------------------------------------------
 # official-notebook-cell: 3 ("Download & Preprocess Data for DDP")
 # jev-change: `ds_train = load_dataset("LocalLLaMA/typed-decisions", ...)` is
 # replaced by reading the local export split files via the manifest's own
@@ -175,25 +297,46 @@ def build_training_item(tok, cfg, state, q, gold_q, render_options, build_sequen
     }, False
 
 
-def preprocess_split(rows, tok, cfg, render_options, build_sequence, QTYPES):
-    """official-notebook-cell: 3 inner loop, generalized to any split's rows."""
+def preprocess_split(rows, tok, cfg, render_options, build_sequence, QTYPES, agent):
+    """official-notebook-cell: 3 inner loop, generalized to any split's rows.
+
+    jev-change: before building any question's training item for a row, the row's state is passed
+    through fit_task_head() using ALL of that row's own questions (the same question set the
+    export groups gold by, per state) -- the identical fit workers/laya_worker.py applies at
+    inference when `providers.json` sets `laya.inputFit: 'task-head'`. Only state["task"] is ever
+    shortened; every other state key, and every question/instructions/option, is untouched. The
+    existing marker-loss drop (`build_training_item`'s own truncation check) still applies
+    afterward, on the fitted state.
+    """
     items = []
     truncated = 0
     total_questions = 0
+    input_fit_truncated_states = 0
     for row in rows:
         state = json.loads(row["state"])
         questions = json.loads(row["questions"])
         gold = json.loads(row["gold"])
+        try:
+            fitted_state, fit_info = fit_task_head(agent, state, questions)
+        except ValueError:
+            # Neither the raw state nor any task prefix fits (e.g. context/questions alone
+            # overflow): every question of this row is dropped the same way a marker-loss would be.
+            truncated += len(questions)
+            total_questions += len(questions)
+            continue
+        if fit_info["truncated"]:
+            input_fit_truncated_states += 1
         for qid, q in questions.items():
             if qid not in gold:
                 continue
             total_questions += 1
-            item, was_truncated = build_training_item(tok, cfg, state, q, gold[qid], render_options, build_sequence, QTYPES)
+            item, was_truncated = build_training_item(tok, cfg, fitted_state, q, gold[qid], render_options, build_sequence, QTYPES)
             if was_truncated:
                 truncated += 1
                 continue
             if item is not None:
                 items.append(item)
+    print(f"[input-fit] {input_fit_truncated_states} states task-head truncated")
     return items, truncated, total_questions
 
 
@@ -609,6 +752,11 @@ def main():
     tok = AutoTokenizer = __import__("transformers").AutoTokenizer.from_pretrained(os.path.join(model_dir, "tokenizer"))
     with open(os.path.join(model_dir, "rl_agent_config.json")) as f:
         cfg = json.load(f)
+    # jev-change: a minimal agent-shaped object exposing only what fit_task_head()/assert_lossless()
+    # read (tok, cfg, ._to_internal) -- the same pattern scripts/laya-budget.py's Shim uses, since
+    # the notebook's training path never constructs a real laya.agent.Agent.
+    import types as _types
+    agent_shim = _types.SimpleNamespace(tok=tok, cfg=cfg, _to_internal=laya_module.agent.Agent._to_internal)
 
     # official-notebook-cell: 3, jev-change described at module top: read the
     # export split files via the manifest's own recorded loader instead of
@@ -622,8 +770,8 @@ def main():
         },
     )
 
-    train_items, train_truncated, train_total = preprocess_split(dataset["train"], tok, cfg, render_options, build_sequence, QTYPES)
-    calib_items, calib_truncated, calib_total = preprocess_split(dataset["validation"], tok, cfg, render_options, build_sequence, QTYPES)
+    train_items, train_truncated, train_total = preprocess_split(dataset["train"], tok, cfg, render_options, build_sequence, QTYPES, agent_shim)
+    calib_items, calib_truncated, calib_total = preprocess_split(dataset["validation"], tok, cfg, render_options, build_sequence, QTYPES, agent_shim)
 
     if not args.skip_admission_check:
         check_tokenizer_admission(train_truncated + calib_truncated, train_total + calib_total, args.max_truncated_fraction, args.allow_truncation)

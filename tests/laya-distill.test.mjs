@@ -81,8 +81,24 @@ test('distill import rejects malformed lines and out-of-range language/length', 
   const home = fixture(t);
   assert.throws(() => distillImport(home, { run: 'run1', inputFile: writeInputFile(t, [{ lang: 'fr', task: 'x' }]) }), /INVALID_DISTILL_TASK_LINE/);
   assert.throws(() => distillImport(home, { run: 'run1', inputFile: writeInputFile(t, [{ lang: 'en', task: '' }]) }), /INVALID_DISTILL_TASK_LINE/);
-  assert.throws(() => distillImport(home, { run: 'run1', inputFile: writeInputFile(t, [{ lang: 'en', task: 'x'.repeat(2001) }]) }), /INVALID_DISTILL_TASK_LINE/);
   assert.throws(() => distillImport(home, { run: 'not a valid run name', inputFile: writeInputFile(t, [{ lang: 'en', task: 'x' }]) }), /INVALID_DISTILL_RUN/);
+});
+
+test('distill import uses a UTF-8 byte limit of 8000 (matching the hook truncateUtf8 cap), not a character count', t => {
+  const home = fixture(t);
+  // Long owner-authored Korean prompts (~2,500 chars) are well over the old 2000-char cap but
+  // comfortably under 8000 bytes; the hook (src/hooks.mjs truncateUtf8) uses the same 8000-byte cap.
+  const koreanTask = '작업 지시문 한국어 문장입니다. '.repeat(150).trim().slice(0, 2500);
+  assert.ok(Buffer.byteLength(koreanTask) > 2000 && Buffer.byteLength(koreanTask) <= 8000);
+  const r = distillImport(home, { run: 'run1', inputFile: writeInputFile(t, [{ lang: 'ko', task: koreanTask }]) });
+  assert.equal(r.added, 1);
+  const asciiUnder = 'x'.repeat(2001); // over the OLD char cap, well under the new byte cap
+  const r2 = distillImport(home, { run: 'run2', inputFile: writeInputFile(t, [{ lang: 'en', task: asciiUnder }]) });
+  assert.equal(r2.added, 1);
+  const overByteLimit = 'x'.repeat(8001);
+  assert.throws(() => distillImport(home, { run: 'run3', inputFile: writeInputFile(t, [{ lang: 'en', task: overByteLimit }]) }), /INVALID_DISTILL_TASK_LINE/);
+  const koreanOverByteLimit = '작업'.repeat(3000); // multi-byte chars pushing well past 8000 bytes
+  assert.throws(() => distillImport(home, { run: 'run4', inputFile: writeInputFile(t, [{ lang: 'ko', task: koreanOverByteLimit }]) }), /INVALID_DISTILL_TASK_LINE/);
 });
 
 test('distill import-shadow pulls captured route task text with forbidden egress and skips non-route captures', t => {
@@ -187,6 +203,71 @@ test('distill label resumes a failed task on the next run without re-attempting 
   const status = distillStatus(home, { run: 'run1' });
   assert.equal(status.teacher_labels, 1);
   assert.equal(status.teacher_label_failures, 1);
+});
+
+test('distill label stops the batch after 5 consecutive failures, keeps already-recorded results, and reports abortReason', async t => {
+  const home = fixture(t);
+  const lines = Array.from({ length: 8 }, (_, i) => ({ lang: 'en', task: `task ${i}` }));
+  distillImport(home, { run: 'run1', inputFile: writeInputFile(t, lines) });
+  let call = 0;
+  // succeeds twice, then fails 5 times in a row (>= the breaker threshold), then would succeed again
+  const provider = async () => {
+    call++;
+    if (call <= 2 || call > 7) return teacherRaw('jev-1.13.0');
+    throw new Error('PROVIDER_DOWN');
+  };
+  const r = await distillLabel(home, { run: 'run1', confirmEgress: true, key: 'k', provider, sleepImpl: async () => {} });
+  assert.equal(r.aborted, true);
+  assert.ok(r.abortReason);
+  assert.equal(r.succeeded, 2);
+  assert.equal(r.failed, 5);
+  assert.equal(r.attempted, 7); // stopped after the 5th consecutive failure, task 8 never attempted
+  const status = distillStatus(home, { run: 'run1' });
+  assert.equal(status.teacher_labels, 2); // already-recorded successes are preserved
+  assert.equal(status.teacher_label_failures, 5);
+  // rerun resumes: the 2 succeeded tasks are skipped, the 5 failed + 1 never-attempted are retried
+  const r2 = await distillLabel(home, { run: 'run1', confirmEgress: true, key: 'k', provider: async () => teacherRaw('jev-1.13.0'), sleepImpl: async () => {} });
+  assert.equal(r2.eligible, 6);
+  assert.equal(r2.succeeded, 6);
+  assert.equal(r2.aborted, false);
+});
+
+test('distill label does not abort when failures are not consecutive (a success resets the streak)', async t => {
+  const home = fixture(t);
+  const lines = Array.from({ length: 6 }, (_, i) => ({ lang: 'en', task: `task ${i}` }));
+  distillImport(home, { run: 'run1', inputFile: writeInputFile(t, lines) });
+  let call = 0;
+  const provider = async () => {
+    call++;
+    if (call % 2 === 0) throw new Error('boom'); // fails on even calls, succeeds on odd: never 5 in a row
+    return teacherRaw('jev-1.13.0');
+  };
+  const r = await distillLabel(home, { run: 'run1', confirmEgress: true, key: 'k', provider, sleepImpl: async () => {} });
+  assert.equal(r.aborted, false);
+  assert.equal(r.abortReason, null);
+  assert.equal(r.attempted, 6);
+});
+
+test('two concurrent distill label runs on the same run do not both call the teacher', async t => {
+  const home = fixture(t);
+  const lines = Array.from({ length: 4 }, (_, i) => ({ lang: 'en', task: `task ${i}` }));
+  distillImport(home, { run: 'run1', inputFile: writeInputFile(t, lines) });
+  let inFlight = 0, maxInFlight = 0;
+  const provider = async () => {
+    inFlight++; maxInFlight = Math.max(maxInFlight, inFlight);
+    await new Promise(resolve => setTimeout(resolve, 10));
+    inFlight--;
+    return teacherRaw('jev-1.13.0');
+  };
+  const run = () => distillLabel(home, { run: 'run1', confirmEgress: true, key: 'k', provider, sleepImpl: async () => {} });
+  const [a, b] = await Promise.allSettled([run(), run()]);
+  const outcomes = [a, b];
+  const rejected = outcomes.filter(o => o.status === 'rejected');
+  const fulfilled = outcomes.filter(o => o.status === 'fulfilled');
+  assert.equal(rejected.length, 1); // the second concurrent run is refused, not silently interleaved
+  assert.match(rejected[0].reason.message, /DISTILL_LOCKED/);
+  assert.equal(fulfilled.length, 1);
+  assert.equal(maxInFlight, 1); // the teacher is never called from two runs at once
 });
 
 // ============================== review ==============================

@@ -83,9 +83,15 @@ jev-control dataset export --version <hash> --format laya
    ```
    - export manifest의 `exporter_version`/`upstream_contract`/`loader`/`source_data_sha256`가
      이 스크립트가 기대하는 값과 다르면 학습 전에 중단한다.
+   - 각 row를 전처리하기 전, `workers/laya_worker.py`에서 byte-identical하게 복사한
+     `fit_task_head()`가 그 row의 `state.task`만 최장 prefix + `" …[truncated]"` marker로
+     줄여(다른 state 키·질문은 그대로) 실제 추론이 `laya.inputFit:'task-head'`로 받는 입력과
+     동일한 형태를 train에도 준다. 로그의 `[input-fit] N states task-head truncated`가 잘린
+     state 수다. 자세한 내용은 `docs/TRAINING_DATA.md` §7.
    - tokenizer admission(잘림) 검사가 먼저 실행되며, 잘리는 행 비율이
      `--max-truncated-fraction`(기본 2%)을 넘으면 중단한다. 강제로 진행하려면
-     `--allow-truncation`.
+     `--allow-truncation`. (이 검사는 `fit_task_head`가 손대지 못하는 나머지 truncation —
+     질문/옵션이 너무 크거나 fit할 prefix가 전혀 없는 행 — 을 여전히 잡아낸다.)
    - 매니페스트/토크나이저 검사만 먼저 확인하고 싶으면 `--dry-run`(torchrun을 실행하지
      않음).
 

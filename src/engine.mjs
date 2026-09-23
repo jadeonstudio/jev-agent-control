@@ -135,7 +135,8 @@ export function createDecisionEngine({ home = resolveHome(), env = process.env, 
           captureStored: result.trainingCapture?.stored ?? null, captureReason: result.trainingCapture?.reason ?? null,
           provider: result.provider ?? null, model: result.model ?? null, purpose: request?.purpose ?? 'unknown',
           reason: result.reason, apply: result.apply, eligible, inputBytes, questionCount: request ? Object.keys(request.questions).length : 0,
-          networkCalls: result.networkCalls, inferenceCalls: result.inferenceCalls, elapsedMs: result.elapsedMs, usage: result.usage });
+          networkCalls: result.networkCalls, inferenceCalls: result.inferenceCalls, elapsedMs: result.elapsedMs, usage: result.usage,
+          inputFitTruncated: Boolean(normalized?.inputFit?.truncated) });
       }
     }
     return result;

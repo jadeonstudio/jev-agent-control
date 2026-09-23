@@ -220,6 +220,19 @@ review.jsonl            {task_id, labels:{intent,difficulty,risk}, reviewer:'hum
 
 **한계.** teacher 자체 오류가 train 라벨에 그대로 들어간다 — 이는 설계상 감수하는 트레이드오프이며, 그래서 calibration/test/holdout을 teacher와 독립된 사람 검수로만 고정했다. `laya qualify`의 자격 판정은 항상 이 사람 검수 split만 보므로, 자격 있는 checkpoint의 판단 신뢰도는 teacher 품질이 아니라 사람 검수 결과에 근거한다.
 
+**teacher는 전체 task를, student는 동일한 규칙으로 head-fit된 task를 본다.** teacher(Jev/TypeSafe)는 B7이 측정한 로컬 tokenizer 예산과 무관하게 합성 task 문장 전체를 받는다. student(Laya)는 학습 때든 실제 추론 때든 같은 무손실 예산 제약을 받는다 — 이 불일치를 줄이기 위해 `workers/laya_worker.py`의 `fit_task_head(agent, state, questions)`가 `assert_lossless()`가 통과하지 않을 때만 발동하는 opt-in 경로를 추가했다: `state["task"]`의 **가장 긴 prefix**(다른 state 키·질문·지시문·선택지는 전혀 건드리지 않음)를 찾아 그 뒤에 고정 marker `" …[truncated]"`(`TRUNCATION_MARK`)를 붙이고, 그 결과가 다시 `assert_lossless()`를 통과하는지 검증한다. 어떤 prefix도 통과하지 못하면(예: context/질문 자체가 이미 예산을 넘거나 mask token이 섞였으면) 기존과 동일하게 거부한다. 이 경로는 `providers.json`의 `laya.inputFit`(기본 `'lossless'`, `register --input-fit lossless|task-head`로 checkpoint 등록 시 고정 — precision과 동일한 취급)이 `'task-head'`일 때만 켜진다. **training 저장 스키마(`src/training/schema.mjs` `validateProvenance`)는 provenance의 모든 필드가 문자열이어야 하므로, worker 응답의 `input_fit:{truncated, original_chars, kept_chars}`(문장 없이 숫자만, 정수 검증 실패 시 `{truncated:false}`로 취급)는 provenance 안이 아니라 정규화된 결과의 별도 `inputFit` 필드로만 남는다.** 그 대신 provenance의 `preprocessing_version`이 모드를 문자열로 나타낸다 — lossless는 `official-laya-0.3.4-lossless-v1`, task-head는 `official-laya-0.3.4-task-head-v1`(둘 다 `settings.laya.inputFit`이 결정하는 **설정된 모드**이며 그 요청이 실제로 잘렸는지는 반영하지 않는다). `jev-control metrics`(`providerActivity.laya.routeInputFitTruncated`)는 route purpose 한정으로, 엔진 텔레메트리가 요청마다의 `inputFit.truncated`를 읽어 집계한다.
+
+**train 전처리도 동일한 fit을 identical하게 적용한다.** `training/laya-kit/train_from_export.py`는 standalone Kaggle kit이라 `workers/laya_worker.py`를 import할 수 없으므로, `fit_task_head()`/`assert_lossless()`를 그대로(byte-identical) 복사해 갖고 있다 — `tests/test_laya_kit_input_fit.py`가 두 사본이 여러 synthetic 케이스에서 동일한 결과를 내는지 검증한다. `build_training_item()` 호출 전, export의 각 row(state)에 대해 그 row 자신의 전체 질문 집합(export가 gold를 question_id별로 묶는 바로 그 질문들, 추론이 보내는 것과 같은 집합)을 넘겨 fit을 적용하고, `state["task"]`만 fit된 값으로 바꾼 뒤 질문별 `build_training_item`을 호출한다. 어떤 prefix도 맞지 않는 행은 그 행의 모든 질문을 기존 marker-loss drop과 같은 방식으로 버린다(`check_tokenizer_admission`이 여전히 그 비율을 본다). 로그에 `[input-fit] N states task-head truncated`로 잘린 state 수를 보고한다.
+
+**실측 overhead** (M4 Pro, `<laya-venv>/bin/python scripts/laya-budget.py --model-dir <ckpt> --fit --runs 20`, EN/KO 2,500자 합성 task, 목표는 호출당 <15ms):
+
+| checkpoint | EN kept_chars / median ms | KO kept_chars / median ms |
+|---|---|---|
+| english | 1,533 / 약 15.4–16.7ms | 294 / 약 16.0–17.3ms |
+| multilingual | 이미 무손실(잘림 없음) / 약 2.4–2.5ms | 1,467 / 약 16.9–17.6ms |
+
+fit_task_head는 분석적 token-budget 추정으로 시작점을 한 번 계산한 뒤(질문별 head/option tokenize + base/task tokenize) 그 지점에서 doubling-step으로 경계를 양쪽으로 감싸고(gallop) 마지막에만 그 좁은 구간을 binary search한다 — 최종 결과는 항상 `assert_lossless()`로 재검증한다(속도보다 정확성 우선). 실측상 english checkpoint는 목표 15ms에 근접하거나 근소하게(약 1–2ms) 초과했고 multilingual의 한국어 경로도 비슷했다; multilingual의 영어 경로는 애초에 무손실이라 가장 빠르다(호출 1회로 끝).
+
 ## 검증 후에만 다음 단계
 
 Jev 실API, 실제 공식 Laya 가중치/MPS, Codex/Claude native 세션과 대표 한국어 업무의 품질·calibration은 offline fixture 테스트와 다르다. 별도로 실제 runtime smoke → blind shadow → 격리 paired downstream 실행 → 검증된 좁은 purpose만 ON 순서로 검증한다. 학습은 충분한 검증 라벨이 쌓인 뒤 offline training → holdout 평가 → shadow → 명시적 promotion으로 수행하며 이 저장소가 자동으로 시작하지 않는다.

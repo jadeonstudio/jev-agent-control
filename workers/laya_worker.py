@@ -73,6 +73,94 @@ def assert_lossless(agent, state, questions):
         if len(sequence) != expected or len(markers) != len(options):
             raise ValueError("INPUT_TRUNCATED")
 
+TRUNCATION_MARK = " …[truncated]"
+
+def fit_task_head(agent, state, questions):
+    """Default lossless refusal stays the behavior of assert_lossless(); this is the opt-in path
+    (see providers.json `laya.inputFit`) that instead finds the longest character prefix of
+    state["task"] that still fits ALL given questions losslessly, leaving every other state key
+    (context) untouched. Never truncates questions/instructions/options. Correctness is always
+    verified by assert_lossless before returning; token-based estimation below only narrows the
+    search window, it never decides the final answer.
+    """
+    try:
+        assert_lossless(agent, state, questions)
+        return state, {"truncated": False}
+    except ValueError as e:
+        original_error = e
+    if str(original_error) == "INPUT_REWRITE_REFUSED" or not (isinstance(state, dict) and isinstance(state.get("task"), str)):
+        raise original_error
+    task = state["task"]
+    original_chars = len(task)
+
+    def candidate(p):
+        return {**state, "task": task[:p].rstrip() + TRUNCATION_MARK}
+
+    def fits(p):
+        try:
+            assert_lossless(agent, candidate(p), questions)
+            return True
+        except ValueError:
+            return False
+
+    # Narrow with a cheap analytic token-budget estimate before a short gallop+binary search. Each
+    # fits() probe below re-runs assert_lossless() in full (head/options/state tokenize +
+    # build_sequence), which is by far the most expensive step, so the estimate's job is to make
+    # that search cover only a handful of characters instead of the whole task -- it is never
+    # itself the answer, and fits(0) is always reached as a real probe below (never skipped), so
+    # "no prefix passes" is still detected and raises the original error, exactly as before.
+    try:
+        from laya.common import render_options, serialize_state
+        tok, max_len = agent.tok, agent.cfg.get("max_len", 512)
+        min_state_budget = None
+        for question in questions.values():
+            q = agent._to_internal(question)
+            head = tok("%s question: %s" % (q["t"], q["ins"]), add_special_tokens=False)["input_ids"]
+            options = [tok(" " + option, add_special_tokens=False)["input_ids"] for option in render_options(q)]
+            state_budget = max_len - len(head) - sum(len(o) + 1 for o in options) - 4
+            min_state_budget = state_budget if min_state_budget is None else min(min_state_budget, state_budget)
+        base_tokens = len(tok(serialize_state(candidate(0)), add_special_tokens=False)["input_ids"])
+        task_tokens = max(1, len(tok(task, add_special_tokens=False)["input_ids"]))
+        chars_per_token = original_chars / task_tokens
+        remaining_tokens = max(0, min_state_budget - base_tokens)
+        guess = min(original_chars, max(0, int(remaining_tokens * chars_per_token)))
+    except Exception:
+        guess = 0
+
+    # Gallop out from the guess (doubling step) to bracket the true boundary in a few probes, then
+    # binary search only that small bracket -- not the whole [0, original_chars] range, which is
+    # what made an unbracketed binary search from a lone guess cost extra probes in practice.
+    if fits(guess):
+        lo, hi, probe, step = guess, original_chars, guess, 1
+        while probe < hi:
+            probe = min(hi, probe + step)
+            if fits(probe):
+                lo = probe
+                step *= 2
+            else:
+                hi = probe
+                break
+    else:
+        hi, probe, step, lo = guess, guess, 1, None
+        while True:
+            probe = max(0, probe - step)
+            if fits(probe):
+                lo = probe
+                break
+            hi = probe
+            if probe == 0:
+                break
+            step *= 2
+        if lo is None:
+            raise original_error
+    while lo < hi:
+        mid = (lo + hi + 1) // 2
+        if fits(mid):
+            lo = mid
+        else:
+            hi = mid - 1
+    return candidate(lo), {"truncated": True, "original_chars": original_chars, "kept_chars": lo}
+
 def resolve_precision(init_msg):
     precision = init_msg.get("precision", "fp32")
     if precision not in ("fp32", "fp16"):
@@ -152,12 +240,20 @@ def main():
         if msg is None:
             break
         try:
-            assert_lossless(agent, msg["state"], msg["questions"])
+            input_fit = msg.get("inputFit", "lossless")
+            if input_fit not in ("lossless", "task-head"):
+                raise ValueError("LAYA_INVALID_INPUT_FIT")
+            if input_fit == "task-head":
+                fitted_state, fit_info = fit_task_head(agent, msg["state"], msg["questions"])
+            else:
+                assert_lossless(agent, msg["state"], msg["questions"])
+                fitted_state, fit_info = msg["state"], {"truncated": False}
             with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
-                result = agent.system_one(msg["state"], msg["questions"])
+                result = agent.system_one(fitted_state, msg["questions"])
             if str(agent.device).split(":")[0] != c["device"]:
                 raise ValueError("DEVICE_FALLBACK_REFUSED")
             result["identity"] = identity
+            result["input_fit"] = fit_info
             emit({"id": msg["id"], "result": result})
         except ValueError as e:
             code = str(e)

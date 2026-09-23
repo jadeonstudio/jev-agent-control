@@ -155,7 +155,7 @@ capture OFF이면 content-bearing training data를 새로 쓰지 않습니다. O
 ### Laya checkpoint 수명주기 (명시적 operator 호출만)
 
 ```sh
-jev-control laya register --checkpoint /absolute/prepared-checkpoint --model laya/my-checkpoint --device mps
+jev-control laya register --checkpoint /absolute/prepared-checkpoint --model laya/my-checkpoint --device mps [--input-fit lossless|task-head]
 jev-control laya holdout freeze --dataset <dataset-hash> --name shared-v1
 jev-control laya holdout list
 jev-control laya qualify --candidate <checkpoint-hash> --dataset <dataset-hash> --holdout shared-v1
@@ -165,7 +165,7 @@ jev-control laya rollback
 jev-control laya status
 ```
 
-`register`는 준비된 로컬 checkpoint를 fingerprint(오프라인, `workers/laya_worker.py --fingerprint`)하고 `JEV_HOME/laya/checkpoints/`로 복사할 뿐 `providers.json`은 바꾸지 않습니다. `holdout freeze`는 데이터셋의 test split을 불변 회귀 holdout으로 고정합니다(모든 checkpoint 버전이 같은 holdout을 공유). `qualify`는 calibration split에서 purpose별 보수적 임계값을 찾고 test+holdout에서 Wilson 하한까지 확인해 자격 여부를 기록합니다. `compare`는 후보와 현재 활성 checkpoint를 같은 holdout으로 비교합니다. `promote`는 자격·비교 보고·무회귀 조건을 모두 만족할 때만 `providers.json`의 laya 블록을 원자적으로 교체하고(`provider` 선택은 바꾸지 않음) 직전 블록을 `JEV_HOME/laya/history.jsonl`에 남깁니다. `rollback`은 그 직전 블록으로 되돌립니다. 무엇도 학습을 시작하거나 promote를 자동 호출하지 않습니다.
+`register`는 준비된 로컬 checkpoint를 fingerprint(오프라인, `workers/laya_worker.py --fingerprint`)하고 `JEV_HOME/laya/checkpoints/`로 복사할 뿐 `providers.json`은 바꾸지 않습니다. `--input-fit`(기본 `lossless`, checkpoint에 고정되어 precision처럼 activate/promote를 따라 이동)을 `task-head`로 두면, 무손실 예산을 넘는 route 요청에서 `state.task`만 잘라(다른 state 키·질문·선택지는 그대로) 최장 prefix로 재시도합니다 — 자세한 내용은 [TRAINING_DATA.md §7](docs/TRAINING_DATA.md). `holdout freeze`는 데이터셋의 test split을 불변 회귀 holdout으로 고정합니다(모든 checkpoint 버전이 같은 holdout을 공유). `qualify`는 calibration split에서 purpose별 보수적 임계값을 찾고 test+holdout에서 Wilson 하한까지 확인해 자격 여부를 기록합니다. `compare`는 후보와 현재 활성 checkpoint를 같은 holdout으로 비교합니다. `promote`는 자격·비교 보고·무회귀 조건을 모두 만족할 때만 `providers.json`의 laya 블록을 원자적으로 교체하고(`provider` 선택은 바꾸지 않음) 직전 블록을 `JEV_HOME/laya/history.jsonl`에 남깁니다. `rollback`은 그 직전 블록으로 되돌립니다. 무엇도 학습을 시작하거나 promote를 자동 호출하지 않습니다.
 
 구체적인 schema·outcome 예제·보안·공식 notebook 근거: **[TRAINING_DATA.md](docs/TRAINING_DATA.md)**. 키/모델 없이 전체 흐름을 확인하려면 `node examples/training-pipeline.mjs`를 실행하세요. 이 예제는 synthetic inference와 무해한 실제 assertion이며 모델 정확도 실험이 아닙니다.
 

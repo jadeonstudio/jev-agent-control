@@ -21,7 +21,7 @@ export function validateProviderConfig(c) {
   c.laya ??= null;
   if (c.laya !== null) {
     const l = c.laya;
-    only(l, ['python', 'modelPath', 'model', 'checkpoint', 'runtimeVersion', 'device', 'startupTimeoutMs', 'idleTimeoutMs', 'precision', 'qualification', 'serverIdleUnloadMs'],
+    only(l, ['python', 'modelPath', 'model', 'checkpoint', 'runtimeVersion', 'device', 'startupTimeoutMs', 'idleTimeoutMs', 'precision', 'qualification', 'serverIdleUnloadMs', 'inputFit'],
       ['python', 'modelPath', 'model', 'checkpoint', 'runtimeVersion', 'device']);
     if (!path.isAbsolute(l.python) || !path.isAbsolute(l.modelPath) || !HASH.test(l.checkpoint) || l.runtimeVersion !== '0.3.4' ||
         !['cpu', 'mps', 'cuda'].includes(l.device) || !/^[A-Za-z0-9][A-Za-z0-9._/-]{0,100}$/.test(l.model)) fail('INVALID_PROVIDER_CONFIG');
@@ -32,6 +32,9 @@ export function validateProviderConfig(c) {
     // probability delta of 0.0074 vs fp32; qualification below is bound to precision because a precision
     // change shifts the answer distribution slightly.
     l.precision ??= 'fp32'; if (!['fp32', 'fp16'].includes(l.precision)) fail('INVALID_PROVIDER_CONFIG');
+    // Default OFF (new feature): 'lossless' keeps today's assert_lossless refusal behavior;
+    // 'task-head' opts into worker.fit_task_head() truncating only state.task (see workers/laya_worker.py).
+    l.inputFit ??= 'lossless'; if (!['lossless', 'task-head'].includes(l.inputFit)) fail('INVALID_PROVIDER_CONFIG');
     if (l.qualification != null) {
       only(l.qualification, ['checkpoint', 'calibrationVersion', 'purposes', 'minConfidence', 'minChoiceProbability', 'noulCertainty', 'precision'],
         ['checkpoint', 'calibrationVersion', 'purposes', 'minConfidence', 'minChoiceProbability', 'noulCertainty']);
@@ -73,11 +76,29 @@ export function normalizeInference(provider, raw, request, config, settings) {
   // Canonical shape validation is shared; probability meaning and acceptance are provider-specific.
   const n = normalizeResponse({ ...raw, model: identity.model }, request, { ...config,
     minConfidence: policy?.minConfidence ?? 1, minChoiceProbability: policy?.minChoiceProbability ?? 1, noulCertainty: policy?.noulCertainty ?? 1 });
+  // The training decision record's provenance (src/training/schema.mjs validateProvenance) only
+  // allows the listed keys with STRING values -- an `input_fit` object there would make every
+  // captured laya decision fail INVALID_TRAINING_SCHEMA. The configured MODE ('lossless' vs
+  // 'task-head', from settings.laya.inputFit) is instead expressed through preprocessing_version,
+  // which is exactly what that field means; the per-REQUEST outcome (was this call truncated, by
+  // how much) is carried outside provenance on the normalized result as `inputFit` below.
+  const preprocessingVersion = (l.inputFit ?? 'lossless') === 'task-head'
+    ? 'official-laya-0.3.4-task-head-v1' : 'official-laya-0.3.4-lossless-v1';
   return { ...n, eligible: Boolean(policy?.purposes.includes(request.purpose)) && n.eligible,
-    qualified: Boolean(policy?.purposes.includes(request.purpose)), provenance: { provider, model: identity.model,
+    qualified: Boolean(policy?.purposes.includes(request.purpose)), inputFit: normalizeInputFit(raw.input_fit),
+    provenance: { provider, model: identity.model,
       model_version: identity.checkpoint, checkpoint: identity.checkpoint, runtime_version: identity.runtime_version,
-      preprocessing_version: 'official-laya-0.3.4-lossless-v1', confidence_semantics: 'choice-score-normalized-entropy;noul-probability',
+      preprocessing_version: preprocessingVersion, confidence_semantics: 'choice-score-normalized-entropy;noul-probability',
       device: identity.device, precision: identity.precision } };
+}
+/** Validates the worker's per-request `input_fit` (never persisted in provenance/training schema;
+ * see normalizeInference above). A malformed or missing value is treated as untruncated rather
+ * than propagated, since it never affects correctness -- only telemetry/metrics read it. */
+function normalizeInputFit(inputFit) {
+  if (!inputFit || typeof inputFit !== 'object' || inputFit.truncated !== true) return { truncated: false };
+  const { original_chars: originalChars, kept_chars: keptChars } = inputFit;
+  if (!Number.isInteger(originalChars) || originalChars < 0 || !Number.isInteger(keptChars) || keptChars < 0 || keptChars > originalChars) return { truncated: false };
+  return { truncated: true, original_chars: originalChars, kept_chars: keptChars };
 }
 
 /** One optional warm Python process. No shell, API keys, downloaded code, HTTP listener or automatic training. */
@@ -184,7 +205,7 @@ export function createLayaClient({ spawnImpl = spawn } = {}) {
       p.resolve = settle(resolve); p.reject = settle(reject);
       signal?.addEventListener('abort', cancelled, { once: true });
       pending.set(id, p);
-      child.stdin.write(JSON.stringify({ id, state: request.state, questions: request.questions }) + '\n');
+      child.stdin.write(JSON.stringify({ id, state: request.state, questions: request.questions, inputFit: l.inputFit ?? 'lossless' }) + '\n');
     });
   }
   async function prepare(settings, { timeoutMs, signal, env = process.env, resident: keepResident = true } = {}) {

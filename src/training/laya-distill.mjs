@@ -41,6 +41,16 @@ function withRunLock(dir, fn) {
   catch (e) { if (e.code === 'EEXIST') fail('DISTILL_LOCKED'); throw e; }
   try { return fn(); } finally { fs.rmdirSync(lockDir); }
 }
+// Async-safe variant: the lock is held across every `await` in `fn` (mkdirSync/rmdirSync are
+// synchronous, so no other call in this same process can slip in between acquire and release),
+// so two concurrent `distill label` runs on the same run never both call the teacher.
+async function withRunLockAsync(dir, fn) {
+  const lockDir = path.join(dir, '.lock');
+  noSymlinks(lockDir);
+  try { fs.mkdirSync(lockDir, { mode: 0o700 }); }
+  catch (e) { if (e.code === 'EEXIST') fail('DISTILL_LOCKED'); throw e; }
+  try { return await fn(); } finally { fs.rmdirSync(lockDir); }
+}
 function appendPrivateJsonl(file, obj) {
   noSymlinks(file);
   const fd = fs.openSync(file, fs.constants.O_CREAT | fs.constants.O_APPEND | fs.constants.O_WRONLY | (fs.constants.O_NOFOLLOW || 0), 0o600);
@@ -89,7 +99,10 @@ export function distillImport(home, { run, inputFile, readFileImpl = (f) => fs.r
       try { parsed = JSON.parse(trimmed); } catch { fail('INVALID_DISTILL_TASK_LINE'); }
       only(parsed, ['lang', 'domain', 'task'], ['lang', 'task']);
       if (!['ko', 'en'].includes(parsed.lang)) fail('INVALID_DISTILL_TASK_LINE');
-      if (typeof parsed.task !== 'string' || !parsed.task.trim() || parsed.task.length > 2000) fail('INVALID_DISTILL_TASK_LINE');
+      // UTF-8 byte limit (not a character count) matching the hook's own truncateUtf8(..., 8000)
+      // cap (src/hooks.mjs preSpawn task=description+prompt), so owner-authored Korean prompts up
+      // to ~2,500 chars (well over the old 2000-char cap) import.
+      if (typeof parsed.task !== 'string' || !parsed.task.trim() || Buffer.byteLength(parsed.task) > 8000) fail('INVALID_DISTILL_TASK_LINE');
       if (parsed.domain !== undefined && parsed.domain !== null) text(parsed.domain, 80);
       if (containsSensitiveData(parsed)) { skippedSensitive++; continue; }
       const normalized = normalizeTaskText(parsed.task);
@@ -130,47 +143,57 @@ export function distillImportShadow(home, { run, trainingStore } = {}) {
 }
 
 // --- label (teacher) -------------------------------------------------------
+const LABEL_CONSECUTIVE_FAILURE_LIMIT = 5;
 export async function distillLabel(home, { run, confirmEgress, limit, provider = callTypeSafe, key, model, timeoutMs, env = process.env,
   now = Date.now, sleepImpl = ms => new Promise(resolve => setTimeout(resolve, ms)) } = {}) {
   if (!confirmEgress) fail('EXPLICIT_REMOTE_TEACHER_CONSENT_REQUIRED');
   validateRunName(run);
   const dir = ensureRunDir(home, run);
-  const tasks = readPrivateJsonl(tasksFile(dir));
-  const labeled = new Set(readPrivateJsonl(teacherFile(dir)).map(l => l.task_id));
-  const eligible = tasks.filter(t => t.egress === 'allowed' && !labeled.has(t.task_id));
-  const batch = Number.isInteger(limit) ? eligible.slice(0, Math.max(0, limit)) : eligible;
-  const resolvedKey = key ?? getCredential(home, env).key;
-  if (!resolvedKey) fail('NO_API_KEY');
-  const policy = loadFeaturePolicy(home);
-  const resolvedModel = model ?? policy.router.expectedModel;
-  const config = loadConfig(home, env);
-  const resolvedTimeout = timeoutMs ?? config.timeoutMs;
-  let lastCallAt = null, attempted = 0, succeeded = 0, failed = 0;
-  const usage = { inputTokens: 0, outputTokens: 0 };
-  const failureCodes = {};
-  for (const task of batch) {
-    if (lastCallAt !== null) {
-      const wait = MIN_CALL_INTERVAL_MS - (now() - lastCallAt);
-      if (wait > 0) await sleepImpl(wait);
+  // Held for the whole batch (across every await below), not just individual writes: two
+  // concurrent `distill label` runs on the same run must never both call the teacher.
+  return withRunLockAsync(dir, async () => {
+    const tasks = readPrivateJsonl(tasksFile(dir));
+    const labeled = new Set(readPrivateJsonl(teacherFile(dir)).map(l => l.task_id));
+    const eligible = tasks.filter(t => t.egress === 'allowed' && !labeled.has(t.task_id));
+    const batch = Number.isInteger(limit) ? eligible.slice(0, Math.max(0, limit)) : eligible;
+    const resolvedKey = key ?? getCredential(home, env).key;
+    if (!resolvedKey) fail('NO_API_KEY');
+    const policy = loadFeaturePolicy(home);
+    const resolvedModel = model ?? policy.router.expectedModel;
+    const config = loadConfig(home, env);
+    const resolvedTimeout = timeoutMs ?? config.timeoutMs;
+    let lastCallAt = null, attempted = 0, succeeded = 0, failed = 0, consecutiveFailures = 0, aborted = false, abortReason = null;
+    const usage = { inputTokens: 0, outputTokens: 0 };
+    const failureCodes = {};
+    for (const task of batch) {
+      if (lastCallAt !== null) {
+        const wait = MIN_CALL_INTERVAL_MS - (now() - lastCallAt);
+        if (wait > 0) await sleepImpl(wait);
+      }
+      lastCallAt = now();
+      attempted++;
+      try {
+        const request = validateRequest(buildTaskRequest(task.task), config);
+        const payload = wireRequest(request, resolvedModel);
+        const raw = await provider(payload, resolvedKey, { timeoutMs: resolvedTimeout });
+        const n = normalizeResponse(raw, request, { ...config, minConfidence: 0, minChoiceProbability: 0, noulCertainty: 0 });
+        const answers = {};
+        for (const qid of Object.keys(ROUTE_QUESTIONS)) answers[qid] = { probabilities: n.answers[qid].probabilities };
+        appendPrivateJsonl(teacherFile(dir), { task_id: task.task_id, model: n.model, answers, usage: n.usage, at: new Date().toISOString() });
+        succeeded++; usage.inputTokens += n.usage.inputTokens ?? 0; usage.outputTokens += n.usage.outputTokens ?? 0;
+        consecutiveFailures = 0;
+      } catch (e) {
+        const code = errorCode(e);
+        appendPrivateJsonl(teacherFailuresFile(dir), { task_id: task.task_id, code, at: new Date().toISOString() });
+        failed++; failureCodes[code] = (failureCodes[code] ?? 0) + 1;
+        consecutiveFailures++;
+        // Circuit breaker: 5 consecutive failures stop the batch (already-recorded results stay;
+        // an unattempted task has no failure record, so the next `distill label` run retries it).
+        if (consecutiveFailures >= LABEL_CONSECUTIVE_FAILURE_LIMIT) { aborted = true; abortReason = code; break; }
+      }
     }
-    lastCallAt = now();
-    attempted++;
-    try {
-      const request = validateRequest(buildTaskRequest(task.task), config);
-      const payload = wireRequest(request, resolvedModel);
-      const raw = await provider(payload, resolvedKey, { timeoutMs: resolvedTimeout });
-      const n = normalizeResponse(raw, request, { ...config, minConfidence: 0, minChoiceProbability: 0, noulCertainty: 0 });
-      const answers = {};
-      for (const qid of Object.keys(ROUTE_QUESTIONS)) answers[qid] = { probabilities: n.answers[qid].probabilities };
-      appendPrivateJsonl(teacherFile(dir), { task_id: task.task_id, model: n.model, answers, usage: n.usage, at: new Date().toISOString() });
-      succeeded++; usage.inputTokens += n.usage.inputTokens ?? 0; usage.outputTokens += n.usage.outputTokens ?? 0;
-    } catch (e) {
-      const code = errorCode(e);
-      appendPrivateJsonl(teacherFailuresFile(dir), { task_id: task.task_id, code, at: new Date().toISOString() });
-      failed++; failureCodes[code] = (failureCodes[code] ?? 0) + 1;
-    }
-  }
-  return { run, eligible: eligible.length, attempted, succeeded, failed, failureCodes, usage };
+    return { run, eligible: eligible.length, attempted, succeeded, failed, failureCodes, usage, aborted, abortReason };
+  });
 }
 
 // --- review (human TTY) -----------------------------------------------------

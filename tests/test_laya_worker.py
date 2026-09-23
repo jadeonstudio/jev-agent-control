@@ -73,6 +73,65 @@ class WorkerBoundaries(unittest.TestCase):
             long={'worker':{'type':'choice','instructions':'Pick.','criteria':{'x'*60:None,'b':None}}}
             with self.assertRaises(ValueError): worker.assert_lossless(agent,'small',long)
 
+def make_synthetic_agent():
+    class Tok:
+        mask_token = '<mask>'
+        def __call__(self, value, **kwargs): return {'input_ids': list(range(len(value)))}
+    tok = Tok()
+    render = lambda q: list(q['crit'])
+    serialize = lambda state: state if isinstance(state, str) else json.dumps(state, ensure_ascii=False)
+    def build(t, state, q, max_len, head_max):
+        count = len('%s question: %s' % (q['t'], q['ins'])) + sum(len(' '+v)+1 for v in render(q)) + len(serialize(state)) + 4
+        return list(range(count)), list(range(len(render(q))))
+    common = types.ModuleType('laya.common')
+    common.render_options, common.serialize_state, common.build_sequence = render, serialize, build
+    agent = types.SimpleNamespace(tok=tok, cfg={'max_len': 120, 'head_max_len': 60},
+        _to_internal=lambda q: {'t': q['type'], 'ins': q['instructions'], 'crit': q['criteria']})
+    return agent, common
+
+class FitTaskHead(unittest.TestCase):
+    def setUp(self):
+        self.agent, self.common = make_synthetic_agent()
+        self.questions = {'worker': {'type': 'choice', 'instructions': 'Pick.', 'criteria': {'a': None, 'b': None}}}
+
+    def test_returns_state_unchanged_when_already_lossless(self):
+        with patch.dict(sys.modules, {'laya.common': self.common}):
+            state = {'task': 'short task', 'context': {'scope': 'local'}}
+            fitted, info = worker.fit_task_head(self.agent, state, self.questions)
+        self.assertEqual(fitted, state)
+        self.assertEqual(info, {'truncated': False})
+
+    def test_truncates_only_the_task_field_and_keeps_context_intact(self):
+        with patch.dict(sys.modules, {'laya.common': self.common}):
+            state = {'task': 'x' * 500, 'context': {'scope': 'local', 'complete': True}}
+            fitted, info = worker.fit_task_head(self.agent, state, self.questions)
+            self.assertTrue(info['truncated'])
+            self.assertEqual(info['original_chars'], 500)
+            self.assertEqual(fitted['context'], state['context'])
+            self.assertTrue(fitted['task'].endswith(worker.TRUNCATION_MARK))
+            self.assertEqual(info['kept_chars'], len(fitted['task']) - len(worker.TRUNCATION_MARK))
+            # the fitted state must itself pass the same admission rule
+            worker.assert_lossless(self.agent, fitted, self.questions)
+
+    def test_raises_when_no_prefix_fits_even_empty_task(self):
+        with patch.dict(sys.modules, {'laya.common': self.common}):
+            long_questions = {'worker': {'type': 'choice', 'instructions': 'Pick.', 'criteria': {'x' * 60: None, 'b': None}}}
+            with self.assertRaises(ValueError):
+                worker.fit_task_head(self.agent, {'task': 'x' * 10, 'context': {}}, long_questions)
+
+    def test_raises_input_rewrite_refused_without_truncating(self):
+        with patch.dict(sys.modules, {'laya.common': self.common}):
+            with self.assertRaises(ValueError) as cm:
+                worker.fit_task_head(self.agent, {'task': 'contains <mask> token', 'context': {}}, self.questions)
+        self.assertEqual(str(cm.exception), 'INPUT_REWRITE_REFUSED')
+
+    def test_non_dict_or_missing_task_state_raises_same_error_as_assert_lossless(self):
+        with patch.dict(sys.modules, {'laya.common': self.common}):
+            with self.assertRaises(ValueError):
+                worker.fit_task_head(self.agent, 'x' * 1000, self.questions)
+            with self.assertRaises(ValueError):
+                worker.fit_task_head(self.agent, {'context': {}, 'blob': 'x' * 1000}, self.questions)
+
 class PrecisionAndLoadMode(unittest.TestCase):
     def test_resolve_precision_defaults_to_fp32_and_rejects_unknown_values(self):
         self.assertEqual(worker.resolve_precision({}), 'fp32')

@@ -95,6 +95,7 @@ owner 요청: 이 Mac(Apple M4 Pro, GPU 16코어, 통합 메모리 24GB)에서 L
 
 - english는 한국어 토큰화 효율이 낮아 한국어 296자를 넘으면 `INPUT_TRUNCATED`로 판단하지 않는다. 실제 한국어 서브에이전트 프롬프트는 대부분 이보다 길어, english는 정확도(B3)뿐 아니라 용량 면에서도 owner 사용 패턴에 맞지 않는다.
 - 결정: fine-tune 기반 모델은 multilingual(한국어 1,440자, 2.2배 빠름, FP16 631MiB). 증류 데이터 3,000개는 짧은 문장 2,000 + 실제 프롬프트형 긴 문장 1,000으로 구성한다(생성된 짧은 문장 중앙값 55자는 실제 입력 분포와 다름). hook의 판단 입력은 예산 안 앞부분으로 명시적으로 자르고 provenance에 기록하는 방식을 추가한다(조용한 잘림 아님).
+- **구현 완료 (2026-09-23):** `workers/laya_worker.py`의 `fit_task_head()`(opt-in, `providers.json` `laya.inputFit:'task-head'`, 기본 `'lossless'`는 기존 거부 동작 유지)가 예산을 넘는 route 입력에서 `state.task`만 최장 prefix + 고정 marker(`" …[truncated]"`)로 줄이고 최종 결과를 반드시 `assert_lossless()`로 재검증한다. `training/laya-kit/train_from_export.py`는 같은 함수를 byte-identical하게 복사해 train 전처리에도 identical하게 적용한다(`tests/test_laya_kit_input_fit.py`로 parity 검증). 상세: `docs/TRAINING_DATA.md` §7. 실측 overhead(M4 Pro, `scripts/laya-budget.py --fit --runs 20`, 2,500자 EN/KO): english EN kept 1,533자/median ≈15.4–16.7ms, english KO kept 294자/median ≈16.0–17.3ms, multilingual EN 이미 무손실/median ≈2.4–2.5ms, multilingual KO kept 1,467자/median ≈16.9–17.6ms — 목표(<15ms)에 근접하거나 근소하게(약 1–2ms) 초과했다(정확성 우선으로 마지막 결과는 항상 `assert_lossless()` 재검증을 거치므로 추가 최적화보다 정확성을 택함).
 
 ### B4. Codex A/B: spawn 전 명시 `jev_route` vs 바로 spawn (codex-cli 0.154.0, `codex exec`, 각 3회, 중앙값)
 

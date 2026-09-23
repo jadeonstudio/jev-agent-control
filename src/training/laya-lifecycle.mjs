@@ -54,7 +54,7 @@ export function defaultFingerprint(python, dir) {
 }
 
 // --- register ---------------------------------------------------------
-export function registerCheckpoint(home, { checkpointDir, model, device, python, precision, fingerprintImpl = defaultFingerprint } = {}) {
+export function registerCheckpoint(home, { checkpointDir, model, device, python, precision, inputFit, fingerprintImpl = defaultFingerprint } = {}) {
   if (typeof checkpointDir !== 'string' || !path.isAbsolute(checkpointDir)) fail('LAYA_CHECKPOINT_PATH_REQUIRED');
   assertNoSymlinksDeep(checkpointDir);
   let stat; try { stat = fs.statSync(checkpointDir); } catch { fail('LAYA_CHECKPOINT_NOT_DIRECTORY'); }
@@ -70,6 +70,10 @@ export function registerCheckpoint(home, { checkpointDir, model, device, python,
   // independent runtime knob.
   const resolvedPrecision = precision ?? active.laya?.precision ?? 'fp32';
   if (!['fp32', 'fp16'].includes(resolvedPrecision)) fail('INVALID_PROVIDER_CONFIG');
+  // Like precision, inputFit is fixed at register time and travels with the candidate through
+  // activate/promote (see providers.json `laya.inputFit`, default OFF/'lossless').
+  const resolvedInputFit = inputFit ?? active.laya?.inputFit ?? 'lossless';
+  if (!['lossless', 'task-head'].includes(resolvedInputFit)) fail('INVALID_PROVIDER_CONFIG');
   const checkpoint = fingerprintImpl(resolvedPython, checkpointDir);
   const resolvedModel = model ?? `laya/${checkpoint.slice(0, 12)}`;
   if (!MODEL_RE.test(resolvedModel)) fail('LAYA_MODEL_INVALID');
@@ -89,7 +93,7 @@ export function registerCheckpoint(home, { checkpointDir, model, device, python,
       fs.renameSync(tmp, dest);
     } catch (e) { fs.rmSync(tmp, { recursive: true, force: true }); throw e; }
   }
-  const candidate = { python: resolvedPython, modelPath: dest, model: resolvedModel, checkpoint, runtimeVersion: LAYA_RUNTIME_VERSION, device: resolvedDevice, precision: resolvedPrecision };
+  const candidate = { python: resolvedPython, modelPath: dest, model: resolvedModel, checkpoint, runtimeVersion: LAYA_RUNTIME_VERSION, device: resolvedDevice, precision: resolvedPrecision, inputFit: resolvedInputFit };
   validateLayaSettings(candidate);
   const file = path.join(candidatesDir(home), `${checkpoint}.json`);
   atomicWrite(file, JSON.stringify(candidate, null, 2) + '\n');

@@ -125,6 +125,8 @@ export function readMetrics(home, days = 7) {
     return [provider, { requests:rows.length, inferenceCalls:inference.reduce((s,e)=>s+(e.inferenceCalls ?? e.networkCalls),0), networkCalls:rows.reduce((s,e)=>s+(e.networkCalls||0),0),
       accepted:rows.filter(e=>e.apply).length, hostFallbacks:rows.filter(e=>e.mode==='on' && !e.apply).length, errors:inference.filter(e=>!normal.includes(e.reason)).length,
       inputTokens:tokens(rows,'usage','inputTokens'), outputTokens:tokens(rows,'usage','outputTokens'), missingUsageCalls:inference.filter(e=>e.usage?.inputTokens==null||e.usage?.outputTokens==null).length,
+      // `laya.inputFit:'task-head'` opt-in only (src/inference.mjs, workers/laya_worker.py fit_task_head); always 0 for jev/'lossless'.
+      routeInputFitTruncated: rows.filter(e => e.purpose === 'route' && e.inputFitTruncated).length,
       latencyMs:{p50:percentile(inference.map(e=>e.elapsedMs).filter(Number.isFinite),.5),p95:percentile(inference.map(e=>e.elapsedMs).filter(Number.isFinite),.95)} }];
   }));
   const observations = events.filter(e => e.kind === 'observation');
