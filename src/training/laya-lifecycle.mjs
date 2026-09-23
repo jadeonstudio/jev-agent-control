@@ -54,7 +54,7 @@ export function defaultFingerprint(python, dir) {
 }
 
 // --- register ---------------------------------------------------------
-export function registerCheckpoint(home, { checkpointDir, model, device, python, fingerprintImpl = defaultFingerprint } = {}) {
+export function registerCheckpoint(home, { checkpointDir, model, device, python, precision, fingerprintImpl = defaultFingerprint } = {}) {
   if (typeof checkpointDir !== 'string' || !path.isAbsolute(checkpointDir)) fail('LAYA_CHECKPOINT_PATH_REQUIRED');
   assertNoSymlinksDeep(checkpointDir);
   let stat; try { stat = fs.statSync(checkpointDir); } catch { fail('LAYA_CHECKPOINT_NOT_DIRECTORY'); }
@@ -65,6 +65,11 @@ export function registerCheckpoint(home, { checkpointDir, model, device, python,
   if (typeof resolvedPython !== 'string' || !path.isAbsolute(resolvedPython)) fail('LAYA_PYTHON_NOT_CONFIGURED');
   const resolvedDevice = device ?? active.laya?.device;
   if (!DEVICES.includes(resolvedDevice)) fail('LAYA_DEVICE_REQUIRED');
+  // fp16 changes the answer distribution slightly (measured max delta 0.0074), so it is fixed at
+  // register time and travels with the candidate through qualify/promote rather than being an
+  // independent runtime knob.
+  const resolvedPrecision = precision ?? active.laya?.precision ?? 'fp32';
+  if (!['fp32', 'fp16'].includes(resolvedPrecision)) fail('INVALID_PROVIDER_CONFIG');
   const checkpoint = fingerprintImpl(resolvedPython, checkpointDir);
   const resolvedModel = model ?? `laya/${checkpoint.slice(0, 12)}`;
   if (!MODEL_RE.test(resolvedModel)) fail('LAYA_MODEL_INVALID');
@@ -84,7 +89,7 @@ export function registerCheckpoint(home, { checkpointDir, model, device, python,
       fs.renameSync(tmp, dest);
     } catch (e) { fs.rmSync(tmp, { recursive: true, force: true }); throw e; }
   }
-  const candidate = { python: resolvedPython, modelPath: dest, model: resolvedModel, checkpoint, runtimeVersion: LAYA_RUNTIME_VERSION, device: resolvedDevice };
+  const candidate = { python: resolvedPython, modelPath: dest, model: resolvedModel, checkpoint, runtimeVersion: LAYA_RUNTIME_VERSION, device: resolvedDevice, precision: resolvedPrecision };
   validateLayaSettings(candidate);
   const file = path.join(candidatesDir(home), `${checkpoint}.json`);
   atomicWrite(file, JSON.stringify(candidate, null, 2) + '\n');
@@ -222,7 +227,7 @@ export async function qualifyCandidate(home, { candidateHash, datasetVersion, ho
   const result = { checkpoint: candidateHash, qualified: qualifiedPurposes.length > 0, purposes: qualifiedPurposes,
     minConfidence: globalThreshold ?? 1, minChoiceProbability: globalThreshold ?? 1, noulCertainty: globalThreshold ?? 1,
     calibrationVersion, dataset_version: datasetVersion, holdout: holdoutManifest.name, holdout_sha256: holdoutManifest.sha256,
-    params, evidence, generated_at: new Date().toISOString() };
+    precision: laya.precision ?? 'fp32', params, evidence, generated_at: new Date().toISOString() };
   ensureDir(layaRoot(home), true); ensureDir(qualificationsDir(home), true);
   atomicWrite(path.join(qualificationsDir(home), `${candidateHash}.json`), JSON.stringify(result, null, 2) + '\n');
   return result;
@@ -320,7 +325,8 @@ export function promoteCandidate(home, { candidateHash, holdoutName, maxRegressi
   const nextLaya = { ...candidate,
     startupTimeoutMs: currentConfig.laya?.startupTimeoutMs ?? 120000, idleTimeoutMs: currentConfig.laya?.idleTimeoutMs ?? 60000,
     qualification: { checkpoint: qualification.checkpoint, calibrationVersion: qualification.calibrationVersion, purposes: qualification.purposes,
-      minConfidence: qualification.minConfidence, minChoiceProbability: qualification.minChoiceProbability, noulCertainty: qualification.noulCertainty } };
+      minConfidence: qualification.minConfidence, minChoiceProbability: qualification.minChoiceProbability, noulCertainty: qualification.noulCertainty,
+      precision: qualification.precision ?? candidate.precision ?? 'fp32' } };
   const nextConfig = { ...currentConfig, laya: nextLaya }; // provider selection (jev/laya) is never changed here
   validateProviderConfig(structuredClone(nextConfig));
   atomicWrite(file, JSON.stringify(nextConfig, null, 2) + '\n', { expected: old });

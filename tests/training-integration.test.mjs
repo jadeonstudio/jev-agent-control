@@ -8,7 +8,7 @@ import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { randomUUID } from 'node:crypto';
 import { createDecisionEngine } from '../src/engine.mjs';
-import { normalizeInference, createLayaClient } from '../src/inference.mjs';
+import { normalizeInference, createLayaClient, validateProviderConfig } from '../src/inference.mjs';
 import { setMode } from '../src/storage.mjs';
 import { DEFAULTS } from '../src/constants.mjs';
 import { startMcp, TOOLS } from '../src/mcp.mjs';
@@ -46,6 +46,30 @@ test('Laya normalization preserves provenance and requires checkpoint-specific q
   p.laya.qualification={checkpoint:p.laya.checkpoint,calibrationVersion:'fixture-v1',purposes:['route'],minConfidence:.9,minChoiceProbability:.9,noulCertainty:.95};
   assert.equal(normalizeInference('laya',raw,request(),DEFAULTS,p).eligible,true);
   assert.throws(()=>normalizeInference('laya',{...raw,identity:{...raw.identity,checkpoint:'b'.repeat(64)}},request(),DEFAULTS,p),/LAYA_IDENTITY_MISMATCH/);
+});
+test('laya.precision defaults to fp32, only accepts fp32|fp16, and binds qualification to it', t => {
+  const base = layaConfig('/tmp');
+  assert.equal(validateProviderConfig(structuredClone(base)).laya.precision, 'fp32');
+  assert.equal(validateProviderConfig({ ...structuredClone(base), laya: { ...base.laya, precision: 'fp16' } }).laya.precision, 'fp16');
+  for (const bad of ['bf16', 'int8', 'FP32', '']) {
+    assert.throws(() => validateProviderConfig({ ...structuredClone(base), laya: { ...base.laya, precision: bad } }), /INVALID_PROVIDER_CONFIG/);
+  }
+  const qualified = { ...structuredClone(base), laya: { ...base.laya, precision: 'fp16',
+    qualification: { checkpoint: base.laya.checkpoint, calibrationVersion: 'v1', purposes: ['route'], minConfidence: .9, minChoiceProbability: .9, noulCertainty: .9 } } };
+  assert.equal(validateProviderConfig(structuredClone(qualified)).laya.precision, 'fp16');
+  const matchingQualification = { ...qualified, laya: { ...qualified.laya, qualification: { ...qualified.laya.qualification, precision: 'fp16' } } };
+  assert.equal(validateProviderConfig(structuredClone(matchingQualification)).laya.qualification.precision, 'fp16');
+  const mismatchedQualification = { ...qualified, laya: { ...qualified.laya, qualification: { ...qualified.laya.qualification, precision: 'fp32' } } };
+  assert.throws(() => validateProviderConfig(structuredClone(mismatchedQualification)), /INVALID_PROVIDER_CONFIG/);
+});
+test('laya identity precision must match the configured precision (fp32<->fp16), independent of checkpoint/device checks', t => {
+  const p = layaConfig('/tmp', { precision: 'fp16' });
+  const raw = { ...response(), identity: { ...identity(p.laya), precision: 'torch.float16' } };
+  assert.equal(normalizeInference('laya', raw, request(), DEFAULTS, p).provenance.precision, 'torch.float16');
+  assert.throws(() => normalizeInference('laya', { ...raw, identity: { ...raw.identity, precision: 'torch.float32' } }, request(), DEFAULTS, p), /LAYA_IDENTITY_MISMATCH/);
+  const fp32 = layaConfig('/tmp');
+  assert.throws(() => normalizeInference('laya', { ...response(), identity: { ...identity(fp32.laya), precision: 'torch.float16' } }, request(), DEFAULTS, fp32), /LAYA_IDENTITY_MISMATCH/);
+  assert.throws(() => normalizeInference('laya', { ...response(), identity: { ...identity(fp32.laya), precision: 'torch.bfloat16' } }, request(), DEFAULTS, fp32), /LAYA_IDENTITY_MISMATCH/);
 });
 test('local inference counts never masquerade as Jev network calls or Jev token usage', async t => {
   const f=fixture(t);const p=layaConfig(f.home);f.writeProviders(p);

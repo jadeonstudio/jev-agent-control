@@ -20,18 +20,23 @@ export function validateProviderConfig(c) {
   c.laya ??= null;
   if (c.laya !== null) {
     const l = c.laya;
-    only(l, ['python', 'modelPath', 'model', 'checkpoint', 'runtimeVersion', 'device', 'startupTimeoutMs', 'idleTimeoutMs', 'qualification'],
+    only(l, ['python', 'modelPath', 'model', 'checkpoint', 'runtimeVersion', 'device', 'startupTimeoutMs', 'idleTimeoutMs', 'precision', 'qualification'],
       ['python', 'modelPath', 'model', 'checkpoint', 'runtimeVersion', 'device']);
     if (!path.isAbsolute(l.python) || !path.isAbsolute(l.modelPath) || !HASH.test(l.checkpoint) || l.runtimeVersion !== '0.3.4' ||
         !['cpu', 'mps', 'cuda'].includes(l.device) || !/^[A-Za-z0-9][A-Za-z0-9._/-]{0,100}$/.test(l.model)) fail('INVALID_PROVIDER_CONFIG');
     for (const [name, fallback, max] of [['startupTimeoutMs', 120000, 180000], ['idleTimeoutMs', 60000, 300000]]) {
       l[name] ??= fallback; if (!Number.isInteger(l[name]) || l[name] < 100 || l[name] > max) fail('INVALID_PROVIDER_CONFIG');
     }
+    // fp16 halves resident memory (measured: english MPS tensor 1,610 -> 810MiB) with a measured max
+    // probability delta of 0.0074 vs fp32; qualification below is bound to precision because a precision
+    // change shifts the answer distribution slightly.
+    l.precision ??= 'fp32'; if (!['fp32', 'fp16'].includes(l.precision)) fail('INVALID_PROVIDER_CONFIG');
     if (l.qualification != null) {
-      only(l.qualification, ['checkpoint', 'calibrationVersion', 'purposes', 'minConfidence', 'minChoiceProbability', 'noulCertainty'],
+      only(l.qualification, ['checkpoint', 'calibrationVersion', 'purposes', 'minConfidence', 'minChoiceProbability', 'noulCertainty', 'precision'],
         ['checkpoint', 'calibrationVersion', 'purposes', 'minConfidence', 'minChoiceProbability', 'noulCertainty']);
       if (l.qualification.checkpoint !== l.checkpoint || !Array.isArray(l.qualification.purposes) ||
           l.qualification.purposes.some(x => !['route', 'select', 'retry', 'review', 'judge', 'escalate'].includes(x))) fail('INVALID_PROVIDER_CONFIG');
+      if (l.qualification.precision != null && l.qualification.precision !== l.precision) fail('INVALID_PROVIDER_CONFIG');
       text(l.qualification.calibrationVersion, 80);
       for (const k of ['minConfidence', 'minChoiceProbability', 'noulCertainty']) { fraction(l.qualification[k]); if (l.qualification[k] < .5) fail('INVALID_PROVIDER_CONFIG'); }
     }
@@ -60,8 +65,9 @@ export function normalizeInference(provider, raw, request, config, settings) {
       runtime_version: 'typesafe-systemone-v1', preprocessing_version: 'wire-request-v1', confidence_semantics: 'provider-distribution-statistic' } };
   }
   const identity = raw?.identity, l = settings.laya;
+  const expectedPrecision = { fp32: 'torch.float32', fp16: 'torch.float16' }[l.precision ?? 'fp32'];
   if (!identity || identity.checkpoint !== l.checkpoint || identity.runtime_version !== l.runtimeVersion || identity.model !== l.model ||
-      typeof identity.device !== 'string' || identity.device.split(':')[0] !== l.device || !['torch.float32', 'torch.float16', 'torch.bfloat16'].includes(identity.precision)) fail('LAYA_IDENTITY_MISMATCH');
+      typeof identity.device !== 'string' || identity.device.split(':')[0] !== l.device || identity.precision !== expectedPrecision) fail('LAYA_IDENTITY_MISMATCH');
   const policy = l.qualification;
   // Canonical shape validation is shared; probability meaning and acceptance are provider-specific.
   const n = normalizeResponse({ ...raw, model: identity.model }, request, { ...config,
@@ -156,7 +162,7 @@ export function createLayaClient({ spawnImpl = spawn } = {}) {
       }
     });
     startupTimer = setTimeout(() => stop('LAYA_STARTUP_TIMEOUT'), l.startupTimeoutMs);
-    process.stdin.write(JSON.stringify({ init: { modelPath: l.modelPath, model: l.model, checkpoint: l.checkpoint, runtimeVersion: l.runtimeVersion, device: l.device } }) + '\n');
+    process.stdin.write(JSON.stringify({ init: { modelPath: l.modelPath, model: l.model, checkpoint: l.checkpoint, runtimeVersion: l.runtimeVersion, device: l.device, precision: l.precision ?? 'fp32' } }) + '\n');
     return promise;
   }
   async function infer(request, settings, { timeoutMs, signal, env = process.env } = {}) {

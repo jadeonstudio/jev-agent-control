@@ -99,7 +99,8 @@ function fakeLayaClient() {
       // (contracts.mjs normalizeResponse): pin the distribution's max share on the picked choice
       // (a valid distribution) and drive the calibration grid purely through `confidence`.
       return {
-        identity: { model: laya.model, checkpoint: laya.checkpoint, runtime_version: laya.runtimeVersion, device: laya.device, precision: 'torch.float32' },
+        identity: { model: laya.model, checkpoint: laya.checkpoint, runtime_version: laya.runtimeVersion, device: laya.device,
+          precision: laya.precision === 'fp16' ? 'torch.float16' : 'torch.float32' },
         answers: { [qid]: { type: 'choice', choice: want, confidence: conf, probabilities: { [want]: .99, [other]: .01 } } },
         usage: { input_tokens: 5, output_tokens: 0 },
       };
@@ -166,6 +167,19 @@ test('register falls back to the active providers.json python/device when not gi
   const candidate = JSON.parse(fs.readFileSync(r.candidate, 'utf8'));
   assert.equal(candidate.python, '/usr/bin/python3');
   assert.equal(candidate.device, 'mps');
+});
+
+test('register defaults precision to fp32, accepts an explicit --precision, and falls back to the active config otherwise', t => {
+  const root = holdoutFixture(t);
+  const home = fs.mkdtempSync(path.join(root, 'home-'));
+  const noConfig = registerCheckpoint(home, { checkpointDir: makeCheckpointDir(root), model: 'laya/p1', device: 'cpu', python: '/usr/bin/python3', fingerprintImpl: fakeFingerprint });
+  assert.equal(JSON.parse(fs.readFileSync(noConfig.candidate, 'utf8')).precision, 'fp32');
+  const explicit = registerCheckpoint(home, { checkpointDir: makeCheckpointDir(root), model: 'laya/p2', device: 'cpu', python: '/usr/bin/python3', precision: 'fp16', fingerprintImpl: fakeFingerprint });
+  assert.equal(JSON.parse(fs.readFileSync(explicit.candidate, 'utf8')).precision, 'fp16');
+  writeProviders(home, { version: 1, provider: 'laya', laya: { python: '/usr/bin/python3', modelPath: home, model: 'laya/base', checkpoint: 'a'.repeat(64), runtimeVersion: '0.3.4', device: 'cpu', precision: 'fp16' } });
+  const fromActive = registerCheckpoint(home, { checkpointDir: makeCheckpointDir(root), model: 'laya/p3', fingerprintImpl: fakeFingerprint });
+  assert.equal(JSON.parse(fs.readFileSync(fromActive.candidate, 'utf8')).precision, 'fp16');
+  assert.throws(() => registerCheckpoint(home, { checkpointDir: makeCheckpointDir(root), model: 'laya/p4', device: 'cpu', python: '/usr/bin/python3', precision: 'int8', fingerprintImpl: fakeFingerprint }), /INVALID_PROVIDER_CONFIG/);
 });
 
 // ============================== holdout ==============================
@@ -247,6 +261,25 @@ async function qualifiedCandidate(f, version, holdoutName, model = 'laya/promote
   assert.equal(qual.qualified, true, JSON.stringify(qual));
   return { reg, qual };
 }
+
+test('qualify records the candidate precision, and promote carries it into providers.json laya + qualification', async t => {
+  const f = trainingFixture(t);
+  const version = buildRouteDataset(f);
+  const holdout = freezeHoldout(f.home, { datasetVersion: version, name: 'h1' });
+  writeProviders(f.home, { version: 1, provider: 'jev' });
+  const reg = registerCheckpoint(f.home, { checkpointDir: makeCheckpointDir(fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'jev-laya-')))),
+    model: 'laya/fp16', device: 'cpu', python: '/usr/bin/python3', precision: 'fp16', fingerprintImpl: fakeFingerprint });
+  const qual = await qualifyCandidate(f.home, { candidateHash: reg.checkpoint, datasetVersion: version, holdoutName: holdout.name, layaClient: fakeLayaClient(),
+    targetAccuracy: .75, minCoverage: .3, minCalibration: 5, minTest: 5, minLowerBound: .5 });
+  assert.equal(qual.qualified, true, JSON.stringify(qual));
+  assert.equal(qual.precision, 'fp16');
+  await compareCandidate(f.home, { candidateHash: reg.checkpoint, holdoutName: holdout.name, layaClient: fakeLayaClient(), noActiveBaseline: true });
+  const promoted = promoteCandidate(f.home, { candidateHash: reg.checkpoint, holdoutName: holdout.name });
+  assert.equal(promoted.promoted, true, JSON.stringify(promoted));
+  const providers = JSON.parse(fs.readFileSync(path.join(f.home, 'providers.json'), 'utf8'));
+  assert.equal(providers.laya.precision, 'fp16');
+  assert.equal(providers.laya.qualification.precision, 'fp16');
+});
 
 test('compare + promote (no active baseline) swaps providers.json laya, keeps provider selection, and logs history', async t => {
   const f = trainingFixture(t);

@@ -1,4 +1,5 @@
 """Offline boundary tests. No model, torch, network, or training is used."""
+import contextlib
 import importlib.util
 import json
 from pathlib import Path
@@ -71,6 +72,79 @@ class WorkerBoundaries(unittest.TestCase):
             with self.assertRaises(ValueError): worker.assert_lossless(agent,'contains <mask>',q)
             long={'worker':{'type':'choice','instructions':'Pick.','criteria':{'x'*60:None,'b':None}}}
             with self.assertRaises(ValueError): worker.assert_lossless(agent,'small',long)
+
+class PrecisionAndLoadMode(unittest.TestCase):
+    def test_resolve_precision_defaults_to_fp32_and_rejects_unknown_values(self):
+        self.assertEqual(worker.resolve_precision({}), 'fp32')
+        self.assertEqual(worker.resolve_precision({'precision': 'fp32'}), 'fp32')
+        self.assertEqual(worker.resolve_precision({'precision': 'fp16'}), 'fp16')
+        with self.assertRaises(ValueError): worker.resolve_precision({'precision': 'bf16'})
+        with self.assertRaises(ValueError): worker.resolve_precision({'precision': 'int8'})
+
+    def _fake_laya(self):
+        class FakeTensor:
+            def __init__(self, dtype): self.dtype = dtype
+        class FakeModel:
+            def __init__(self):
+                self.dtype = 'torch.float32'
+                self.halved = False
+            def parameters(self): return iter([FakeTensor(self.dtype)])
+            def half(self):
+                self.halved = True
+                self.dtype = 'torch.float16'
+        class FakeAgent:
+            def __init__(self, model_path, device=None):
+                self.model_path, self.device, self.model = model_path, device, FakeModel()
+        autocast_calls = []
+        def autocast(device_type, dtype=None, enabled=True, **kw):
+            autocast_calls.append({'device_type': device_type, 'dtype': dtype, 'enabled': enabled})
+            return contextlib.nullcontext()
+        fake_torch = types.SimpleNamespace(float16='fake-torch-float16', autocast=autocast)
+        agent_mod = types.ModuleType('laya.agent')
+        agent_mod.Agent, agent_mod.torch = FakeAgent, fake_torch
+        agent_mod._fix_tokenizer_config = lambda _: None
+        laya_pkg = types.ModuleType('laya')
+        laya_pkg.agent = agent_mod
+        return laya_pkg, agent_mod, autocast_calls
+
+    def test_load_agent_uses_no_init_weights_when_transformers_supports_it(self):
+        laya_pkg, agent_mod, _ = self._fake_laya()
+        calls = []
+        class FakeCtx:
+            def __enter__(self): calls.append('enter')
+            def __exit__(self, *a): calls.append('exit')
+        init_mod = types.ModuleType('transformers.initialization')
+        init_mod.no_init_weights = lambda: FakeCtx()
+        transformers_mod = types.ModuleType('transformers')
+        transformers_mod.initialization = init_mod
+        with patch.dict(sys.modules, {'laya': laya_pkg, 'laya.agent': agent_mod,
+                                       'transformers': transformers_mod, 'transformers.initialization': init_mod}):
+            agent, load_mode = worker.load_agent('/model', 'cpu', 'fp32')
+        self.assertEqual(load_mode, 'no_init_weights')
+        self.assertEqual(calls, ['enter', 'exit'])
+        self.assertFalse(agent.model.halved)
+
+    def test_load_agent_falls_back_to_default_when_no_init_weights_unavailable(self):
+        laya_pkg, agent_mod, _ = self._fake_laya()
+        # sys.modules[name] = None is the standard way to force a deterministic ImportError on
+        # `import name` without depending on (or polluting via) whatever transformers/torch this
+        # test process happens to have installed.
+        with patch.dict(sys.modules, {'laya': laya_pkg, 'laya.agent': agent_mod, 'transformers': None, 'transformers.initialization': None}):
+            agent, load_mode = worker.load_agent('/model', 'cpu', 'fp32')
+        self.assertEqual(load_mode, 'default')
+
+    def test_load_agent_fp16_halves_weights_and_forces_autocast_on_every_device(self):
+        # B2: on MPS, half() alone crashes at inference because Agent.system_one only turns on
+        # autocast for CUDA. The fp16 path must also force torch.autocast on for this process.
+        laya_pkg, agent_mod, autocast_calls = self._fake_laya()
+        with patch.dict(sys.modules, {'laya': laya_pkg, 'laya.agent': agent_mod, 'transformers': None, 'transformers.initialization': None}):
+            agent, load_mode = worker.load_agent('/model', 'mps', 'fp16')
+            self.assertTrue(agent.model.halved)
+            self.assertEqual(str(next(agent.model.parameters()).dtype), 'torch.float16')
+            with agent_mod.torch.autocast(device_type='mps', dtype='torch.float32', enabled=False):
+                pass
+        self.assertEqual(len(autocast_calls), 1)
+        self.assertEqual(autocast_calls[0], {'device_type': 'mps', 'dtype': 'fake-torch-float16', 'enabled': True})
 
 if __name__ == '__main__':
     unittest.main()

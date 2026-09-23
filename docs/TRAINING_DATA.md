@@ -38,12 +38,15 @@ Codex / Claude / 직접 소유한 runner
     "runtimeVersion": "0.3.4",
     "device": "mps",
     "startupTimeoutMs": 120000,
-    "idleTimeoutMs": 60000
+    "idleTimeoutMs": 60000,
+    "precision": "fp32"
   }
 }
 ```
 
 공식 `laya==0.3.4`와 모델은 별도 검토·다운로드 절차로 미리 준비한다. 실행 중에는 다운로드하지 않는다. 모델 루트·자식·상위 경로 symlink 및 remote model code 설정을 거부한다. 공식 tokenizer 호환성 수정이 필요한 파일은 준비 단계에서 수정한 **복사본**을 고정한다. worker가 로딩 중 원본 모델 설정을 수정하지 않는다.
+
+worker는 매번 cold 시작한다는 뜻이 아니다. 실측(이 Mac, M4 Pro, english checkpoint, MPS, `scripts/laya-bench.py`): 24초 로드 중 약 19초는 ModernBERT 가중치의 무작위 초기화(`normal_`/`trunc_normal_`)였고, 뒤이은 `load_state_dict(strict=True)`가 그 값을 전부 덮어쓴다. transformers 공식 `transformers.initialization.no_init_weights()`로 그 단계를 건너뛰면(worker가 항상 시도하고, 설치된 transformers가 지원하지 않으면 조용히 기존 방식으로 되돌아간다 — `identity.load_mode`가 `no_init_weights`/`default`로 알려준다) 콜드 시작이 3.5–4.2초로 줄고, FP32 확률 결과는 완전히 동일하다(36/36, 확률 차 0.0). `precision: "fp16"`은 가중치를 절반으로 줄이지만(1,610MiB → 810MiB, english MPS) 속도 이득은 거의 없다. MPS에서 half 가중치는 `Agent.system_one`이 CUDA에서만 autocast를 켜기 때문에 그대로 두면 첫 추론에서 dtype 불일치 assert로 프로세스가 죽는다 — worker는 fp16을 켤 때 `laya.agent.torch.autocast`를 이 프로세스 한정으로 강제로 켠 상태(모든 device)로 감싸 이 문제를 우회한다(검증: english 36/36 일치, 최대 확률 차 0.0074). `identity.precision`은 실제 파라미터 dtype(`torch.float32`|`torch.float16`)을 보고하며 `providers.json`의 `laya.precision`과 일치해야 한다(불일치는 `LAYA_IDENTITY_MISMATCH`). 정밀도를 바꾸면 답이 조금 달라지므로 `qualification.precision`이 있으면 현재 `laya.precision`과 같아야 한다(다르면 `INVALID_PROVIDER_CONFIG`) — qualification을 정밀도에 묶어 둔다. `ready` 메시지의 `load_ms`가 실제 로드 시간을 보고한다.
 
 ```sh
 # 파일만 해시하는 오프라인 준비 확인. 추론·다운로드·학습 없음.
