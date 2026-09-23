@@ -144,6 +144,8 @@ jev-control compare --live < sanitized-comparison.json
 jev-control metrics --days 7
 jev-control uninstall --target both --dry-run
 jev-control uninstall --target both
+# 호스트 스킬 폴더가 심볼릭 링크라 설치기가 거부할 때(UNSAFE_SYMLINK): 스킬만 건너뛰고 MCP·hook·블록을 설치
+# jev-control install --target claude --hooks --no-skills
 # hook·지침 블록만 되돌릴 때 (MCP·스킬·shim·mode는 유지):
 jev-control uninstall --target both --hooks-only --dry-run
 jev-control uninstall --target both --hooks-only

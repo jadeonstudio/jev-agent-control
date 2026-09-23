@@ -232,3 +232,28 @@ test('an identical unowned hook group (no install record) is refused instead of 
   assert.throws(() => f.install({ hooks: true }), /HOOK_COLLISION/);
   assert.equal(fs.readFileSync(claudeSettings(f.user), 'utf8'), settings);
 });
+
+test('--no-skills installs MCP, hooks and block for a host whose skills directory is a symlink, without writing through it', t => {
+  const f = setup(t);
+  const outside = path.join(f.user, 'forge-skills'); fs.mkdirSync(outside, { recursive: true });
+  fs.mkdirSync(path.join(f.user, '.claude'), { recursive: true });
+  fs.symlinkSync(outside, path.join(f.user, '.claude/skills'));
+  assert.throws(() => f.install({ target: 'claude', hooks: true }), /UNSAFE_SYMLINK/);
+  const r = f.install({ target: 'claude', hooks: true, skills: false });
+  assert.equal(r.ok, true);
+  assert.deepEqual(fs.readdirSync(outside), []);
+  assert.ok(JSON.parse(fs.readFileSync(path.join(f.user, '.claude.json'), 'utf8')).mcpServers['jev_agent_control']);
+  assert.ok(JSON.parse(fs.readFileSync(claudeSettings(f.user), 'utf8')).hooks.PreToolUse.length >= 1);
+  assert.match(fs.readFileSync(claudeMd(f.user), 'utf8'), /jev-agent-control managed/);
+  const u = f.install({ target: 'claude', remove: true, skills: false });
+  assert.equal(u.ok, true);
+  assert.deepEqual(fs.readdirSync(outside), []);
+  assert.equal(fs.existsSync(claudeSettings(f.user)), false);
+});
+test('CLI accepts --no-skills for install and uninstall only', t => {
+  const f = setup(t);
+  const bin = path.join(REPO_ROOT, 'bin/jev-control.mjs');
+  const run = args => spawnSync(process.execPath, [bin, ...args, '--home', f.home], { encoding: 'utf8', env: f.env });
+  assert.equal(run(['install', '--target', 'claude', '--no-skills', '--dry-run']).status, 0);
+  assert.notEqual(run(['status', '--no-skills']).status, 0);
+});

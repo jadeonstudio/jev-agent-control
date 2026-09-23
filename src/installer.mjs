@@ -142,7 +142,7 @@ export function describeHookStatus({ home, env = process.env, scope = 'user', pr
   }
   return result;
 }
-export function installationPlan({ home, env = process.env, target = 'both', scope = 'user', project = process.cwd(), remove = false, hooks = false, hooksOnly = false, root = REPO_ROOT } = {}) {
+export function installationPlan({ home, env = process.env, target = 'both', scope = 'user', project = process.cwd(), remove = false, hooks = false, hooksOnly = false, skills = true, root = REPO_ROOT } = {}) {
   if (process.platform === 'win32') fail('USE_WSL');
   if (!['both', 'codex', 'claude'].includes(target) || !['user', 'project'].includes(scope)) fail('INVALID_INSTALL_OPTIONS');
   if (hooksOnly && !remove) fail('HOOKS_ONLY_REQUIRES_UNINSTALL');
@@ -273,7 +273,8 @@ export function installationPlan({ home, env = process.env, target = 'both', sco
         updateRecord(owned, file, server);
       }
       const skillsDir = path.join(scope === 'user' ? userHome : projectRoot, agent === 'codex' ? '.agents/skills' : '.claude/skills');
-      for (const skill of ['jev-control', 'jev-decisions']) {
+      // --no-skills: leave the skills directory alone (e.g. a symlinked skills root the installer must not write through).
+      for (const skill of skills ? ['jev-control', 'jev-decisions'] : []) {
         const skillDir = path.join(skillsDir, skill), markerPath = path.join(skillDir, '.jev-managed.json');
         const markerText = readText(markerPath, { optional: true });
         const marker = markerText ? parseJson(markerText) : null;
@@ -308,12 +309,12 @@ export function installationPlan({ home, env = process.env, target = 'both', sco
     add(shim, remove && target === 'both' ? null : (remove ? before : next), before, 0o700);
     if (!remove || target === 'both') updateRecord(owned, shim, next);
   }
-  return { home, target, scope, remove, hooksOnly, agents, actions, runtime: cli, hookChanges, instructionBlocks, hostTrustRequired: [...hostTrustSet] };
+  return { home, target, scope, remove, hooksOnly, skills, agents, actions, runtime: cli, hookChanges, instructionBlocks, hostTrustRequired: [...hostTrustSet] };
 }
 export function applyInstallation(plan, { dryRun = false } = {}) {
   const report = { ok: true, dryRun, target: plan.target, scope: plan.scope, operation: plan.remove ? (plan.hooksOnly ? 'uninstall-hooks-only' : 'uninstall') : 'install',
     changes: plan.actions.map(a => ({ path: a.file, action: a.next === null ? 'remove-owned-file' : 'write' })),
-    runtime: plan.runtime, typeSafeCredentialWritten: false, hostApprovalsChanged: false,
+    runtime: plan.runtime, typeSafeCredentialWritten: false, hostApprovalsChanged: false, skillsManaged: plan.skills !== false,
     hookChanges: plan.hookChanges, instructionBlocks: plan.instructionBlocks, hostTrustRequired: plan.hostTrustRequired };
   if (dryRun) return report;
   ensureDir(plan.home, true);
