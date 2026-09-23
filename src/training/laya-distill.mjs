@@ -242,26 +242,44 @@ export async function distillReview(home, { run, count = 200, isStdinTTY, isStdo
   }
   const pending = selected.filter(id => !reviewedIds.has(id));
   let reviewed = 0, skipped = 0, quit = false;
-  for (const task_id of pending) {
+  for (let idx = 0; idx < pending.length; idx++) {
+    const task_id = pending[idx];
     const task = tasksById.get(task_id), teacher = teacherById.get(task_id);
-    write(`\ntask (${task.lang}): ${task.task}\n`);
+    write(`\n[${idx + 1}/${pending.length}] lang=${task.lang}\n`);
+    write(`task (${task.lang}): ${task.task}\n`);
     const labels = {};
     let taskSkipped = false, taskQuit = false;
     for (const [qid, q] of Object.entries(ROUTE_QUESTIONS)) {
       const teacherAnswer = teacher.answers[qid];
-      const top = Object.entries(teacherAnswer.probabilities).sort((a, b) => b[1] - a[1])[0];
-      const display = q.type === 'score' ? String(Number(top[0]) + 1) : top[0];
-      write(`question ${qid}: ${q.instructions}\n  teacher: ${display} (p=${top[1].toFixed(3)})\n`);
-      const answer = (await prompt(`value for "${qid}" (Enter=accept, s=skip task, q=save & quit): `)).trim();
-      if (answer === 'q') { taskQuit = true; break; }
-      if (answer === 's') { taskSkipped = true; break; }
-      let value;
-      if (answer === '') value = q.type === 'score' ? Number(top[0]) : top[0];
-      else if (q.type === 'score') {
+      const probs = teacherAnswer.probabilities;
+      const optionKeys = q.type === 'score' ? q.criteria.map((_, i) => String(i)) : Object.keys(q.criteria);
+      const topKey = Object.entries(probs).sort((a, b) => b[1] - a[1])[0][0];
+      write(`question ${qid}: ${q.instructions}\n`);
+      optionKeys.forEach((key, i) => {
+        const label = q.type === 'score' ? q.criteria[i] : `${key} — ${q.criteria[key]}`;
+        const marker = key === topKey ? '*' : ' ';
+        const p = (probs[key] ?? 0).toFixed(2);
+        write(`${marker}${i + 1}) ${label} (p=${p})\n`);
+      });
+      let value, resolved = false, invalidAttempts = 0;
+      while (!resolved) {
+        const answer = (await prompt(`value for "${qid}" (Enter=accept, number/key, s=skip task, q=save & quit): `)).trim();
+        if (answer === 'q') { taskQuit = true; break; }
+        if (answer === 's') { taskSkipped = true; break; }
+        if (answer === '') { value = q.type === 'score' ? Number(topKey) : topKey; resolved = true; break; }
         const n = Number(answer);
-        if (!Number.isInteger(n) || n < 1 || n > q.criteria.length) fail('INVALID_TRAINING_TARGET');
-        value = n - 1;
-      } else value = answer;
+        if (q.type === 'score') {
+          if (Number.isInteger(n) && n >= 1 && n <= q.criteria.length) { value = n - 1; resolved = true; break; }
+        } else {
+          if (Number.isInteger(n) && n >= 1 && n <= optionKeys.length) { value = optionKeys[n - 1]; resolved = true; break; }
+          const match = optionKeys.find(k => k.toLowerCase() === answer.toLowerCase());
+          if (match) { value = match; resolved = true; break; }
+        }
+        invalidAttempts++;
+        if (invalidAttempts >= 5) { taskSkipped = true; write(`too many invalid attempts for "${qid}"; skipping task\n`); break; }
+        write(`invalid value "${answer}" for "${qid}"; try again\n`);
+      }
+      if (taskQuit || taskSkipped) break;
       validateTarget(q, value);
       labels[qid] = value;
     }

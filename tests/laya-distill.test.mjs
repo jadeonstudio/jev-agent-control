@@ -348,6 +348,51 @@ test('review accepts teacher defaults on Enter, overrides with a typed label, sk
   assert.equal(overridden.labels.difficulty, 2); // typed "3" (1-based) -> 0-based 2
 });
 
+test('review prints a progress header and a numbered option list (with teacher marker + probability) for choice and score questions', async t => {
+  const home = labeledFixture(t, 2); // 1 ko + 1 en
+  await distillLabel(home, { run: 'run1', confirmEgress: true, key: 'k', provider: async () => teacherRaw('jev-1.13.0', { intent: 'edit', difficulty: 1, risk: 'safe' }), sleepImpl: async () => {} });
+  const written = [];
+  await distillReview(home, { run: 'run1', count: 2, isStdinTTY: true, isStdoutTTY: true, write: t => written.push(t),
+    prompt: fakePromptQueue(Array(6).fill('')) });
+  const out = written.join('');
+  assert.match(out, /\[1\/2\] lang=ko/); // progress header: k/N + lang
+  // choice question (intent): every criteria key listed in order, teacher top ('edit') marked, with a 2-decimal probability
+  assert.match(out, / 1\) explain — Explain or locate existing code; do not change behavior \(p=0\.\d\d\)/);
+  assert.match(out, /\*2\) edit — Write or change a bounded piece of code or documentation \(p=0\.82\)/);
+  // score question (difficulty): 5 numbered options 1..5, teacher top (picks.difficulty=1 -> 0-based -> displayed as "2") marked
+  assert.match(out, /\*2\) 2: Small local change with explicit requirements and known validation \(p=0\.80\)/);
+  assert.match(out, / 5\) 5: Deep reasoning, unknown repository-wide impact, architecture or long-horizon planning \(p=0\.\d\d\)/);
+});
+
+test('review re-prompts the same question on invalid input instead of aborting, and skips the task after 5 consecutive invalid attempts', async t => {
+  const home = labeledFixture(t, 2);
+  await distillLabel(home, { run: 'run1', confirmEgress: true, key: 'k', provider: async () => teacherRaw('jev-1.13.0'), sleepImpl: async () => {} });
+  const written = [];
+  // task1 (ko): 5 invalid answers to the first question ("intent") -> capped -> treated as skip.
+  // task2 (en): all Enter -> accepted.
+  const result = await distillReview(home, { run: 'run1', count: 2, isStdinTTY: true, isStdoutTTY: true, write: t => written.push(t),
+    prompt: fakePromptQueue(['bogus', 'zzz', '99', '-1', 'nope', '', '', '']) });
+  assert.equal(result.skipped, 1);
+  assert.equal(result.reviewed, 1);
+  assert.ok(written.some(w => /invalid/i.test(w))); // a one-line error was written, not a thrown exception
+  const lines = fs.readFileSync(path.join(runDir(home, 'run1'), 'review.jsonl'), 'utf8').trim().split('\n').map(JSON.parse);
+  assert.equal(lines.length, 1); // the invalid-input task was never recorded
+});
+
+test('review accepts a 1-based option number or a case-insensitive exact key for a choice question', async t => {
+  const home = labeledFixture(t, 2);
+  await distillLabel(home, { run: 'run1', confirmEgress: true, key: 'k', provider: async () => teacherRaw('jev-1.13.0', { intent: 'edit', difficulty: 1, risk: 'safe' }), sleepImpl: async () => {} });
+  // task1 (ko): intent by 1-based number (3 -> 'debug'), difficulty accept, risk by case-insensitive key 'HIGH'
+  // task2 (en): all accept
+  const result = await distillReview(home, { run: 'run1', count: 2, isStdinTTY: true, isStdoutTTY: true,
+    prompt: fakePromptQueue(['3', '', 'HIGH', '', '', '']) });
+  assert.equal(result.reviewed, 2);
+  const lines = fs.readFileSync(path.join(runDir(home, 'run1'), 'review.jsonl'), 'utf8').trim().split('\n').map(JSON.parse);
+  const overridden = lines.find(l => l.labels.intent === 'debug');
+  assert.ok(overridden);
+  assert.equal(overridden.labels.risk, 'high');
+});
+
 test('review is resumable: an interrupted (quit) session leaves unreviewed tasks pending for the next call', async t => {
   const home = labeledFixture(t, 4);
   await distillLabel(home, { run: 'run1', confirmEgress: true, key: 'k', provider: async () => teacherRaw('jev-1.13.0'), sleepImpl: async () => {} });
