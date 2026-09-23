@@ -55,7 +55,23 @@ jev-control dataset export --version <hash> --format laya
 보장하고, 각 명령의 플래그는 `jev-control --help`로 그때그때 확인한다(임의로 추측해
 적지 않음).
 
-## 실행 순서(사람이 직접)
+## 실행 순서(사람이 직접) -- multilingual checkpoint 기준 전체 러너북
+
+owner 결정(2026-09-23): fine-tune 기준 checkpoint는 **multilingual**(mmBERT, `max_len=1024`
+/ `head_max_len=256`)이다. HF 저장소 `convaiinnovations/laya`는 체크포인트별로 서브폴더가
+나뉘어 있다 -- 로컬 `~/.local/share/laya/models/multilingual/.cache/huggingface/download/`
+아래 파일 경로가 전부 `multilingual/`로 시작하는 것으로 로컬에서 직접 확인했다(반면 english
+체크포인트의 같은 경로는 서브폴더 없이 루트에 바로 있다). 이 kit이 HF 저장소 파일 트리를
+직접 열람할 수는 없었으므로, 서브폴더 이름은 아래처럼 `--model-subdir`로 사람이 명시한다.
+
+0. **(로컬) 증류 데이터셋 빌드**
+   ```sh
+   jev-control laya distill build --run d3k
+   jev-control dataset export --version <hash> --format laya
+   ```
+   `<hash>`는 `laya distill build`가 출력하는 `dataset_version`이다. 정확한 서브커맨드 인자는
+   이 kit이 만들어진 시점의 CLI 구현을 따르며(§ 상단 안내), 최신 플래그는
+   `jev-control training --help`(`TRAINING_HELP`, `src/training/cli.mjs`)로 그때그때 확인한다.
 
 1. **export 검증(로컬, GPU 불필요)**
    ```sh
@@ -64,10 +80,12 @@ jev-control dataset export --version <hash> --format laya
    실패하면 다음 단계로 넘어가지 않는다.
 
 2. **Kaggle Notebook 설정**
+   - Kaggle → Datasets → New Dataset: `exports/<hash>/laya/` 폴더 전체를 업로드해 **private**
+     Kaggle Dataset을 만든다(비공개로 유지; 공개 전환하지 않는다).
    - Notebook options → Accelerator: `GPU T4 x2`
    - Notebook options → Internet: `On` (모델/패키지 다운로드에 필요)
-   - `training/laya-kit/` 전체와 `exports/<hash>/laya/` 폴더를 Kaggle Notebook의
-     Input/Working 디렉터리에 업로드한다.
+   - `training/laya-kit/` 전체와 방금 만든 private Dataset을 Kaggle Notebook의
+     Input/Working 디렉터리에 연결(Add Input)한다.
 
 3. **의존성 설치** (Kaggle Notebook 셀에서, 로컬에서 하지 않음)
    ```sh
@@ -75,12 +93,21 @@ jev-control dataset export --version <hash> --format laya
    ```
    버전 미고정 패키지는 `requirements.lock`에 "확인 불가"로 표시된 이유를 참고.
 
-4. **학습 실행**
+4. **모델 다운로드 + 학습 실행**
    ```sh
+   python3 -c "from huggingface_hub import snapshot_download; print(snapshot_download('convaiinnovations/laya'))"
    python3 training/laya-kit/train_from_export.py \
        --export-dir /kaggle/input/<업로드한-export>/laya \
-       --output-dir /kaggle/working/laya_finetuned_typed_decisions
+       --model-dir <위에서 출력된 snapshot 경로> \
+       --model-subdir multilingual \
+       --output-dir /kaggle/working/laya_finetuned_multilingual
    ```
+   - `--model-dir`을 생략하면 스크립트가 직접 `snapshot_download("convaiinnovations/laya")`를
+     호출한다(네트워크, Kaggle에서만). `--model-subdir multilingual`은 그 snapshot 루트 아래
+     `multilingual/` 서브폴더를 실제 checkpoint 디렉터리로 쓴다 -- 이 서브폴더에
+     `rl_agent_config.json`/`tokenizer/`/`encoder/`가 없으면 학습 시작 전에 분명한 에러로
+     중단한다(`validate_resolved_model_dir`). english 체크포인트처럼 서브폴더 없이 루트에
+     바로 있는 경우는 `--model-subdir`을 생략한다(기존 동작 그대로 유지).
    - export manifest의 `exporter_version`/`upstream_contract`/`loader`/`source_data_sha256`가
      이 스크립트가 기대하는 값과 다르면 학습 전에 중단한다.
    - 각 row를 전처리하기 전, `workers/laya_worker.py`에서 byte-identical하게 복사한
@@ -88,22 +115,73 @@ jev-control dataset export --version <hash> --format laya
      줄여(다른 state 키·질문은 그대로) 실제 추론이 `laya.inputFit:'task-head'`로 받는 입력과
      동일한 형태를 train에도 준다. 로그의 `[input-fit] N states task-head truncated`가 잘린
      state 수다. 자세한 내용은 `docs/TRAINING_DATA.md` §7.
+   - base checkpoint 자신의 `rl_agent_config.json`이 `max_len`/`head_max_len`을 학습 시
+     최종값(1024/256, official notebook cell 4의 override)과 다르게 갖고 있어도(예: english
+     체크포인트는 512/192), 전처리(`fit_task_head`/`build_training_item`)는 항상 학습이 실제로
+     쓰는 최종값을 기준으로 admission을 판단한다(`resolve_effective_cfg`) -- multilingual/
+     typed-decisions 체크포인트는 애초에 1024/256이라 이 보정이 값을 바꾸지 않는다.
    - tokenizer admission(잘림) 검사가 먼저 실행되며, 잘리는 행 비율이
      `--max-truncated-fraction`(기본 2%)을 넘으면 중단한다. 강제로 진행하려면
      `--allow-truncation`. (이 검사는 `fit_task_head`가 손대지 못하는 나머지 truncation —
      질문/옵션이 너무 크거나 fit할 prefix가 전혀 없는 행 — 을 여전히 잡아낸다.)
    - 매니페스트/토크나이저 검사만 먼저 확인하고 싶으면 `--dry-run`(torchrun을 실행하지
-     않음).
+     않음). 로컬에서는 `datasets` 패키지가 없어 이 확인조차 통과하지 못한다(로컬 laya
+     `.venv`는 추론 전용 -- `pip list`로 실측 확인함); Kaggle의 `pip install`(3단계) 이후에만
+     의미가 있다.
+   - 스크립트는 내부적으로 다음 형태의 `torchrun`을 직접 실행한다(사람이 직접 칠 필요는
+     없음 -- 디버깅 시 참고용):
+     ```sh
+     torchrun --standalone --nproc_per_node=2 <output-dir>/train_ddp.py \
+         <resolved-model-dir> <output-dir> <output-dir>/train_items.pt <output-dir>/calib_items.pt \
+         <derived-model-name> <base-model-dir-name> <export-manifest의-exporter_version>
+     ```
+     `<derived-model-name>`은 저장되는 checkpoint의 `model_name`으로, base checkpoint 자신의
+     `rl_agent_config.json.model_name`(없으면 `--model-subdir` 또는 모델 폴더 이름)에
+     `-jev-ft`를 붙여 만든다(`derive_model_name`) -- 예: multilingual의 base `model_name`이
+     `"rl-agent"`이면 `"rl-agent-jev-ft"`. 과거처럼 `"laya-typed-decisions"`로 고정되지
+     않는다.
+   - **예상 소요 시간**: 공식 notebook 셀 9는 `torchrun` 학습 루프(cell 10)만을 두고
+     "~4 to 6 minutes total"이라 명시한다(분 단위). notebook 전체(설치·다운로드·전처리·평가
+     포함)의 총 GPU-시간은 공식 문서에 없다 -- **확인 불가**로 남긴다. 실행 전 Kaggle 계정의
+     현재 GPU 할당량을 직접 확인한다.
 
 5. **산출물 다운로드**
    `output-dir` 아래 `model.safetensors`, `encoder/`, `tokenizer/`,
-   `rl_agent_config.json`, `benchmark_report.json`(평가 성공 시), 그리고
-   `training_metadata.json`(notebook 커밋, laya 버전, export 해시, 하이퍼파라미터,
-   시작·종료 시각)을 로컬로 내려받는다.
+   `rl_agent_config.json`(이제 `model_name`/`base_model_dir_name`/`exporter_version`을
+   함께 기록), `benchmark_report.json`(평가 성공 시), 그리고 `training_metadata.json`
+   (notebook 커밋, laya 버전, export 해시, `base_model_dir_name`, `derived_model_name`,
+   하이퍼파라미터, 시작·종료 시각)을 로컬로 내려받는다.
 
-6. **checkpoint 등록 → holdout 동결 → qualify → compare → promote**
-   `docs/TRAINING_DATA.md`가 규정한 순서를 그대로 따른다. **promote는 owner의 명시 승인
-   없이 실행하지 않는다.** 자동 승격은 이 저장소에 구현돼 있지 않다.
+6. **(로컬) checkpoint 등록 → holdout 동결 → qualify → compare → promote**
+   정확한 서브커맨드 플래그는 `src/training/cli.mjs`의 `TRAINING_HELP`(`jev-control training
+   --help`로도 확인 가능)를 그대로 옮긴 것이다. 임의로 지어내지 않는다.
+   ```sh
+   jev-control laya register --checkpoint <다운로드한-절대경로> \
+       --python /Users/jangjiyong/.local/share/laya/.venv/bin/python \
+       --device mps --precision fp16 --input-fit task-head
+   jev-control laya holdout freeze --dataset <hash>
+   jev-control laya qualify --candidate <candidate-hash> --dataset <hash> --holdout <holdout-id>
+   jev-control laya compare --candidate <candidate-hash> --holdout <holdout-id>
+   jev-control laya promote --candidate <candidate-hash> --holdout <holdout-id>
+   ```
+   **promote는 owner의 명시 승인 없이 실행하지 않는다.** 자동 승격은 이 저장소에 구현돼
+   있지 않다.
+   - `laya register`에 `--model NAME`을 주지 않으면 이름은 `laya/<checkpoint 해시 앞 12자>`가
+     된다(`src/training/laya-lifecycle.mjs` `registerCheckpoint`). 저장된
+     `rl_agent_config.json.model_name`(derive_model_name이 만든 값)은 checkpoint 안의 기록일 뿐
+     등록 이름으로 쓰이지 않는다.
+   - **resident server 재시작은 필요 없다.** `src/inference.mjs`의 `createLayaClient().start()`
+     는 매 infer 호출마다 providers.json의 laya 블록 해시(`digest(l)`)를 이전 child의
+     identity와 비교하고, `promote`로 checkpoint가 바뀌면 자동으로 이전 worker를 내리고
+     (`LAYA_CONFIG_CHANGED`) 새 checkpoint로 재기동한다(`src/laya-server.mjs`의
+     `handleInfer`/`handlePrepare`도 요청마다 providers.json을 새로 읽는다) -- 코드로 직접
+     확인함. 단 이 자동 반영은 **상주 서버 프로세스가 `inputFit`을 아는 코드(30aeab4 이후)로
+     떠 있을 때만** 성립한다. 그 이전에 시작된 서버는 worker에 `inputFit`을 보내지 않아
+     task-head가 적용되지 않으므로, 처음 task-head checkpoint를 쓸 때는 한 번 재시작한다.
+     그 뒤로는 선택 사항이다:
+     ```sh
+     launchctl kickstart -k gui/$(id -u)/com.jev-agent-control.laya
+     ```
 
 ## 예상 시간 (출처 표시)
 

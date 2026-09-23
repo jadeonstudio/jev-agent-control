@@ -169,6 +169,83 @@ def assert_lossless(agent, state, questions):
         if len(sequence) != expected or len(markers) != len(options):
             raise ValueError("INPUT_TRUNCATED")
 
+# ---------------------------------------------------------------------------
+# jev-change: --model-subdir support and model_name derivation. The upstream
+# HF repo (convaiinnovations/laya) keeps some checkpoint variants at the repo
+# root (the english checkpoint, historically) and others under a per-variant
+# subfolder (e.g. `multilingual/`, `typed-decisions/` -- confirmed locally via
+# the huggingface_hub download cache layout under each variant's
+# ~/.local/share/laya/models/<variant>/.cache/huggingface/download/ tree,
+# which shows the subfolder name repeated as a path prefix for multilingual
+# and typed-decisions but not for english). Neither this kit nor this
+# environment can browse the HF repo's file tree directly to double-check
+# that pattern against the live repo, so --model-subdir is left for the
+# operator to pass explicitly rather than guessed/auto-detected.
+# ---------------------------------------------------------------------------
+def resolve_model_dir(model_dir, model_subdir):
+    """Resolve --model-dir against an optional --model-subdir. Omitting
+    --model-subdir (None or "") preserves the pre-existing behavior of using
+    model_dir as-is."""
+    model_dir = Path(model_dir)
+    if not model_subdir:
+        return model_dir
+    return model_dir / model_subdir
+
+
+def validate_resolved_model_dir(resolved_dir):
+    """Fail clearly (KitError) if the resolved checkpoint dir is missing any of the
+    files this kit and the official notebook both require."""
+    resolved_dir = Path(resolved_dir)
+    missing = []
+    if not (resolved_dir / "rl_agent_config.json").is_file():
+        missing.append("rl_agent_config.json")
+    if not (resolved_dir / "tokenizer").is_dir():
+        missing.append("tokenizer/")
+    if not (resolved_dir / "encoder").is_dir():
+        missing.append("encoder/")
+    if missing:
+        die(
+            f"{resolved_dir} is missing {', '.join(missing)} -- check --model-dir/"
+            "--model-subdir (the HF repo may keep this checkpoint under a per-variant "
+            "subfolder, e.g. `multilingual/`)"
+        )
+    return resolved_dir
+
+
+def derive_model_name(base_cfg, base_model_dir_name):
+    """Derive the fine-tuned checkpoint's model_name from the base checkpoint's own
+    rl_agent_config.json (falling back to the resolved model dir's name) instead of
+    hard-coding 'laya-typed-decisions', which is specific to one checkpoint variant
+    and wrong for any other (e.g. multilingual)."""
+    base_name = (base_cfg or {}).get("model_name") or base_model_dir_name
+    if not base_name:
+        die(
+            "cannot derive model_name: base rl_agent_config.json has no model_name and "
+            "the resolved model dir has no usable name"
+        )
+    return f"{base_name}-jev-ft"
+
+
+# jev-change: official-notebook-cell 4 (inside TRAIN_DDP_SCRIPT below) overrides
+# cfg['max_len']/cfg['head_max_len'] to 1024/256 before building the model. These
+# constants mirror that literal override so fit_task_head()/build_training_item() in
+# THIS process admit sequences against the SAME final budget the trained model actually
+# uses -- not the base checkpoint's own (possibly smaller) max_len/head_max_len, which
+# would otherwise let preprocessing admit sequences the model's real budget disagrees
+# with. If TRAIN_DDP_SCRIPT's override values ever change, these must change with them.
+DEFAULT_FINAL_MAX_LEN = 1024
+DEFAULT_FINAL_HEAD_MAX_LEN = 256
+
+
+def resolve_effective_cfg(base_cfg, max_len=DEFAULT_FINAL_MAX_LEN, head_max_len=DEFAULT_FINAL_HEAD_MAX_LEN):
+    """Return a NEW cfg dict (base_cfg is not mutated) with max_len/head_max_len set to
+    the final training-time values, matching TRAIN_DDP_SCRIPT's override."""
+    effective = dict(base_cfg or {})
+    effective["max_len"] = max_len
+    effective["head_max_len"] = head_max_len
+    return effective
+
+
 TRUNCATION_MARK = " …[truncated]"
 
 def fit_task_head(agent, state, questions):
@@ -440,6 +517,12 @@ def main():
     # (the export's real held-out split), replacing the notebook's
     # all_items[::15][:400] slice of the *training* data.
     calib_items_path = sys.argv[4]
+    # jev-change: fifth/sixth/seventh argv let the saved checkpoint record which base
+    # checkpoint it was fine-tuned from, instead of hard-coding model_name to
+    # 'laya-typed-decisions' (see derive_model_name() in train_from_export.py's main()).
+    model_name = sys.argv[5]
+    base_model_dir_name = sys.argv[6]
+    exporter_version = sys.argv[7]
 
     with open(os.path.join(model_dir, "rl_agent_config.json")) as f:
         cfg = json.load(f)
@@ -600,7 +683,9 @@ def main():
         tok.save_pretrained(os.path.join(output_dir, "tokenizer"))
 
         cfg["fine_tuned"] = True
-        cfg["model_name"] = "laya-typed-decisions"
+        cfg["model_name"] = model_name
+        cfg["base_model_dir_name"] = base_model_dir_name
+        cfg["exporter_version"] = exporter_version
         cfg["temperature"] = fitted_temps
         with open(os.path.join(output_dir, "rl_agent_config.json"), "w") as f:
             json.dump(cfg, f, indent=2)
@@ -715,6 +800,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     parser.add_argument("--export-dir", required=True, help="exports/<version>/laya folder with train/calibration/test.jsonl + manifest.json")
     parser.add_argument("--model-dir", default=None, help="Path to a pre-downloaded convaiinnovations/laya snapshot. If omitted, uses huggingface_hub.snapshot_download (network + model download -- do this on Kaggle, not locally).")
+    parser.add_argument("--model-subdir", default=None, help="Per-checkpoint subfolder under --model-dir/the downloaded snapshot root (e.g. 'multilingual' for the multilingual checkpoint). Omit for a checkpoint that lives at the snapshot root (e.g. the english checkpoint's historical layout).")
     parser.add_argument("--output-dir", required=True, help="Where to write the fine-tuned checkpoint + training_metadata.json")
     parser.add_argument("--max-truncated-fraction", type=float, default=0.02, help="Abort if more than this fraction of question-rows are dropped by tokenizer admission (default 2%%)")
     parser.add_argument("--allow-truncation", action="store_true", help="Proceed even if the truncated fraction exceeds --max-truncated-fraction")
@@ -747,11 +833,22 @@ def main():
     if model_dir is None:
         print("[download] no --model-dir given: fetching convaiinnovations/laya via snapshot_download (network)")
         model_dir = snapshot_download("convaiinnovations/laya")
-    _fix_tokenizer_config(model_dir)
+    resolved_model_dir = resolve_model_dir(model_dir, args.model_subdir)
+    validate_resolved_model_dir(resolved_model_dir)
+    _fix_tokenizer_config(str(resolved_model_dir))
 
-    tok = AutoTokenizer = __import__("transformers").AutoTokenizer.from_pretrained(os.path.join(model_dir, "tokenizer"))
-    with open(os.path.join(model_dir, "rl_agent_config.json")) as f:
-        cfg = json.load(f)
+    tok = AutoTokenizer = __import__("transformers").AutoTokenizer.from_pretrained(os.path.join(str(resolved_model_dir), "tokenizer"))
+    with open(os.path.join(str(resolved_model_dir), "rl_agent_config.json")) as f:
+        base_cfg = json.load(f)
+    # jev-change: fit_task_head()/build_training_item() in this process must admit
+    # sequences against the SAME max_len/head_max_len the model is actually trained with
+    # (TRAIN_DDP_SCRIPT overrides these to DEFAULT_FINAL_MAX_LEN/DEFAULT_FINAL_HEAD_MAX_LEN
+    # regardless of the base checkpoint's own values) -- see resolve_effective_cfg().
+    cfg = resolve_effective_cfg(base_cfg)
+    base_model_dir_name = args.model_subdir or Path(resolved_model_dir).name
+    derived_model_name = derive_model_name(base_cfg, base_model_dir_name)
+    print(f"[model] resolved_model_dir={resolved_model_dir} base_model_dir_name={base_model_dir_name!r} "
+          f"derived_model_name={derived_model_name!r}")
     # jev-change: a minimal agent-shaped object exposing only what fit_task_head()/assert_lossless()
     # read (tok, cfg, ._to_internal) -- the same pattern scripts/laya-budget.py's Shim uses, since
     # the notebook's training path never constructs a real laya.agent.Agent.
@@ -798,9 +895,13 @@ def main():
     ddp_script_path.write_text(TRAIN_DDP_SCRIPT, encoding="utf-8")
 
     # official-notebook-cell: 5 ("Launch Multi-GPU Fine-Tuning with torchrun")
+    # jev-change: argv[5:] (derived_model_name, base_model_dir_name, exporter_version) let
+    # TRAIN_DDP_SCRIPT's save step record model_name/base_model_dir_name/exporter_version
+    # instead of hard-coding model_name -- see derive_model_name() above.
     cmd = [
         "torchrun", "--standalone", "--nproc_per_node=2", str(ddp_script_path),
-        str(model_dir), str(output_dir), str(train_items_path), str(calib_items_path),
+        str(resolved_model_dir), str(output_dir), str(train_items_path), str(calib_items_path),
+        derived_model_name, base_model_dir_name, str(manifest.get("exporter_version") or ""),
     ]
     print("[train] executing:", " ".join(cmd))
     subprocess.run(cmd, check=True)
@@ -825,6 +926,9 @@ def main():
         "export_dataset_version": manifest.get("dataset_version"),
         "export_source_data_sha256": manifest.get("source_data_sha256"),
         "export_sample_count": manifest.get("sample_count"),
+        "base_model_dir_name": base_model_dir_name,
+        "model_subdir": args.model_subdir,
+        "derived_model_name": derived_model_name,
         "hyperparameters": {
             "epochs": 4, "micro_batch": 8, "grad_accum": 4, "group_size": 4,
             "lr_encoder": 2.5e-5, "lr_head": 1.0e-4, "sigma_start": 0.4, "sigma_end": 0.1,
