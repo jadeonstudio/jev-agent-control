@@ -4,11 +4,13 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { randomUUID } from 'node:crypto';
+import { spawnSync, execFileSync } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
 import { atomicWrite, readText } from '../src/storage.mjs';
 import { digest } from '../src/training/schema.mjs';
 import { buildDataset } from '../src/training/dataset.mjs';
 import { fixture as trainingFixture, trace, outcome, REF } from './training-helpers.mjs';
-import { registerCheckpoint, freezeHoldout, listHoldouts, qualifyCandidate, compareCandidate,
+import { registerCheckpoint, activateCandidate, freezeHoldout, listHoldouts, qualifyCandidate, compareCandidate,
   promoteCandidate, rollbackLaya, layaStatus, loadQualification } from '../src/training/laya-lifecycle.mjs';
 
 // --- synthetic checkpoint fixture -------------------------------------------------
@@ -451,4 +453,40 @@ test('a promoted providers.json is loadable by the runtime provider loader', asy
   const c = loadProviderConfig(f.home);
   assert.equal(c.laya.checkpoint, reg.checkpoint);
   assert.ok(c.laya.qualification.calibrationVersion.length <= 80);
+});
+
+test('CLI laya register accepts --python so the first checkpoint can be registered before providers.json has a laya block', t => {
+  const f = trainingFixture(t);
+  const ckpt = makeCheckpointDir(fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'jev-laya-'))));
+  const python = execFileSync('python3', ['-c', 'import sys; print(sys.executable)'], { encoding: 'utf8' }).trim();
+  const bin = fileURLToPath(new URL('../bin/jev-control.mjs', import.meta.url));
+  const r = spawnSync(process.execPath, [bin, 'laya', 'register', '--checkpoint', ckpt, '--python', python, '--device', 'cpu', '--precision', 'fp16', '--home', f.home],
+    { encoding: 'utf8', env: { ...process.env, HOME: f.home, JEV_HOME: f.home } });
+  assert.equal(r.status, 0, r.stderr);
+  const out = JSON.parse(r.stdout);
+  const candidate = JSON.parse(fs.readFileSync(out.candidate, 'utf8'));
+  assert.equal(candidate.python, python);
+  assert.equal(candidate.precision, 'fp16');
+  assert.equal(fs.existsSync(path.join(f.home, 'providers.json')), false); // register never activates
+  const bad = spawnSync(process.execPath, [bin, 'laya', 'register', '--checkpoint', ckpt, '--python', 'relative/python', '--device', 'cpu', '--home', f.home],
+    { encoding: 'utf8', env: { ...process.env, HOME: f.home, JEV_HOME: f.home } });
+  assert.notEqual(bad.status, 0);
+});
+
+test('laya activate installs an unqualified candidate for shadow/data collection only and is undone by rollback', t => {
+  const f = trainingFixture(t);
+  const reg = registerCheckpoint(f.home, { checkpointDir: makeCheckpointDir(fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'jev-laya-')))), model: 'laya/base', device: 'cpu', python: '/usr/bin/python3', precision: 'fp16', fingerprintImpl: fakeFingerprint });
+  const r = activateCandidate(f.home, { candidateHash: reg.checkpoint });
+  assert.equal(r.activated, true); assert.equal(r.qualified, false);
+  const providers = JSON.parse(fs.readFileSync(path.join(f.home, 'providers.json'), 'utf8'));
+  assert.equal(providers.provider, 'jev'); // provider selection is a separate explicit command
+  assert.equal(providers.laya.checkpoint, reg.checkpoint);
+  assert.equal(providers.laya.precision, 'fp16');
+  assert.equal(providers.laya.qualification, undefined); // never applied in ON without a qualification
+  // An active qualified checkpoint is never silently replaced by an unqualified one.
+  writeProviders(f.home, { ...providers, laya: { ...providers.laya, qualification: { checkpoint: reg.checkpoint, calibrationVersion: 'v1', purposes: ['route'], minConfidence: .9, minChoiceProbability: .9, noulCertainty: .9 } } });
+  assert.throws(() => activateCandidate(f.home, { candidateHash: reg.checkpoint }), /ACTIVE_CHECKPOINT_QUALIFIED/);
+  writeProviders(f.home, providers);
+  rollbackLaya(f.home);
+  assert.equal(JSON.parse(fs.readFileSync(path.join(f.home, 'providers.json'), 'utf8')).laya, null);
 });

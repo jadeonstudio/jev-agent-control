@@ -168,6 +168,8 @@ Exporter는 canonical 형식과 분리돼 있으며, 학습 실행 코드는 없
 
 ```text
 (별도 laya-kit 오프라인 학습) → laya register → laya holdout freeze → laya qualify → laya compare → laya promote → laya rollback
+
+자격이 없는 checkpoint를 SHADOW·데이터 수집용으로 쓰려면 `laya register --python <절대경로>`(첫 등록 시 providers.json이 없어도 됨) 뒤 `laya activate --candidate <hash>`를 쓴다. activate는 qualification 없이 laya 블록을 설치하므로 ON에서도 결과를 채택하지 않는다. 이미 자격을 받은 활성 checkpoint는 `ACTIVE_CHECKPOINT_QUALIFIED`로 덮어쓰지 않는다. provider 선택은 바꾸지 않고, rollback이 promote와 같은 스택으로 되돌린다. checkpoint가 바뀌어도 운영 설정(startupTimeoutMs, idleTimeoutMs, serverIdleUnloadMs)은 유지된다.
 ```
 
 산출물은 모두 `JEV_HOME/laya/` 아래(디렉터리 0700 / 파일 0600, symlink·bare-Git 경로 거부)에 있으며 `providers.json`과 분리돼 있다:

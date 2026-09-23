@@ -290,6 +290,27 @@ function readHistory(home) {
 }
 
 // --- promote / rollback ------------------------------------------------
+// Operator runtime knobs survive a checkpoint change; only the checkpoint identity and qualification move.
+function runtimeSettings(laya) {
+  return { startupTimeoutMs: laya?.startupTimeoutMs ?? 120000, idleTimeoutMs: laya?.idleTimeoutMs ?? 60000,
+    ...(laya?.serverIdleUnloadMs !== undefined ? { serverIdleUnloadMs: laya.serverIdleUnloadMs } : {}) };
+}
+/** Install an UNQUALIFIED candidate for shadow/data collection. Without a qualification block its answers are
+ * never applied in ON, and a currently qualified checkpoint is never silently replaced. Undone by rollback. */
+export function activateCandidate(home, { candidateHash } = {}) {
+  if (!HASH.test(candidateHash)) fail('INVALID_CANDIDATE_HASH');
+  const candidate = loadCandidate(home, candidateHash);
+  const file = providersFile(home);
+  const old = readText(file, { optional: true, privateFile: true });
+  const currentConfig = old === null ? { version: 1, provider: 'jev', laya: null } : JSON.parse(old);
+  if (currentConfig.laya?.qualification) fail('ACTIVE_CHECKPOINT_QUALIFIED');
+  const nextLaya = { ...candidate, ...runtimeSettings(currentConfig.laya) };
+  const nextConfig = { ...currentConfig, laya: nextLaya }; // provider selection is a separate explicit command
+  validateProviderConfig(structuredClone(nextConfig));
+  atomicWrite(file, JSON.stringify(nextConfig, null, 2) + '\n', { expected: old });
+  appendHistory(home, { action: 'activate', candidate: candidateHash, before: currentConfig.laya ?? null, after: nextLaya });
+  return { activated: true, qualified: false, checkpoint: candidateHash, previous: currentConfig.laya ?? null };
+}
 export function promoteCandidate(home, { candidateHash, holdoutName, maxRegression = 0.02 } = {}) {
   if (!HASH.test(candidateHash)) fail('INVALID_CANDIDATE_HASH');
   if (!Number.isFinite(maxRegression) || maxRegression < 0 || maxRegression > 1) fail('INVALID_PROMOTE_PARAMS');
@@ -322,8 +343,7 @@ export function promoteCandidate(home, { candidateHash, holdoutName, maxRegressi
   const file = providersFile(home);
   const old = readText(file, { optional: true, privateFile: true });
   const currentConfig = old === null ? { version: 1, provider: 'jev', laya: null } : JSON.parse(old);
-  const nextLaya = { ...candidate,
-    startupTimeoutMs: currentConfig.laya?.startupTimeoutMs ?? 120000, idleTimeoutMs: currentConfig.laya?.idleTimeoutMs ?? 60000,
+  const nextLaya = { ...candidate, ...runtimeSettings(currentConfig.laya),
     qualification: { checkpoint: qualification.checkpoint, calibrationVersion: qualification.calibrationVersion, purposes: qualification.purposes,
       minConfidence: qualification.minConfidence, minChoiceProbability: qualification.minChoiceProbability, noulCertainty: qualification.noulCertainty,
       precision: qualification.precision ?? candidate.precision ?? 'fp32' } };
@@ -338,7 +358,7 @@ export function rollbackLaya(home) {
   // so it cannot become a gate-free re-promotion.
   const stack = [];
   for (const entry of readHistory(home)) {
-    if (entry.action === 'promote') stack.push(entry);
+    if (entry.action === 'promote' || entry.action === 'activate') stack.push(entry);
     else if (entry.action === 'rollback') stack.pop();
   }
   if (!stack.length) fail('NO_HISTORY_TO_ROLLBACK');
