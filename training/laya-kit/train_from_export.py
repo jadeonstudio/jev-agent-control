@@ -615,10 +615,102 @@ def oom_suggestion(batch_size, grad_accum):
     )
 
 
+def compute_calib_agreement(calib_preds):
+    # jev-change: per-epoch best-checkpoint selection (2026-09-23: a real
+    # local run overfit badly -- train argmax agreement ~0.99/0.92/0.95 vs
+    # held-out test ~0.72/0.58/0.60). Kept textually identical to
+    # train_from_export.py's compute_calib_agreement() (this script must stay
+    # standalone -- tests/test_laya_kit_eval_and_epoch_select.py checks
+    # parity). QTYPES: choice=0, score=1, noul=2 (laya.common.QTYPES).
+    names = {0: "choice", 1: "score", 2: "noul"}
+    correct = {0: 0, 1: 0, 2: 0}
+    total = {0: 0, 1: 0, 2: 0}
+    for qtype, logits, target in calib_preds:
+        if not logits or not target:
+            continue
+        pred_idx = max(range(len(logits)), key=lambda i: logits[i])
+        gold_idx = max(range(len(target)), key=lambda i: target[i])
+        total[qtype] += 1
+        if pred_idx == gold_idx:
+            correct[qtype] += 1
+    agreement = {names[qt]: (correct[qt] / total[qt] if total[qt] else None) for qt in names}
+    scored = [v for v in agreement.values() if v is not None]
+    agreement["mean"] = (sum(scored) / len(scored)) if scored else None
+    return agreement
+
+
+def collect_calib_logits(model, calib_items, tok, device, autocast_device, autocast_dtype, autocast_enabled):
+    """Run calib_items through model in eval mode; return (qtype, logits, target)
+    tuples in the shape compute_calib_agreement() consumes. Shared by
+    epoch_end_fn (best-epoch selection) and finalize_and_save (temperature
+    fitting) so both read calibration items through the identical forward
+    pass."""
+    model.eval()
+    calib_preds = []
+    with torch.no_grad():
+        for c_idx in range(0, len(calib_items), 16):
+            c_chunk = calib_items[c_idx:c_idx + 16]
+            cb = collate_train_batch(c_chunk, tok.pad_token_id)
+            if autocast_enabled:
+                with torch.autocast(autocast_device, dtype=autocast_dtype):
+                    l_sub, _ = model(
+                        cb["input_ids"].to(device),
+                        cb["attention_mask"].to(device),
+                        cb["marker_pos"].to(device),
+                        cb["marker_mask"].to(device),
+                        cb["qtype"].to(device)
+                    )
+            else:
+                l_sub, _ = model(
+                    cb["input_ids"].to(device),
+                    cb["attention_mask"].to(device),
+                    cb["marker_pos"].to(device),
+                    cb["marker_mask"].to(device),
+                    cb["qtype"].to(device)
+                )
+            l_np = l_sub.float().cpu().numpy()
+            for r_idx, it in enumerate(c_chunk):
+                k = len(it["markers"])
+                calib_preds.append((it["qtype"], l_np[r_idx, :k].tolist(), it["target"]))
+    return calib_preds
+
+
+def make_epoch_end_fn(model, calib_items, tok, device, *, autocast_device, autocast_dtype, autocast_enabled,
+                       rank, world_size, dist_module, select_best_epoch, best_state, epoch_agreements, log_prefix):
+    """Build the epoch_end_fn callback run_training_loop calls after every
+    epoch (DDP: only rank 0 evaluates, then all ranks barrier so training
+    stays in lockstep). Logs "[select] epoch N calib_agreement ..." and, when
+    the mean calibration agreement improves, keeps a CPU copy of the model's
+    state_dict in best_state (freed/loaded back in main_ddp()/main_local()
+    after training finishes)."""
+    def epoch_end_fn(epoch):
+        if select_best_epoch and rank == 0:
+            calib_preds = collect_calib_logits(model, calib_items, tok, device,
+                                                autocast_device, autocast_dtype, autocast_enabled)
+            agreement = compute_calib_agreement(calib_preds)
+            epoch_agreements.append({"epoch": epoch + 1, **agreement})
+
+            def fmt(v):
+                return "n/a" if v is None else f"{v:.4f}"
+
+            print(f"{log_prefix} [select] epoch {epoch + 1} calib_agreement "
+                  f"choice={fmt(agreement['choice'])} score={fmt(agreement['score'])} "
+                  f"noul={fmt(agreement['noul'])} mean={fmt(agreement['mean'])}")
+            mean_score = agreement["mean"]
+            if mean_score is not None and (best_state["score"] is None or mean_score > best_state["score"]):
+                best_state["score"] = mean_score
+                best_state["epoch"] = epoch + 1
+                best_state["state_dict"] = {k: v.detach().to("cpu", copy=True) for k, v in model.state_dict().items()}
+            model.train()
+        if world_size > 1:
+            dist_module.barrier()
+    return epoch_end_fn
+
+
 def run_training_loop(forward_fn, items, params_for_clip, optimizer, scheduler, tok, *,
                        device, epochs, micro_batch, grad_accum, group_size, sigma_start, sigma_end,
                        rank, world_size, use_scaler, scaler, autocast_device, autocast_dtype,
-                       autocast_enabled, max_steps, mem_log_fn, log_prefix):
+                       autocast_enabled, max_steps, mem_log_fn, log_prefix, epoch_end_fn=None):
     """official-notebook-cell 4's inner training loop, generalized over
     (forward_fn, world_size, autocast/scaler settings) so it is IDENTICAL for
     DDP (world_size=2, forward_fn=ddp_model, cuda fp16 autocast+GradScaler) and
@@ -726,12 +818,16 @@ def run_training_loop(forward_fn, items, params_for_clip, optimizer, scheduler, 
                     print(f"{log_prefix} [smoke] reached --max-steps={max_steps}, stopping early")
                 if mem_log_fn:
                     mem_log_fn(epoch)
+                if epoch_end_fn:
+                    epoch_end_fn(epoch)
                 return {"epochs_completed": epochs_completed, "global_step": global_step,
                         "elapsed_s": time.time() - t0, "stopped_early": True}
 
         epochs_completed = epoch + 1
         if mem_log_fn:
             mem_log_fn(epoch)
+        if epoch_end_fn:
+            epoch_end_fn(epoch)
         if rank == 0:
             print(f"=== {log_prefix} Epoch {epoch+1}/{epochs} Completed in {time.time()-t0:.1f}s | Avg Loss: {epoch_loss/max(1, n_batches):.4f} ===")
 
@@ -739,43 +835,19 @@ def run_training_loop(forward_fn, items, params_for_clip, optimizer, scheduler, 
             "elapsed_s": time.time() - t0, "stopped_early": False}
 
 
-def finalize_and_save(model, tok, calib_items_path, output_dir, model_name, base_model_dir_name,
+def finalize_and_save(model, tok, calib_items, output_dir, model_name, base_model_dir_name,
                        exporter_version, cfg, *, device, autocast_device, autocast_dtype, autocast_enabled):
     """official-notebook-cell 4's post-training calibration-temperature-fit + save
     step, extracted so both main_ddp() (rank 0 only) and main_local() (always,
     world_size=1) call the IDENTICAL save path -- same checkpoint layout
-    (model.safetensors fp16, encoder/, tokenizer/, rl_agent_config.json)."""
+    (model.safetensors fp16, encoder/, tokenizer/, rl_agent_config.json).
+
+    jev-change: calib_items is now the already-loaded list (not a path) so the
+    caller can load calibration.jsonl's preprocessed items once and reuse them
+    for both epoch_end_fn's per-epoch selection and this final temperature
+    fit, via the shared collect_calib_logits() helper."""
     print("\nFitting post-training calibration temperatures...")
-    model.eval()
-    # jev-change: real held-out calibration.jsonl items, not every-15th
-    # training item.
-    calib_items = torch.load(calib_items_path, weights_only=False)
-    calib_preds = []
-    with torch.no_grad():
-        for c_idx in range(0, len(calib_items), 16):
-            c_chunk = calib_items[c_idx:c_idx + 16]
-            cb = collate_train_batch(c_chunk, tok.pad_token_id)
-            if autocast_enabled:
-                with torch.autocast(autocast_device, dtype=autocast_dtype):
-                    l_sub, _ = model(
-                        cb["input_ids"].to(device),
-                        cb["attention_mask"].to(device),
-                        cb["marker_pos"].to(device),
-                        cb["marker_mask"].to(device),
-                        cb["qtype"].to(device)
-                    )
-            else:
-                l_sub, _ = model(
-                    cb["input_ids"].to(device),
-                    cb["attention_mask"].to(device),
-                    cb["marker_pos"].to(device),
-                    cb["marker_mask"].to(device),
-                    cb["qtype"].to(device)
-                )
-            l_np = l_sub.float().cpu().numpy()
-            for r_idx, it in enumerate(c_chunk):
-                k = len(it["markers"])
-                calib_preds.append((it["qtype"], l_np[r_idx, :k], it["target"]))
+    calib_preds = collect_calib_logits(model, calib_items, tok, device, autocast_device, autocast_dtype, autocast_enabled)
 
     fitted_temps = [1.2, 1.2, 1.2]
     try:
@@ -803,6 +875,22 @@ def finalize_and_save(model, tok, calib_items_path, output_dir, model_name, base
     print(f"Model successfully saved to {output_dir}!")
 
 
+def write_epoch_selection_metadata(output_dir, select_best_epoch, selected_epoch, epoch_agreements):
+    # jev-change: per-epoch best-checkpoint selection metadata, folded into
+    # training_metadata.json by train_from_export.py's outer main() (see
+    # docs/TRAINING_DATA.md's promotion flow -- qualify -> compare -> promote
+    # needs to know which epoch a saved checkpoint actually came from).
+    path = os.path.join(output_dir, "epoch_selection.json")
+    with open(path, "w") as f:
+        json.dump({
+            "select_best_epoch": select_best_epoch,
+            "selected_epoch": selected_epoch,
+            "epoch_agreements": epoch_agreements,
+        }, f, indent=2)
+    print(f"wrote {path}")
+    return path
+
+
 def load_common_argv():
     model_dir = sys.argv[1]
     output_dir = sys.argv[2]
@@ -817,10 +905,14 @@ def load_common_argv():
     model_name = sys.argv[5]
     base_model_dir_name = sys.argv[6]
     exporter_version = sys.argv[7]
-    # jev-change: argv[8] selects "ddp" (default, unchanged invocation -- see
-    # train_from_export.py's torchrun cmd, still exactly 7 args) or "local".
+    # jev-change: argv[8] selects "ddp" or "local".
     mode = sys.argv[8] if len(sys.argv) > 8 else "ddp"
-    return model_dir, output_dir, train_items_path, calib_items_path, model_name, base_model_dir_name, exporter_version, mode
+    # jev-change: argv[9] is "1"/"0" for --select-best-epoch, shared by
+    # main_ddp() and main_local() (see make_epoch_end_fn()). Defaults to
+    # enabled when omitted, matching train_from_export.py's own default.
+    select_best_epoch = (sys.argv[9] != "0") if len(sys.argv) > 9 else True
+    return (model_dir, output_dir, train_items_path, calib_items_path, model_name,
+            base_model_dir_name, exporter_version, mode, select_best_epoch)
 
 
 def main_ddp():
@@ -835,7 +927,7 @@ def main_ddp():
     device = torch.device("cuda", local_rank)
 
     (model_dir, output_dir, train_items_path, calib_items_path, model_name,
-     base_model_dir_name, exporter_version, _mode) = load_common_argv()
+     base_model_dir_name, exporter_version, _mode, select_best_epoch) = load_common_argv()
 
     with open(os.path.join(model_dir, "rl_agent_config.json")) as f:
         cfg = json.load(f)
@@ -859,6 +951,10 @@ def main_ddp():
 
     all_items = torch.load(train_items_path, weights_only=False)
     my_items = all_items[rank::world_size]
+    # jev-change: best-epoch selection (make_epoch_end_fn()) evaluates the
+    # SAME calib_items.pt finalize_and_save() later fits temperatures on --
+    # loaded once here and reused for both.
+    calib_items = torch.load(calib_items_path, weights_only=False)
 
     GRAD_ACCUM = 4  # Effective batch across 2 GPUs = 64 sequences (8 * 2 * 4)
 
@@ -869,21 +965,38 @@ def main_ddp():
     if rank == 0:
         print(f"Starting 2xT4 DDP training: {len(all_items)} total items | {len(my_items)} per rank | {EPOCHS} epochs")
 
+    # jev-change: per-epoch calibration-agreement checkpoint selection. Only
+    # rank 0 evaluates/keeps the CPU state_dict copy; epoch_end_fn barriers
+    # all ranks afterward so training stays in lockstep.
+    best_state = {"score": None, "epoch": None, "state_dict": None}
+    epoch_agreements = []
+    epoch_end_fn = make_epoch_end_fn(
+        model, calib_items, tok, device, autocast_device="cuda", autocast_dtype=torch.float16,
+        autocast_enabled=True, rank=rank, world_size=world_size, dist_module=dist,
+        select_best_epoch=select_best_epoch, best_state=best_state, epoch_agreements=epoch_agreements,
+        log_prefix="[ddp]")
+
     run_training_loop(
         ddp_model, my_items, list(ddp_model.parameters()), optimizer, scheduler, tok,
         device=device, epochs=EPOCHS, micro_batch=MICRO_BATCH, grad_accum=GRAD_ACCUM, group_size=GROUP_SIZE,
         sigma_start=SIGMA_START, sigma_end=SIGMA_END, rank=rank, world_size=world_size,
         use_scaler=True, scaler=scaler, autocast_device="cuda", autocast_dtype=torch.float16,
-        autocast_enabled=True, max_steps=0, mem_log_fn=None, log_prefix="[ddp]")
+        autocast_enabled=True, max_steps=0, mem_log_fn=None, log_prefix="[ddp]", epoch_end_fn=epoch_end_fn)
 
     dist.barrier()
 
     if rank == 0:
         del optimizer, scaler, scheduler
         torch.cuda.empty_cache()
-        finalize_and_save(model, tok, calib_items_path, output_dir, model_name, base_model_dir_name,
+        selected_epoch = None
+        if select_best_epoch and best_state["state_dict"] is not None:
+            selected_epoch = best_state["epoch"]
+            model.load_state_dict(best_state["state_dict"], strict=True)
+            del best_state["state_dict"]  # jev-change: free the ~1.3GB CPU copy once loaded.
+        finalize_and_save(model, tok, calib_items, output_dir, model_name, base_model_dir_name,
                            exporter_version, cfg, device=device, autocast_device="cuda",
                            autocast_dtype=torch.float16, autocast_enabled=True)
+        write_epoch_selection_metadata(output_dir, select_best_epoch, selected_epoch, epoch_agreements)
 
     dist.destroy_process_group()
 
@@ -895,12 +1008,12 @@ def main_local():
     # optimizer, LR schedule, epochs, per-device batch size and seed are the
     # SAME as main_ddp(); only process/device wiring and precision differ.
     (model_dir, output_dir, train_items_path, calib_items_path, model_name,
-     base_model_dir_name, exporter_version, _mode) = load_common_argv()
-    device_name = sys.argv[9] if len(sys.argv) > 9 else "mps"
-    grad_accum = int(sys.argv[10]) if len(sys.argv) > 10 else 8
-    micro_batch = int(sys.argv[11]) if len(sys.argv) > 11 else MICRO_BATCH
-    mps_autocast = sys.argv[12] if len(sys.argv) > 12 else "off"
-    max_steps = int(sys.argv[13]) if len(sys.argv) > 13 else 0
+     base_model_dir_name, exporter_version, _mode, select_best_epoch) = load_common_argv()
+    device_name = sys.argv[10] if len(sys.argv) > 10 else "mps"
+    grad_accum = int(sys.argv[11]) if len(sys.argv) > 11 else 8
+    micro_batch = int(sys.argv[12]) if len(sys.argv) > 12 else MICRO_BATCH
+    mps_autocast = sys.argv[13] if len(sys.argv) > 13 else "off"
+    max_steps = int(sys.argv[14]) if len(sys.argv) > 14 else 0
 
     if device_name == "mps" and not torch.backends.mps.is_available():
         print("[FATAL] --device mps requested but torch.backends.mps.is_available() is False", file=sys.stderr)
@@ -927,6 +1040,10 @@ def main_local():
 
     all_items = torch.load(train_items_path, weights_only=False)
     my_items = list(all_items)  # world_size=1: no DDP rank split, every item is "mine"
+    # jev-change: best-epoch selection (make_epoch_end_fn()) evaluates the
+    # SAME calib_items.pt finalize_and_save() later fits temperatures on --
+    # loaded once here and reused for both.
+    calib_items = torch.load(calib_items_path, weights_only=False)
 
     optimizer, scheduler = build_optimizer_and_scheduler(
         list(model.named_parameters()), len(my_items), micro_batch, grad_accum, EPOCHS)
@@ -956,17 +1073,34 @@ def main_local():
             except Exception as e:
                 print(f"[mem] epoch {epoch+1} mps memory read failed: {e}")
 
+    # jev-change: per-epoch calibration-agreement checkpoint selection --
+    # world_size=1 here, so epoch_end_fn never barriers.
+    best_state = {"score": None, "epoch": None, "state_dict": None}
+    epoch_agreements = []
+    epoch_end_fn = make_epoch_end_fn(
+        model, calib_items, tok, device, autocast_device=autocast_device, autocast_dtype=autocast_dtype,
+        autocast_enabled=autocast_enabled, rank=0, world_size=1, dist_module=None,
+        select_best_epoch=select_best_epoch, best_state=best_state, epoch_agreements=epoch_agreements,
+        log_prefix="[local]")
+
     result = run_training_loop(
         model, my_items, list(model.parameters()), optimizer, scheduler, tok,
         device=device, epochs=EPOCHS, micro_batch=micro_batch, grad_accum=grad_accum, group_size=GROUP_SIZE,
         sigma_start=SIGMA_START, sigma_end=SIGMA_END, rank=0, world_size=1,
         use_scaler=False, scaler=None, autocast_device=autocast_device, autocast_dtype=autocast_dtype,
-        autocast_enabled=autocast_enabled, max_steps=max_steps, mem_log_fn=mem_log_fn, log_prefix="[local]")
+        autocast_enabled=autocast_enabled, max_steps=max_steps, mem_log_fn=mem_log_fn, log_prefix="[local]",
+        epoch_end_fn=epoch_end_fn)
 
     del optimizer, scheduler
-    finalize_and_save(model, tok, calib_items_path, output_dir, model_name, base_model_dir_name,
+    selected_epoch = None
+    if select_best_epoch and best_state["state_dict"] is not None:
+        selected_epoch = best_state["epoch"]
+        model.load_state_dict(best_state["state_dict"], strict=True)
+        del best_state["state_dict"]  # jev-change: free the ~1.3GB CPU copy once loaded.
+    finalize_and_save(model, tok, calib_items, output_dir, model_name, base_model_dir_name,
                        exporter_version, cfg, device=device, autocast_device=autocast_device,
                        autocast_dtype=autocast_dtype, autocast_enabled=autocast_enabled)
+    write_epoch_selection_metadata(output_dir, select_best_epoch, selected_epoch, epoch_agreements)
 
     # jev-change: structured local-run metadata the outer train_from_export.py
     # main() reads back and folds into training_metadata.json (device/local
@@ -984,7 +1118,7 @@ def main_local():
 
 def main():
     _mode_probe = load_common_argv()
-    mode = _mode_probe[-1]
+    mode = _mode_probe[7]
     if mode == "local":
         main_local()
     else:
@@ -993,6 +1127,77 @@ def main():
 if __name__ == "__main__":
     main()
 '''
+
+
+# ---------------------------------------------------------------------------
+# jev-change: the official notebook's evaluation cell assumes the HF
+# `LocalLLaMA/typed-decisions` test split's gold answers carry an explicit
+# "label"/"score" key. The jev export never writes one -- exportDataset() in
+# src/training/dataset.mjs writes `gold[qid] = {"probabilities": {...}}`
+# only (confirmed against check_export.py's check_gold_probabilities(), which
+# enforces exactly that shape). A real local run's post-training eval step
+# failed with "[eval] evaluation step failed or was skipped: 'label'" because
+# evaluate_checkpoint() read `g_ans["label"]` directly. resolve_gold_label()
+# derives the gold label the same way build_training_item() derives the
+# training target's own label (`target.index(max(target))`, i.e. argmax over
+# probabilities), so evaluation compares like with like. An explicit "label"
+# key still wins when present (e.g. a hand-authored fixture), for backward
+# compatibility with the official notebook's own dataset shape.
+# ---------------------------------------------------------------------------
+def resolve_gold_label(q_type, g_ans, keys=None, n_levels=None):
+    if q_type == "choice":
+        if "label" in g_ans:
+            return str(g_ans["label"])
+        if not keys:
+            die("resolve_gold_label: q_type='choice' requires keys")
+        probs = g_ans.get("probabilities") or {}
+        values = [probs.get(k, 0.0) for k in keys]
+        return keys[values.index(max(values))]
+    if q_type == "noul":
+        if "label" in g_ans:
+            return str(g_ans["label"]).lower()
+        probs = g_ans.get("probabilities") or {}
+        values = [probs.get("false", 0.5), probs.get("true", 0.5)]
+        return "false" if values.index(max(values)) == 0 else "true"
+    if q_type == "score":
+        if "label" in g_ans:
+            return int(g_ans["label"])
+        if not n_levels:
+            die("resolve_gold_label: q_type='score' requires n_levels")
+        probs = g_ans.get("probabilities") or {}
+        values = [probs.get(str(i), 0.0) for i in range(n_levels)]
+        return values.index(max(values))
+    die(f"resolve_gold_label: unknown question type {q_type!r}")
+
+
+# ---------------------------------------------------------------------------
+# jev-change: pure aggregation helper for per-epoch best-checkpoint selection
+# (see TRAIN_DDP_SCRIPT's epoch_end_fn below). Computes the argmax(logits) ==
+# argmax(target) agreement fraction per question type (QTYPES: choice=0,
+# score=1, noul=2, matching laya.common.QTYPES) plus the unweighted mean over
+# qtypes that had at least one calibration item. Duplicated verbatim inside
+# TRAIN_DDP_SCRIPT (that script must stay standalone for Kaggle/local
+# subprocess execution and cannot import this module) --
+# tests/test_laya_kit_eval_and_epoch_select.py checks parity between the two,
+# the same way tests/test_laya_kit_local_mode.py checks
+# oom_suggestion()/format_oom_message() parity.
+# ---------------------------------------------------------------------------
+def compute_calib_agreement(calib_preds):
+    names = {0: "choice", 1: "score", 2: "noul"}
+    correct = {0: 0, 1: 0, 2: 0}
+    total = {0: 0, 1: 0, 2: 0}
+    for qtype, logits, target in calib_preds:
+        if not logits or not target:
+            continue
+        pred_idx = max(range(len(logits)), key=lambda i: logits[i])
+        gold_idx = max(range(len(target)), key=lambda i: target[i])
+        total[qtype] += 1
+        if pred_idx == gold_idx:
+            correct[qtype] += 1
+    agreement = {names[qt]: (correct[qt] / total[qt] if total[qt] else None) for qt in names}
+    scored = [v for v in agreement.values() if v is not None]
+    agreement["mean"] = (sum(scored) / len(scored)) if scored else None
+    return agreement
 
 
 # ---------------------------------------------------------------------------
@@ -1037,11 +1242,19 @@ def evaluate_checkpoint(output_dir, export_dir, laya_module, device="cuda"):
             if q_type == "choice":
                 keys = list(qdef["criteria"].keys())
                 pred_choice = p_ans["choice"]
-                gold_label = str(g_ans["label"])
+                gold_label = resolve_gold_label(q_type, g_ans, keys=keys)
                 is_corr = float(pred_choice == gold_label)
                 accuracies.append(is_corr); all_corrects.append(is_corr)
-                p_probs = np.array([p_ans["probabilities"].get(k, 1e-6) for k in keys])
-                g_probs = np.array([g_ans["probabilities"].get(k, 1e-6) for k in keys])
+                # jev-change: dtype=float64 is required, not just convenient --
+                # the export's objective/human-labeled gold probabilities are a
+                # one-hot {key: 1 or 0} dict (targetDistribution() in
+                # src/training/schema.mjs); JSON round-trips a whole number
+                # like `1`/`0` as a Python int, so an untyped np.array() here
+                # can infer int64 and the in-place `/=` below then raises
+                # "Cannot cast ufunc 'divide' output from dtype('float64') to
+                # dtype('int64')" (observed on a real smoke run, 2026-09-23).
+                p_probs = np.array([p_ans["probabilities"].get(k, 1e-6) for k in keys], dtype=np.float64)
+                g_probs = np.array([g_ans["probabilities"].get(k, 1e-6) for k in keys], dtype=np.float64)
                 p_probs /= p_probs.sum(); g_probs /= g_probs.sum()
                 all_confs.append(float(p_probs.max()))
                 soft_accuracies.append(float((p_probs * g_probs).sum()))
@@ -1051,7 +1264,7 @@ def evaluate_checkpoint(output_dir, export_dir, laya_module, device="cuda"):
             elif q_type == "noul":
                 p_val = p_ans["noul"]
                 g_val = g_ans.get("noul", g_ans.get("probabilities", {}).get("true", 0.5))
-                gold_label = str(g_ans["label"]).lower()
+                gold_label = resolve_gold_label(q_type, g_ans)
                 pred_label = "true" if p_val >= 0.5 else "false"
                 is_corr = float(pred_label == gold_label)
                 accuracies.append(is_corr); all_corrects.append(is_corr)
@@ -1064,11 +1277,18 @@ def evaluate_checkpoint(output_dir, export_dir, laya_module, device="cuda"):
                 kl_divs.append(float((g_dist * np.log(np.clip(g_dist / p_dist, 1e-12, 1e4))).sum()))
             elif q_type == "score":
                 p_score = p_ans["score"]
-                g_score = g_ans.get("score", 0.0)
+                n_levels = len(qdef.get("criteria", []))
+                # jev-change: the real export's gold answer has no "score" key
+                # (only "probabilities"), so the gold level is the argmax over
+                # probabilities (resolve_gold_label), and the gold scalar used
+                # for score_mae/within_1_level falls back to that level instead
+                # of the notebook's own gold "score" float, which this export
+                # never provides.
+                g_lvl = resolve_gold_label(q_type, g_ans, n_levels=n_levels)
+                g_score = g_ans.get("score", float(g_lvl))
                 score_maes.append(abs(p_score - g_score))
                 within_one.append(float(abs(p_score - g_score) <= 1.0))
-                n_levels = len(qdef.get("criteria", []))
-                p_probs_score = np.array([p_ans["probabilities"].get(str(i), 0.0) for i in range(n_levels)])
+                p_probs_score = np.array([p_ans["probabilities"].get(str(i), 0.0) for i in range(n_levels)], dtype=np.float64)
                 if p_probs_score.sum() > 0:
                     p_probs_score /= p_probs_score.sum()
                     p_lvl = int(np.argmax(p_probs_score))
@@ -1076,7 +1296,6 @@ def evaluate_checkpoint(output_dir, export_dir, laya_module, device="cuda"):
                 else:
                     p_lvl = int(round(p_score))
                     all_confs.append(0.5)
-                g_lvl = int(g_ans.get("label", int(round(g_score))))
                 is_corr = float(p_lvl == g_lvl)
                 accuracies.append(is_corr); all_corrects.append(is_corr)
 
@@ -1112,6 +1331,12 @@ def main():
     parser.add_argument("--batch-size", type=int, default=None, help="--local only: per-step micro batch size (default 8, same as the DDP recipe's MICRO_BATCH). If --grad-accum is not also given, it is scaled to keep the same effective global batch -- use a smaller --batch-size if training OOMs.")
     parser.add_argument("--mps-autocast", choices=["bf16", "off"], default="off", help="--local only: MPS autocast dtype during the forward pass. Default off (fp32) -- MPS fp16 autocast is unreliable for training; bf16 is opt-in.")
     parser.add_argument("--max-steps", type=int, default=None, help="--local only, for smoke validation: stop after this many optimizer micro-steps total instead of running full EPOCHS. Omit for a real training run.")
+    parser.add_argument("--select-best-epoch", action=argparse.BooleanOptionalAction, default=True,
+                         help="After each epoch, evaluate calibration.jsonl argmax agreement and keep the "
+                              "best epoch's checkpoint instead of always the last one (default: on). A real "
+                              "local run (2026-09-23) overfit badly by the final epoch -- train agreement "
+                              "~0.99/0.92/0.95 (intent/difficulty/risk) vs held-out test ~0.72/0.58/0.60. "
+                              "Pass --no-select-best-epoch to keep the old always-last-epoch behavior.")
     args = parser.parse_args()
 
     if args.local:
@@ -1225,27 +1450,30 @@ def main():
     ddp_script_path = output_dir / "train_ddp.py"
     ddp_script_path.write_text(TRAIN_DDP_SCRIPT, encoding="utf-8")
 
+    select_best_epoch_flag = "1" if args.select_best_epoch else "0"
     if args.local:
         # jev-change: --local runs the SAME embedded script with plain python3
-        # (no torchrun/NCCL/DDP) -- argv[8:] select main_local() and its
-        # device/grad-accum/batch-size/autocast/max-steps. argv[1:8] are
-        # UNCHANGED from the DDP cmd below.
+        # (no torchrun/NCCL/DDP) -- argv[8] selects main_local(), argv[9] is
+        # --select-best-epoch, argv[10:] are device/grad-accum/batch-size/
+        # autocast/max-steps. argv[1:8] are UNCHANGED from the DDP cmd below.
         cmd = [
             sys.executable, str(ddp_script_path),
             str(resolved_model_dir), str(output_dir), str(train_items_path), str(calib_items_path),
             derived_model_name, base_model_dir_name, str(manifest.get("exporter_version") or ""),
-            "local", args.device, str(resolved_grad_accum), str(resolved_batch_size),
+            "local", select_best_epoch_flag, args.device, str(resolved_grad_accum), str(resolved_batch_size),
             args.mps_autocast, str(args.max_steps or 0),
         ]
     else:
         # official-notebook-cell: 5 ("Launch Multi-GPU Fine-Tuning with torchrun")
         # jev-change: argv[5:] (derived_model_name, base_model_dir_name, exporter_version) let
         # TRAIN_DDP_SCRIPT's save step record model_name/base_model_dir_name/exporter_version
-        # instead of hard-coding model_name -- see derive_model_name() above.
+        # instead of hard-coding model_name -- see derive_model_name() above. argv[8]="ddp" and
+        # argv[9]=--select-best-epoch are explicit so load_common_argv() can parse the latter.
         cmd = [
             "torchrun", "--standalone", "--nproc_per_node=2", str(ddp_script_path),
             str(resolved_model_dir), str(output_dir), str(train_items_path), str(calib_items_path),
             derived_model_name, base_model_dir_name, str(manifest.get("exporter_version") or ""),
+            "ddp", select_best_epoch_flag,
         ]
     print("[train] executing:", " ".join(cmd))
     subprocess.run(cmd, check=True)
@@ -1282,6 +1510,7 @@ def main():
             "epochs": 4, "micro_batch": resolved_batch_size, "grad_accum": resolved_grad_accum, "group_size": 4,
             "lr_encoder": 2.5e-5, "lr_head": 1.0e-4, "sigma_start": 0.4, "sigma_end": 0.1,
             "weight_decay": 0.01, "max_len": cfg.get("max_len", 1024), "head_max_len": cfg.get("head_max_len", 256),
+            "select_best_epoch": args.select_best_epoch,
         },
         "train_sequences": len(train_items),
         "train_truncated": train_truncated,
@@ -1297,6 +1526,15 @@ def main():
         local_run_path = output_dir / "local_training_run.json"
         if local_run_path.exists():
             training_metadata["local_run"] = json.loads(local_run_path.read_text(encoding="utf-8"))
+    # jev-change: fold epoch_selection.json (written by TRAIN_DDP_SCRIPT's
+    # main_ddp()/main_local() -- see write_epoch_selection_metadata()) into
+    # training_metadata.json so the promotion flow can see which epoch a
+    # saved checkpoint actually came from, for both --local and DDP runs.
+    selection_path = output_dir / "epoch_selection.json"
+    if selection_path.exists():
+        epoch_selection = json.loads(selection_path.read_text(encoding="utf-8"))
+        training_metadata["epoch_selection"] = epoch_selection
+        training_metadata["selected_epoch"] = epoch_selection.get("selected_epoch")
     (output_dir / "training_metadata.json").write_text(json.dumps(training_metadata, indent=2), encoding="utf-8")
     print(f"[done] wrote {output_dir / 'training_metadata.json'}")
     return 0

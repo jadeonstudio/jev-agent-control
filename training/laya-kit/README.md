@@ -233,11 +233,13 @@ owner 결정(2026-09-23): fine-tune 기준 checkpoint는 **multilingual**(mmBERT
     mps_driver_allocated_mib=...`, MPS에 진짜 peak 카운터가 없어 best-effort 근사치).
     OOM이 나면(`RuntimeError`에 "out of memory") 학습을 멈추고 `--batch-size`를 반으로
     줄이고 `--grad-accum`을 비례해서 늘리라는 구체적 메시지를 낸다.
-  - 산출물: `model.safetensors`(fp16, notebook과 동일), `encoder/`, `tokenizer/`,
-    `rl_agent_config.json`(model_name/base_model_dir_name/exporter_version 포함, DDP와
-    동일 레이아웃), `training_metadata.json`(`mode:"local"`, `device`, 하이퍼파라미터에
-    실제 micro_batch/grad_accum 포함, `local_run`에 device/grad_accum/epochs_completed/
-    wall_time_s), 그리고 로컬 전용 `local_training_run.json`.
+  - 산출물: `model.safetensors`(fp16, notebook과 동일 -- best-epoch 선택이 켜져 있으면
+    선택된 epoch의 가중치), `encoder/`, `tokenizer/`, `rl_agent_config.json`(model_name/
+    base_model_dir_name/exporter_version 포함, DDP와 동일 레이아웃), `training_metadata.json`
+    (`mode:"local"`, `device`, 하이퍼파라미터에 실제 micro_batch/grad_accum/
+    select_best_epoch 포함, `local_run`에 device/grad_accum/epochs_completed/wall_time_s,
+    `epoch_selection`/`selected_epoch`는 아래 절 참고), 그리고 로컬 전용
+    `local_training_run.json`.
 - **Smoke 실측 (2026-09-23, M4 Pro, multilingual base, 합성 export 12/6/6행, `--local
   --device mps`)**: 합성 데이터로 12개 train 행 × 질문 3개 = 36 학습 시퀀스.
   `--max-steps 20`(micro-batch 20개, batch-size 8/grad-accum 8) 기준 총 11.953초 →
@@ -264,6 +266,68 @@ owner 결정(2026-09-23): fine-tune 기준 checkpoint는 **multilingual**(mmBERT
 - `docs/TRAINING_DATA.md`의 `providers.json` 예시에 `"device": "mps"`가 있는 것은
   **추론(inference) 시점**의 로컬 Laya worker 장치 설정이며, 이 학습 kit의 `--local`
   학습 경로와는 별개다(다만 같은 물리 장치를 쓴다). 혼동하지 않는다.
+
+## Epoch별 최적 checkpoint 선택 (`--select-best-epoch`, 기본 ON, 2026-09-23 구현)
+
+- **문제(실측)**: 2026-09-23 M4 Pro 실측 학습(multilingual base, 실제 증류 데이터 train
+  7,659행, 4 epoch, batch 4 × grad-accum 16)이 마지막 epoch에서 심하게 과적합했다 --
+  train argmax agreement(intent/difficulty/risk) ≈ 0.99/0.92/0.95인데 held-out
+  test ≈ 0.72/0.58/0.60. 항상 마지막 epoch의 가중치만 저장하는 기존 동작은 최적이
+  아닌 checkpoint를 승격 후보로 넘길 위험이 있다.
+- **동작**: `train_from_export.py`가 매 epoch 끝(DDP/`--local` 공통, `run_training_loop()`의
+  `epoch_end_fn` 콜백)에 모델을 eval 모드로 두고 `calib_items.pt`(`finalize_and_save()`가
+  온도 피팅에 쓰는 것과 동일한, export의 실제 held-out `calibration.jsonl`)에 대해
+  질문 유형별(choice/score/noul) argmax 일치율(`compute_calib_agreement()`)을 계산해
+  `[select] epoch N calib_agreement choice=.. score=.. noul=.. mean=..`으로 로그한다.
+  세 유형 평균(`mean`)이 이전 최고보다 개선되면 그 epoch의 state_dict를 CPU에 복사해
+  들고 있는다(322M 파라미터 fp32 약 1.3GB, 학습 끝나면 로드 후 바로 해제). 학습 종료 후
+  최고 epoch의 state_dict를 모델에 로드하고 나서 `finalize_and_save()`(온도 피팅 + 저장)를
+  실행한다 -- 즉 저장되는 checkpoint는 항상 "가장 나은 calibration-agreement를 낸 epoch"이다.
+  DDP에서는 rank 0만 평가하고, 매 epoch 끝에 전체 rank가 barrier로 동기화된다.
+- **플래그**: `--select-best-epoch`(기본 ON)/`--no-select-best-epoch`(기존처럼 항상
+  마지막 epoch 유지). `--local`/DDP 양쪽 모두 지원(`load_common_argv()`의 공유 argv
+  슬롯으로 두 경로에 동일하게 전달).
+- **메타데이터**: `<output-dir>/epoch_selection.json`(`select_best_epoch`,
+  `selected_epoch`, epoch별 agreement 표 `epoch_agreements`)을 학습 스크립트가 쓰고,
+  바깥쪽 `train_from_export.py`의 `main()`이 이를 읽어 `training_metadata.json`의
+  `epoch_selection`/`selected_epoch` 필드로 접는다.
+- **검증**: `tests/test_laya_kit_eval_and_epoch_select.py`의
+  `ComputeCalibAgreement`(순수 집계 로직)와 `TrainDdpScriptEpochSelectionStructure`
+  (임베딩된 `TRAIN_DDP_SCRIPT` 안의 `epoch_end_fn`/best-state 로직에 대한 정적 검사 +
+  outer 모듈과의 parity)가 커버한다. 2026-09-23 M4 Pro `--local --max-steps` smoke에서
+  `[select] epoch 1 calib_agreement choice=... score=... noul=... mean=...` 로그와
+  `epoch_selection.json`/`training_metadata.json`의 `selected_epoch` 기록을 실측 확인했다.
+
+## 학습 후 평가(`evaluate_checkpoint`) 버그 수정 (2026-09-23)
+
+- **증상(실측)**: 위 실측 학습의 학습 후 평가 단계가
+  `[eval] evaluation step failed or was skipped: 'label'`로 실패해 `test.jsonl` 기준
+  metrics(accuracy 등)가 전혀 기록되지 않았다.
+- **원인**: 공식 notebook의 평가 셀은 gold 답에 `label`/`score` 키가 있다고 가정하지만,
+  jev export의 `exportDataset()`(`src/training/dataset.mjs`)은 `gold[qid]`를
+  `{"probabilities": {...}}`로만 쓴다(`training/laya-kit/check_export.py`의
+  `check_gold_probabilities()`가 이 형태를 강제). `evaluate_checkpoint()`가
+  `g_ans["label"]`을 직접 읽어 choice/noul 질문에서 `KeyError('label')`이 났다.
+- **수정**: `resolve_gold_label(q_type, g_ans, keys=None, n_levels=None)`이
+  `build_training_item()`이 학습 타깃 라벨을 정하는 것과 동일한 방식
+  (`target.index(max(target))`, 즉 probabilities의 argmax)으로 gold 라벨을 derive한다.
+  명시적 `label` 키가 있으면(예: 수기로 만든 fixture) 그 값이 우선한다(하위 호환).
+  choice/noul/score 세 분기 모두 이 함수를 쓰도록 고쳤고, score 타입의 gold scalar
+  (`score_mae`/`within_1_level`용)도 `g_ans.get("score", ...)`가 없을 때 이 argmax
+  레벨로 대체한다.
+- **연쇄로 드러난 둘째 버그**: 위 수정 후 실측에서 새로운 에러
+  `Cannot cast ufunc 'divide' output from dtype('float64') to dtype('int64')`가
+  나왔다 -- objective/human 라벨의 gold probabilities는 one-hot(`targetDistribution()`이
+  `1`/`0` 정수를 만듦)이라 JSON 왕복 시 Python `int`로 역직렬화되고, 그 값들로 만든
+  `np.array(...)`가 `int64` dtype으로 추론돼 이어지는 in-place `/=`가 casting 에러를
+  낸다. `p_probs`/`g_probs`/`p_probs_score` 세 배열 생성에 `dtype=np.float64`를 명시해
+  고쳤다.
+- **검증**: `tests/test_laya_kit_eval_and_epoch_select.py`의 `ResolveGoldLabel`(순수
+  로직)과 `EvaluateCheckpointRealExportShape`(실제 export row 형태의 synthetic
+  test.jsonl + fake `Agent`로 `evaluate_checkpoint()`를 end-to-end 실행, 정수값
+  probabilities 케이스 포함)가 두 버그 모두 RED로 재현 후 GREEN을 확인했다. 2026-09-23
+  M4 Pro `--local --max-steps` smoke에서 `[eval]` 실패 로그 없이
+  `training_metadata.json.metrics`가 채워지는 것을 실측 확인했다.
 
 ## 반복 fine-tune의 망각(catastrophic forgetting) 위험과 holdout 게이트
 
