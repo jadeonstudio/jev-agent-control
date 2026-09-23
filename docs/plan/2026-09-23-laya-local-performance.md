@@ -121,6 +121,12 @@ owner 요청: 이 Mac(Apple M4 Pro, GPU 16코어, 통합 메모리 24GB)에서 L
   - [x] 증류 파이프라인 `laya distill import|import-shadow|label|review|build|status` (7371af2): teacher 라벨은 train에만, 사람 검수는 calibration/test에만, `readDataset`이 teacher 라벨의 평가 split 유입을 `TEACHER_LABEL_IN_EVAL_SPLIT`로 거부
   - [x] 긴 입력 task-head 맞춤과 학습·추론 입력 일치, label 연속 5회 실패 중단·run 잠금 (30aeab4)
   - [x] 긴 문장 1차 생성분(haiku 워커 5개, 1,000개) 폐기: 기본 작업 약 10개를 "(케이스 N)"·"#N" 번호만 바꿔 반복하고 상투 문단으로 길이를 채움, 최대 약 850자. 재생성은 sonnet 워커 10개 × 100개, 직접 작성·템플릿 금지·길이 3구간·작업 유형 혼합·5-gram 유사도 검사 조건
-  - [ ] 3,000개 구성(짧은 2,000 + 긴 1,000) → teacher 라벨링(실행 직전 owner 승인) → owner TTY 검수 200 → build → Kaggle 학습(multilingual 기반, `--input-fit task-head`로 등록) → holdout·qualify·compare·promote
+  - [x] 긴 문장 재생성 1,000개(ko 500·en 500, 300~2,228자, 길이 3구간 170/170/160, 같은 언어 최대 5-gram 유사도 0.198, 번호 패턴 0). 길이 채우기로 생긴 문장 내 반복 56건은 구성 단계에서 제거
+  - [x] 번역 쌍 발견: 긴 문장의 약 44%가 한국어·영어 번역 쌍. group 필드로 묶고 build가 검수된 group의 다른 멤버를 train에서 제외 (5afdc5b). 짧은 문장은 번역 쌍을 확실히 식별할 수 없어 `reviewable:false`로 train 보강에만 쓰고, 사람 검수 평가 세트는 실제 입력에 가까운 긴 문장에서만 뽑는다
+  - [x] 3,000개 구성·import(run `d3k`): 짧은 2,000(도메인×언어 200씩, 가까운 중복 제외) + 긴 1,000, group 2,686개, 검수 대상 1,000, 민감정보·중복 제외 0
+  - [x] teacher는 Jev 유지(owner 결정 2026-09-23). Claude teacher는 확률 분포를 직접 주지 않아 추가 샘플링 비용이 들고 우위가 측정되지 않아 보류
+  - [x] 파일럿 20회(owner 승인): 20/20 성공, 모델 jev-1.13.0, 호출당 입력 짧은 869·긴 1,364(평균 1,093자) / 출력 124, 간격 중앙값 1.19s. 라벨 형태: intent 7범주 분산, difficulty 0~4 분산, 최대 확률 평균 0.67~0.81, risk는 safe 15/20으로 치우침
+  - [~] 나머지 2,980회(owner 승인, 추정 입력 약 3.0M·출력 약 0.37M, 약 59분)
+  - [ ] owner TTY 검수 200(긴 문장, 언어 균등, group당 1개) → build → export → Kaggle 학습(multilingual 기반, `--input-fit task-head`로 등록) → holdout·qualify·compare·promote
 - [x] L5 Codex A/B 실측(B4) 후 owner 승인으로 Codex 관리 블록에서 spawn 전 route 안내 제거, hook 기록만 유지
 - [ ] L6 설치본 반영·문서·커밋
