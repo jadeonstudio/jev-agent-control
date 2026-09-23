@@ -126,7 +126,9 @@ owner 요청: 이 Mac(Apple M4 Pro, GPU 16코어, 통합 메모리 24GB)에서 L
   - [x] 3,000개 구성·import(run `d3k`): 짧은 2,000(도메인×언어 200씩, 가까운 중복 제외) + 긴 1,000, group 2,686개, 검수 대상 1,000, 민감정보·중복 제외 0
   - [x] teacher는 Jev 유지(owner 결정 2026-09-23). Claude teacher는 확률 분포를 직접 주지 않아 추가 샘플링 비용이 들고 우위가 측정되지 않아 보류
   - [x] 파일럿 20회(owner 승인): 20/20 성공, 모델 jev-1.13.0, 호출당 입력 짧은 869·긴 1,364(평균 1,093자) / 출력 124, 간격 중앙값 1.19s. 라벨 형태: intent 7범주 분산, difficulty 0~4 분산, 최대 확률 평균 0.67~0.81, risk는 safe 15/20으로 치우침
-  - [~] 나머지 2,980회(owner 승인, 추정 입력 약 3.0M·출력 약 0.37M, 약 59분)
+  - [x] 나머지 2,980회(owner 승인, 추정 입력 약 3.0M·출력 약 0.37M, 약 59분): 2,977 성공·3 실패(`MALFORMED_RESPONSE`, 자동 재시도 없음). 전체 라벨 2,997, 모델 jev-1.13.0 단일, 실측 입력 2,959,268·출력 372,719 토큰, 63.4분
+    - 라벨 분포(긴 999): intent edit 383·explain 165·debug 161·architecture 147·research 97·other 32·operate 14 / difficulty(0~4) 3이 456으로 최다 / risk safe 676·caution 203·high 105·unknown 15. 짧은 1,998은 intent other 498, difficulty 2가 1,212로 몰림(짧은 문장은 정보가 적어 teacher도 판단을 유보)
+    - teacher 일관성(번역 쌍 304쌍의 ko·en argmax 일치): intent 0.86, risk 0.83, difficulty 0.69. 같은 작업을 언어만 바꿨을 때도 difficulty는 약 3할이 갈리므로, difficulty는 teacher 라벨 자체의 잡음이 크고 soft target과 사람 검수가 특히 중요하다. 이 수치는 teacher 자기 일관성이지 정확도가 아니다
   - [ ] owner TTY 검수 200(긴 문장, 언어 균등, group당 1개) → build → export → Kaggle 학습(multilingual 기반, `--input-fit task-head`로 등록) → holdout·qualify·compare·promote
 - [x] L5 Codex A/B 실측(B4) 후 owner 승인으로 Codex 관리 블록에서 spawn 전 route 안내 제거, hook 기록만 유지
 - [ ] L6 설치본 반영·문서·커밋
