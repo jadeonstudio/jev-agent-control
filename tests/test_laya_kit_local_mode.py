@@ -139,6 +139,17 @@ class TrainDdpScriptLocalModeStructure(unittest.TestCase):
         body = rest if end_rel == -1 else rest[:end_rel]
         return body
 
+    def test_clip_params_are_materialized_not_a_one_shot_generator(self):
+        # run_training_loop clips every optimizer step with the same params_for_clip argument;
+        # a bare .parameters() generator is exhausted after the first clip, silently disabling
+        # gradient clipping for the rest of training (observed 2026-09-23 as torch's
+        # "`parameters` is an empty generator" warning in a real local run).
+        for func in ('main_ddp', 'main_local'):
+            body = self._extract_function_body(kit.TRAIN_DDP_SCRIPT, func)
+            self.assertIn('run_training_loop(', body)
+            self.assertNotRegex(body, r'run_training_loop\(\s*\w+,\s*\w+,\s*\w+\.parameters\(\)',
+                                f'{func} passes a one-shot generator to run_training_loop')
+
     def test_main_local_exists_and_main_ddp_exists(self):
         self.assertIn('def main_local(', kit.TRAIN_DDP_SCRIPT)
         self.assertIn('def main_ddp(', kit.TRAIN_DDP_SCRIPT)

@@ -864,7 +864,7 @@ def main_ddp():
         print(f"Starting 2xT4 DDP training: {len(all_items)} total items | {len(my_items)} per rank | {EPOCHS} epochs")
 
     run_training_loop(
-        ddp_model, my_items, ddp_model.parameters(), optimizer, scheduler, tok,
+        ddp_model, my_items, list(ddp_model.parameters()), optimizer, scheduler, tok,
         device=device, epochs=EPOCHS, micro_batch=MICRO_BATCH, grad_accum=GRAD_ACCUM, group_size=GROUP_SIZE,
         sigma_start=SIGMA_START, sigma_end=SIGMA_END, rank=rank, world_size=world_size,
         use_scaler=True, scaler=scaler, autocast_device="cuda", autocast_dtype=torch.float16,
@@ -951,7 +951,7 @@ def main_local():
                 print(f"[mem] epoch {epoch+1} mps memory read failed: {e}")
 
     result = run_training_loop(
-        model, my_items, model.parameters(), optimizer, scheduler, tok,
+        model, my_items, list(model.parameters()), optimizer, scheduler, tok,
         device=device, epochs=EPOCHS, micro_batch=micro_batch, grad_accum=grad_accum, group_size=GROUP_SIZE,
         sigma_start=SIGMA_START, sigma_end=SIGMA_END, rank=0, world_size=1,
         use_scaler=False, scaler=None, autocast_device=autocast_device, autocast_dtype=autocast_dtype,
