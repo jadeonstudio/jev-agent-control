@@ -33,6 +33,17 @@ owner 요청: 이 Mac(Apple M4 Pro, GPU 16코어, 통합 메모리 24GB)에서 L
 - 16비트는 속도 이득이 거의 없고(리서치와 일치) 메모리를 절반으로 줄인다. autocast는 더 느리고 메모리를 더 쓴다.
 - zero-shot 품질(english, 합성 12문장): 영어 intent는 6/6이 그럴듯하다. 한국어 intent는 약하다(other 3건). difficulty는 운영 DB 교체·저장소 재설계를 1–2로 판단하는 등 약하다. 정답 라벨이 없는 관찰이며 정확도가 아니다.
 
+### B2. checkpoint별 (MPS, 초기화 생략, 같은 입력)
+
+| checkpoint | 파라미터 | 콜드 | 1질문 p50 | 3질문 p50 / p95 | MPS 텐서 fp32 → half |
+|---|---:|---:|---:|---:|---:|
+| english | 421M | 3.5–3.9s | 56–58ms | 118–122 / 150ms | 1,610 → 810MiB |
+| multilingual | 322M | 3.7–4.2s | 23–24ms | 53 / 60–82ms | 1,236 → 631MiB |
+| typed-decisions | 421M | 3.7–4.0s | 54–56ms | 116–120 / 142–146ms | 1,610 → 810MiB |
+
+- multilingual은 english보다 약 2.2배 빠르다(공식 서술과 일치).
+- 관찰(정답 라벨 없음): multilingual은 한국어 intent 12개 중 약 3개가 어긋나 보인다. multilingual·typed-decisions 모두 "운영 DB 비밀번호 교체"의 risk를 `safe`로 냈다. zero-shot risk 판단은 신뢰할 수 없으며, qualification 없이 ON에 쓰면 안 된다는 근거다.
+
 ## 단계
 
 - [x] L0 기준선·리서치

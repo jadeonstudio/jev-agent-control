@@ -65,7 +65,7 @@ def compare(ref, cur):
             rp, cp = a_[q].get("probabilities"), b_[q].get("probabilities")
             if isinstance(rp, dict) and isinstance(cp, dict): max_dp = max(max_dp, max(abs(rp[k] - cp.get(k, 0)) for k in rp))
             if "score" in a_[q]: max_dp = max(max_dp, abs(a_[q]["score"] - b_[q]["score"]))
-    return {"agreement_vs_fp32": f"{agree}/{total}", "max_prob_delta_vs_fp32": round(max_dp, 5)}
+    return {"agreement_vs_reference": f"{agree}/{total}", "max_prob_delta_vs_reference": round(max_dp, 5)}
 
 def run_mode(a, agent, torch, call):
     import laya.agent as la
@@ -152,9 +152,11 @@ def main():
             child = json.loads(p.stdout.strip().splitlines()[-1])
             results[mode] = {**child["result"], "cold_ms": child["timings_ms"]}
         except Exception: results[mode] = {"error": f"exit {p.returncode}: " + (p.stderr.strip().splitlines() or ["?"])[-1][:240]}
-    ref = results.get("fp32", {}).get("answers_full")
+    # The first mode that succeeded is the reference (normally fp32 or fp32-fastinit).
+    ref_mode = next((m for m, r in results.items() if "answers_full" in r), None)
+    ref = results[ref_mode]["answers_full"] if ref_mode else None
     for mode, r in results.items():
-        if mode != "fp32" and ref and "answers_full" in r: r.update(compare(ref, r["answers_full"]))
+        if mode != ref_mode and ref and "answers_full" in r: r.update(compare(ref, r["answers_full"]), reference_mode=ref_mode)
     for r in results.values(): r.pop("answers_full", None)
     out["modes"] = results
     out["sample_answer_keys"] = sorted(first.get("answers", {}).get("intent", {}).keys())
