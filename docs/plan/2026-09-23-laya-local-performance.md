@@ -154,6 +154,17 @@ owner 요청: 이 Mac(Apple M4 Pro, GPU 16코어, 통합 메모리 24GB)에서 L
   - [x] 3차 데이터 확대 완료: 18개 도메인 1,800문장 중 제외 14(다른 과제 문단 이어붙임 12 + 불확실 2) → 1,786, import 민감정보 검사로 3개 추가 제외 → **1,783문장 run d4에 추가**(train 기준 라벨 6,134). 새 문장 라벨 분포 risk safe 717·caution 516·high 449(25%)·unknown 104, intent edit 614·debug 320·operate 304(17%)·explain 296. dataset `4452fd05…`: train 18,402 / calibration 423 / test 477, holdout `d5-claude-test` sha256이 `d4-claude-test`와 동일(4f4cac5f…) — 평가 문장 불변 확인. 경로 기록: `~/.local/share/laya/distill-src/r3/`(GEN_SPEC3.md·LABEL_SPEC.md·FULLREAD.md·audit3.py·merge_r3.py·exclude.txt). 새 도메인 18개 × 100문장(sonnet 생성, 위험도 경계 중심: 언어별 high 12·위험해 보이지만 범위가 제한된 작업 12·일반 18·맥락 부족 8), Opus 라벨 전체 읽기. 라벨러가 다른 과제 문단이 이어 붙은 문장을 보고하면 제외 목록에 넣는다(현재 12건). 생성 워커가 high를 "지금 운영에 실행" 형태로 써서 intent operate가 약 20%로 쏠림(평가 1%) → 명세에 언어별 운영 작업 4개 상한 추가. 세션 사용량 한도로 워커 9개가 끊겨 SendMessage로 이어서 진행, 동시 실행은 5~6개로 제한
   - 참고: 2차 평가 시점의 방향 판단 — train 부분집합(앞 450표본) 일치율 0.979/0.919/0.944로 학습 데이터는 거의 맞히지만(과적합) 새 문장에서는 difficulty·risk가 0.6대에 머문다. Claude 자기 일치율(0.91~0.94)로 보면 목표 상한은 충분히 높다
 
+  - [~] 3차 학습(d5, dropout 0.1): 2026-09-24 20:51 시작, 1 epoch 6,657s(약 1.45s/step, 18,402 items → 4,600 step/epoch), epoch 1 calib 일치율 choice 0.773 / score 0.645 / mean 0.709(같은 dropout·2차 데이터 A/B의 epoch 1은 0.635). owner 지시(소음, 밤샘 금지)로 23:21 epoch 2 중반에 중단. 키트에 epoch 단위 재개가 없어 다음 실행은 처음부터 약 7.5시간.
+  - [ ] 3차 재개: 아래 명령으로 처음부터 학습 → 추론 파일만 복사해 `laya register ... --model laya/multilingual-d5 --input-fit task-head` → `laya qualify --dataset 4452fd05… --holdout d5-claude-test` → `laya compare --holdout d5-claude-test`(활성 = 2차 후보 0d424dad…, 관측 전용) → 합격·무회귀면 `laya promote` 후 상주 서버 재시작 → 합격 시 Hugging Face 모델 카드 초안 작성(owner 요청; 업로드는 owner 확인 후, `huggingface-cli login`은 owner 실행)
+
+```sh
+X=~/.local/share/jev-agent-control/training/exports/4452fd052866af6a671589b09947e26ac9353bb063a87994fed1f1c178af119a/laya
+OUT=~/.local/share/laya/training-runs/d5-drop10
+PYTHONUNBUFFERED=1 ~/.local/share/laya/.venv/bin/python -u training/laya-kit/train_from_export.py \
+  --export-dir $X --model-dir ~/.local/share/laya/models/multilingual/multilingual \
+  --output-dir $OUT --local --device mps --batch-size 4 --dropout 0.1 > $OUT.log 2>&1   # 약 7.5시간
+```
+
 ### 프롬프트 감사 (2026-09-24, `/claude-api prompt-audit`, 대상 Claude Opus 5.5)
 
 모델이 읽는 텍스트(AGENTS.md, 스킬 2개, MCP 도구 설명·스키마, 관리 블록) 점검. 발견 11건 중 10건과 추가 발견 2건을 e094c18로 반영: jev-decisions 스킬이 hook 도입·B4 실측 이전의 "spawn 전 jev_route 호출"을 계속 지시해 관리 블록과 모순(가장 영향 큼), 매 턴 jev_status 확인 지시(코드가 이미 강제), TypeSafe 전용으로 적힌 추론 경로·API 사용량 문구(laya provider에서 사실과 다름), 대문자 강조, AGENTS.md 절 제목의 버전·날짜·이전 계약 이력, 상주 서버 절의 세부값, jev_route context 필드와 jev_status 설명 부족. `classifier.dev` 언급은 사람 독자용 맥락이라 AGENTS.md·jev-control에 유지하고 jev-decisions에서만 뺐다. installer 주석의 반대 서술도 정정. 설치본 갱신·Codex 스킬 재설치 완료(Claude 스킬 디렉터리는 심볼릭 링크라 기존대로 미설치).
