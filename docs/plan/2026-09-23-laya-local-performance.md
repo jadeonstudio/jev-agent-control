@@ -148,7 +148,10 @@ owner 요청: 이 Mac(Apple M4 Pro, GPU 16코어, 통합 메모리 24GB)에서 L
   - [x] compare(활성 english zero-shot 대비, 같은 holdout): route raw 일치 후보 0.679(477 전부 응답) vs 활성 0.324(응답 204건 기준, 273건은 입력 거부). 후보가 모든 문항에서 앞서지만 qualify 불합격이라 promote 게이트를 통과할 수 없어 **승격·서버 재시작 안 함**
   - [x] qualify 보고의 `by_question`이 calibration·test·holdout을 합산해 test를 두 번 세고 calibration을 섞던 결함 수정(split별 보고). 합산값 0.839/0.651/0.621이 test 단독보다 높게 보였다
   - [x] owner 결정(2026-09-24): ① 2차 후보를 관측 전용으로 활성화 ② 학습 데이터 확대를 함께 진행. ①은 `laya activate`로 반영(`providers.json` laya = 0d424dad…, qualification 없음 → ON이어도 적용 안 됨, `laya rollback`으로 복귀). 상주 서버(2026-09-23 13:10 시작)는 inputFit 도입 전 코드라 새 설정에 `INVALID_TRAINING_SCHEMA`를 반환 → `launchctl kickstart -k gui/$(id -u)/com.jev-agent-control.laya` 재시작 필요(에이전트 권한 거부) → owner가 15:08 재시작, 서버 identity `laya/multilingual-d4`·mps·fp16 로드 확인
-  - [ ] 3차 데이터 확대 (진행 중)
+  - [x] 공개 리서치(과적합 완화): 데이터 다양성 > 양(ACL Findings 2026), 소수 클래스 경계 예시 표적 생성, R-Drop(NeurIPS 2021, BERT-base GLUE +0.8~1.2), soft label 이론적 이점(preprint), CORAL(이미지 도메인만 검증). 반증: 모호한 판단일수록 합성 데이터 이득이 작음, focal loss 단독은 역효과 사례
+  - [x] 학습 키트 `--dropout`/`--rdrop-alpha`(4a90d3a, 기본 OFF). multilingual base는 encoder dropout이 전부 0.0이었다(head만 0.1)
+  - [x] A/B(같은 d4 데이터, `--dropout 0.1`, 4 epoch, 13,056 step, 약 1.1~1.3s/step): calib 일치율 mean 0.635 → 0.688 → 0.704 → 0.723(기준 0.738보다 낮고 4 epoch까지 계속 상승). 사후 보정 temperature가 8.5/9.2 → **1.63/1.48**로 과신이 크게 줄었다. test 원 일치율은 intent 0.799 / difficulty 0.635 / risk 0.566(기준 0.811/0.635/0.591)으로 비슷하지만, **qualify에서 처음으로 임계값이 잡혔다**: calibration 임계값 0.57, test coverage 0.47에서 선택 일치율 0.848(하한 0.795) — 목표 0.9·하한 0.8에는 미달(불합격). 확신도가 실제로 맞고 틀림을 가르기 시작했다는 뜻이라 3차 학습은 dropout 0.1을 쓴다
+  - [ ] 3차 데이터 확대 (진행 중): `~/.local/share/laya/distill-src/r3/`(GEN_SPEC3.md·LABEL_SPEC.md·FULLREAD.md·audit3.py·merge_r3.py·exclude.txt). 새 도메인 18개 × 100문장(sonnet 생성, 위험도 경계 중심: 언어별 high 12·위험해 보이지만 범위가 제한된 작업 12·일반 18·맥락 부족 8), Opus 라벨 전체 읽기. 라벨러가 다른 과제 문단이 이어 붙은 문장을 보고하면 제외 목록에 넣는다(현재 12건). 생성 워커가 high를 "지금 운영에 실행" 형태로 써서 intent operate가 약 20%로 쏠림(평가 1%) → 명세에 언어별 운영 작업 4개 상한 추가. 세션 사용량 한도로 워커 9개가 끊겨 SendMessage로 이어서 진행, 동시 실행은 5~6개로 제한
   - 참고: 2차 평가 시점의 방향 판단 — train 부분집합(앞 450표본) 일치율 0.979/0.919/0.944로 학습 데이터는 거의 맞히지만(과적합) 새 문장에서는 difficulty·risk가 0.6대에 머문다. Claude 자기 일치율(0.91~0.94)로 보면 목표 상한은 충분히 높다
 
 ### 프롬프트 감사 (2026-09-24, `/claude-api prompt-audit`, 대상 Claude Opus 5.5)
