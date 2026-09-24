@@ -143,7 +143,11 @@ owner 요청: 이 Mac(Apple M4 Pro, GPU 16코어, 통합 메모리 24GB)에서 L
   - [x] 라벨링 에이전트가 긴 파일을 한 번에 출력해 잘린 텍스트로 판단한 사례 확인. 한 part 비교에서 부분 vs 전체 읽기 일치 intent 0.94 / difficulty 0.86 / risk 0.90. 평가 300은 전체 읽기로 재라벨링(1·2차 대비 difficulty 0.88~0.90, risk 0.92 일치), 학습 라벨은 잡음 감수(해당 part 30은 전체 읽기로 교체)
   - [x] 2차 데이터: 새 긴 문장 1,800개(18개 새 도메인, sonnet 워커, 세션 한도로 13개 워커가 중간 종료됐으나 점검 통과분 사용) + Claude 학습 라벨. run d4 → dataset 30c025bc…: train 13,053 / calibration 423 / test 477 (평가 문장은 1차와 동일)
   - [x] 학습 키트: epoch별 calibration 일치율로 최고 epoch 선택(5d57aa3), 자체 평가 label 키·정수 확률 오류 수정
-  - [~] 2차 로컬 학습(d4): 2026-09-24 00:22 1 epoch 완료(3,618s, ~1.11s/step, MPS ~10GB, 여유 메모리 26~42%), calib 일치율 choice 0.762 / score 0.582 / mean 0.672. owner 지시로 epoch 2 중반에 중단(다음 날 처음부터 재실행). 남은 순서: 학습 → register → holdout freeze → qualify → compare(english 대비) → 조건 충족 시 promote·서버 재시작
+  - [x] 2차 로컬 학습(d4): 2026-09-23 첫 실행은 owner 지시로 epoch 2 중반에 중단. 2026-09-24 10:23 처음부터 재실행, 4 epoch 14,574s(~1.1s/step, MPS 6~10GB, 여유 메모리 29~43%) 무중단 완료. epoch별 calib 일치율 mean 0.718 → 0.727 → 0.732 → 0.738(epoch 4 선택: choice 0.794 / score 0.681). 사후 보정 temperature choice 8.5 · score 9.2 — train loss가 거의 0까지 내려간 과신을 크게 눌러야 했다는 뜻
+  - [x] 2차 후보 0d424dad… 평가(holdout `d4-claude-test`, 159문장 × 3문항 = 477): **qualify 불합격**(route purpose에서 목표 0.9·coverage 0.2를 만족하는 임계값 없음). test split 단독 Claude 일치율: intent 0.811(1차 0.72), difficulty 0.635(±1 0.906, 1차 0.58/0.84), risk 0.591(1차 0.60). calibration split은 0.901/0.688/0.688 — epoch 선택에 쓰여 낙관적이다. risk는 Claude `high` 26건 중 모델 `high` 예측이 11건뿐으로 위험을 낮게 보는 쪽으로 틀린다
+  - [x] compare(활성 english zero-shot 대비, 같은 holdout): route raw 일치 후보 0.679(477 전부 응답) vs 활성 0.324(응답 204건 기준, 273건은 입력 거부). 후보가 모든 문항에서 앞서지만 qualify 불합격이라 promote 게이트를 통과할 수 없어 **승격·서버 재시작 안 함**
+  - [x] qualify 보고의 `by_question`이 calibration·test·holdout을 합산해 test를 두 번 세고 calibration을 섞던 결함 수정(split별 보고). 합산값 0.839/0.651/0.621이 test 단독보다 높게 보였다
+  - [ ] 다음 방향(owner 결정 필요): train 부분집합(앞 450표본) 일치율 0.979/0.919/0.944로 학습 데이터는 거의 맞히지만(과적합) 새 문장에서는 difficulty·risk가 0.6대에 머문다. Claude 자기 일치율(0.91~0.94)로 보면 목표 상한은 충분히 높다
 
 ### 프롬프트 감사 (2026-09-24, `/claude-api prompt-audit`, 대상 Claude Opus 5.5)
 

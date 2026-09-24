@@ -368,11 +368,16 @@ test('qualify credits score questions by argmax(probabilities) vs the target ind
   assert.deepEqual(result.purposes, ['judge']);
   assert.equal(result.evidence.judge.test.accuracy, 1);
   assert.equal(result.evidence.judge.holdout.accuracy, 1);
-  // Content-free per-question raw stats (bug 4): n, raw agreement, refused.
+  // Content-free per-question raw stats (bug 4): n, raw agreement, refused — reported per split, never
+  // pooled: calibration also picks the epoch/threshold (optimistic) and the holdout freezes the test split,
+  // so a pooled figure would double-count test and mix in tuned-on data.
   assert.ok(result.by_question, 'qualify result must report per-question raw stats');
-  assert.equal(result.by_question.severity.n, 26); // 10 calibration + 8 test + 8 holdout (holdout freezes the test split)
-  assert.equal(result.by_question.severity.refused, 0);
-  assert.ok(result.by_question.severity.raw_agreement > 0 && result.by_question.severity.raw_agreement <= 1);
+  assert.deepEqual(Object.keys(result.by_question), ['calibration', 'test', 'holdout']);
+  assert.equal(result.by_question.calibration.severity.n, 10);
+  assert.equal(result.by_question.test.severity.n, 8);
+  assert.equal(result.by_question.holdout.severity.n, 8);
+  assert.equal(result.by_question.test.severity.refused, 0);
+  assert.ok(result.by_question.test.severity.raw_agreement > 0 && result.by_question.test.severity.raw_agreement <= 1);
 });
 
 // ============================== compare + promote ==============================

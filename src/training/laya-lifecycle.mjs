@@ -279,7 +279,10 @@ export async function qualifyCandidate(home, { candidateHash, datasetVersion, ho
   const result = { checkpoint: candidateHash, qualified: qualifiedPurposes.length > 0, purposes: qualifiedPurposes,
     minConfidence: globalThreshold ?? 1, minChoiceProbability: globalThreshold ?? 1, noulCertainty: globalThreshold ?? 1,
     calibrationVersion, dataset_version: datasetVersion, holdout: holdoutManifest.name, holdout_sha256: holdoutManifest.sha256,
-    precision: laya.precision ?? 'fp32', params, evidence, by_question: byQuestionStats(allRecords), generated_at: new Date().toISOString(),
+    precision: laya.precision ?? 'fp32', params, evidence,
+    // Per split, never pooled: calibration also tunes epoch/threshold and the holdout freezes the test split.
+    by_question: { calibration: byQuestionStats(calibrationRecords), test: byQuestionStats(testRecords), holdout: byQuestionStats(holdoutRecords) },
+    generated_at: new Date().toISOString(),
     ...labelSourceSummary(allRecords) };
   ensureDir(layaRoot(home), true); ensureDir(qualificationsDir(home), true);
   atomicWrite(path.join(qualificationsDir(home), `${candidateHash}.json`), JSON.stringify(result, null, 2) + '\n');
