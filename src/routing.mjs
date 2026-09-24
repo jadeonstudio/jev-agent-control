@@ -104,10 +104,14 @@ export async function routeOrDelegate(layer, input, { use, delegate, signal } = 
 export const routeSchema = {
   type: 'object', additionalProperties: false, required: ['task', 'host', 'risk', 'context', 'availableRoles'], properties: {
     task: { type: 'string', minLength: 1, maxLength: 8000 }, host: { type: 'string', enum: ['codex', 'claude'] },
-    risk: { type: 'string', enum: ['routine', 'sensitive'] },
+    risk: { type: 'string', enum: ['routine', 'sensitive'], description: 'sensitive keeps the host choice (no cheaper route) — use it for production, credentials, permissions, payments or other hard-to-reverse work.' },
     context: { type: 'object', additionalProperties: false, required: ['complete', 'scope', 'previousFailures', 'highImpact', 'modelLocked', 'exhaustive'], properties: {
-      complete: { type: 'boolean' }, scope: { type: 'string', enum: ['local', 'cross-module', 'repository', 'unknown'] },
-      previousFailures: { type: 'integer', minimum: 0, maximum: 100 }, highImpact: { type: 'boolean' }, modelLocked: { type: 'boolean' }, exhaustive: { type: 'boolean' },
+      complete: { type: 'boolean', description: 'true only when the task statement already contains what the worker needs (files, acceptance criteria); false keeps the host choice.' },
+      scope: { type: 'string', enum: ['local', 'cross-module', 'repository', 'unknown'], description: 'Extent of the change. cross-module, repository and unknown keep the host choice.' },
+      previousFailures: { type: 'integer', minimum: 0, maximum: 100, description: 'Earlier failed attempts at this same task; any value above 0 keeps the host choice.' },
+      highImpact: { type: 'boolean', description: 'true for work whose mistakes are costly to undo; keeps the host choice.' },
+      modelLocked: { type: 'boolean', description: 'true when the user or caller fixed the model; routing never overrides it.' },
+      exhaustive: { type: 'boolean', description: 'true when every input must be covered (audits, full reviews); keeps the host choice.' },
     } },
     availableRoles: { type: 'array', maxItems: 32, uniqueItems: true, items: { type: 'string' }, description: 'Role names the host actually has agent definitions for (e.g. ~/.codex/agents/*.toml or ~/.claude/agents/*.md stems), not guessed names.' },
     availableModels: { type: 'array', maxItems: 32, uniqueItems: true, items: { type: 'string' }, description: 'Optional; actual model IDs available to this host, not guessed names. Codex ignores a spawn_agent model argument, so this rarely applies there.' },

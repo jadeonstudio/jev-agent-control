@@ -10,10 +10,10 @@ const protocolVersions = ['2024-11-05', '2025-03-26', '2025-06-18'];
 export const TOOLS = [
   { name: 'jev_decide', description: 'One bounded batch of Choice/Noul/Score decisions. OFF never invokes a provider; SHADOW hides suggestions; only apply=true permits consuming an advisory result. Never grants execution permission.', inputSchema: withTrace(decisionSchema),
     annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: false, openWorldHint: true } },
-  { name: 'jev_status', description: 'Read global and per-feature Jev modes and credential readiness without exposing a secret or calling the API.',
+  { name: 'jev_status', description: 'Report the global mode, the router and bulk feature modes, the selected provider (jev or laya) and whether it is ready, training-capture state and the local Laya worker status. Use it to answer questions about Jev configuration or before reporting modes to the user; decision tools already return without a provider call while OFF, so a status check is not needed before calling them. Never returns a key or credential value and makes no network call.',
     inputSchema: { type: 'object', properties: {}, additionalProperties: false },
     annotations: { readOnlyHint: true, destructiveHint: false, idempotentHint: true, openWorldHint: false } },
-  { name: 'jev_feedback', description: 'Compare an independently obtained baseline with a recent decision in this process. Record measured usage only; agreement is NOT accuracy. Expires after five minutes. No raw state or baseline values are logged.',
+  { name: 'jev_feedback', description: 'Compare an independently obtained baseline with a recent decision in this process. Record measured usage only; agreement is not accuracy. Expires after five minutes. No raw state or baseline values are logged.',
     inputSchema: { type: 'object', additionalProperties: false, required: ['id', 'baseline'], properties: {
       id: { type: 'string' }, baseline: { type: 'object', additionalProperties: { anyOf: [{ type: 'string' }, { type: 'number' }, { type: 'boolean' }] } },
       baselineUsage: { type: 'object', additionalProperties: false, properties: { inputTokens: { type: ['integer', 'null'], minimum: 0 }, outputTokens: { type: ['integer', 'null'], minimum: 0 } } },

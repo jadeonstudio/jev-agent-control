@@ -97,7 +97,7 @@ function mdPatch(text, block, remove, recordedBlock) {
 export function instructionBlock(host) {
   const decide = '- 좁은 선택·재시도·에스컬레이션 판단은 `jev_decide`를 쓰고 `apply=true`일 때만 따른다. 가능하면 trace(task_id, snapshot_id)를 넘긴다.';
   // codex-cli 0.154.0 hands hooks spawn_agent.message as an opaque token (measured 2026-09-23), so a Codex hook cannot
-  // read the task or a context line; Codex routing stays an explicit jev_route call before spawning.
+  // read the task or a context line and only records spawns.
   // A/B on 2026-09-23 (docs/plan/2026-09-23-laya-local-performance.md B4): an explicit jev_route call before each
   // spawn added ~8.6s and one extra main-model turn with no measured saving, so Codex is not asked to route.
   const body = host === 'codex' ? [
