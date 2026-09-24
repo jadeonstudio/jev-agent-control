@@ -145,6 +145,10 @@ owner 요청: 이 Mac(Apple M4 Pro, GPU 16코어, 통합 메모리 24GB)에서 L
   - [x] 학습 키트: epoch별 calibration 일치율로 최고 epoch 선택(5d57aa3), 자체 평가 label 키·정수 확률 오류 수정
   - [~] 2차 로컬 학습(d4): 2026-09-24 00:22 1 epoch 완료(3,618s, ~1.11s/step, MPS ~10GB, 여유 메모리 26~42%), calib 일치율 choice 0.762 / score 0.582 / mean 0.672. owner 지시로 epoch 2 중반에 중단(다음 날 처음부터 재실행). 남은 순서: 학습 → register → holdout freeze → qualify → compare(english 대비) → 조건 충족 시 promote·서버 재시작
 
+### 프롬프트 감사 (2026-09-24, `/claude-api prompt-audit`, 대상 Claude Opus 5.5)
+
+모델이 읽는 텍스트(AGENTS.md, 스킬 2개, MCP 도구 설명·스키마, 관리 블록) 점검. 발견 11건 중 10건과 추가 발견 2건을 e094c18로 반영: jev-decisions 스킬이 hook 도입·B4 실측 이전의 "spawn 전 jev_route 호출"을 계속 지시해 관리 블록과 모순(가장 영향 큼), 매 턴 jev_status 확인 지시(코드가 이미 강제), TypeSafe 전용으로 적힌 추론 경로·API 사용량 문구(laya provider에서 사실과 다름), 대문자 강조, AGENTS.md 절 제목의 버전·날짜·이전 계약 이력, 상주 서버 절의 세부값, jev_route context 필드와 jev_status 설명 부족. `classifier.dev` 언급은 사람 독자용 맥락이라 AGENTS.md·jev-control에 유지하고 jev-decisions에서만 뺐다. installer 주석의 반대 서술도 정정. 설치본 갱신·Codex 스킬 재설치 완료(Claude 스킬 디렉터리는 심볼릭 링크라 기존대로 미설치).
+
 ### 재개 절차 (2026-09-24)
 
 상태: 전역 SHADOW, provider laya(english zero-shot 활성), 설치본 = origin/main. 데이터는 JEV_HOME에 영구 보관: run `d4`(문장 4,796, Claude 라벨 eval 300 / train 4,351), dataset·export `30c025bc5ffd1d87f7342bf39ee66f29742cd478d530a8418253f74c0736e421`. 1차 후보 `f15827a4…`와 holdout `d3k-claude-test`(d3k dataset test split)는 등록돼 있다. 2차는 d4 dataset의 test split으로 새 holdout을 만든다(평가 문장은 1차와 동일).
