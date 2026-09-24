@@ -147,7 +147,9 @@ owner 요청: 이 Mac(Apple M4 Pro, GPU 16코어, 통합 메모리 24GB)에서 L
   - [x] 2차 후보 0d424dad… 평가(holdout `d4-claude-test`, 159문장 × 3문항 = 477): **qualify 불합격**(route purpose에서 목표 0.9·coverage 0.2를 만족하는 임계값 없음). test split 단독 Claude 일치율: intent 0.811(1차 0.72), difficulty 0.635(±1 0.906, 1차 0.58/0.84), risk 0.591(1차 0.60). calibration split은 0.901/0.688/0.688 — epoch 선택에 쓰여 낙관적이다. risk는 Claude `high` 26건 중 모델 `high` 예측이 11건뿐으로 위험을 낮게 보는 쪽으로 틀린다
   - [x] compare(활성 english zero-shot 대비, 같은 holdout): route raw 일치 후보 0.679(477 전부 응답) vs 활성 0.324(응답 204건 기준, 273건은 입력 거부). 후보가 모든 문항에서 앞서지만 qualify 불합격이라 promote 게이트를 통과할 수 없어 **승격·서버 재시작 안 함**
   - [x] qualify 보고의 `by_question`이 calibration·test·holdout을 합산해 test를 두 번 세고 calibration을 섞던 결함 수정(split별 보고). 합산값 0.839/0.651/0.621이 test 단독보다 높게 보였다
-  - [ ] 다음 방향(owner 결정 필요): train 부분집합(앞 450표본) 일치율 0.979/0.919/0.944로 학습 데이터는 거의 맞히지만(과적합) 새 문장에서는 difficulty·risk가 0.6대에 머문다. Claude 자기 일치율(0.91~0.94)로 보면 목표 상한은 충분히 높다
+  - [x] owner 결정(2026-09-24): ① 2차 후보를 관측 전용으로 활성화 ② 학습 데이터 확대를 함께 진행. ①은 `laya activate`로 반영(`providers.json` laya = 0d424dad…, qualification 없음 → ON이어도 적용 안 됨, `laya rollback`으로 복귀). 상주 서버(2026-09-23 13:10 시작)는 inputFit 도입 전 코드라 새 설정에 `INVALID_TRAINING_SCHEMA`를 반환 → `launchctl kickstart -k gui/$(id -u)/com.jev-agent-control.laya` 재시작 필요(에이전트 권한 거부) → owner가 15:08 재시작, 서버 identity `laya/multilingual-d4`·mps·fp16 로드 확인
+  - [ ] 3차 데이터 확대 (진행 중)
+  - 참고: 2차 평가 시점의 방향 판단 — train 부분집합(앞 450표본) 일치율 0.979/0.919/0.944로 학습 데이터는 거의 맞히지만(과적합) 새 문장에서는 difficulty·risk가 0.6대에 머문다. Claude 자기 일치율(0.91~0.94)로 보면 목표 상한은 충분히 높다
 
 ### 프롬프트 감사 (2026-09-24, `/claude-api prompt-audit`, 대상 Claude Opus 5.5)
 
