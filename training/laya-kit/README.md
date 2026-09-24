@@ -298,6 +298,40 @@ owner 결정(2026-09-23): fine-tune 기준 checkpoint는 **multilingual**(mmBERT
   `[select] epoch 1 calib_agreement choice=... score=... noul=... mean=...` 로그와
   `epoch_selection.json`/`training_metadata.json`의 `selected_epoch` 기록을 실측 확인했다.
 
+## 과적합 완화용 정규화 플래그 (`--dropout`, `--rdrop-alpha`, 기본 OFF, `--local` 전용, 2026-09-24)
+
+- **배경**: 2차 학습에서 train subset agreement 0.98/0.92/0.94 대 held-out 0.81/0.64/0.59로
+  과적합이 컸다. multilingual base의 `encoder/config.json`은 attention/embedding/mlp
+  dropout이 모두 0.0이라 encoder는 dropout 없이 학습된다(참고: `DecisionModel`의 2층 head는
+  laya 코드에 하드코딩된 `nn.TransformerEncoderLayer` dropout 0.1을 원래부터 쓴다).
+- **`--dropout P`** (0 < P ≤ 0.5, 기본 미설정 = checkpoint 설정 그대로): 학습 때 encoder의
+  attention/embedding/mlp dropout을 P로 둔다. ModernBERT는 이 값을 모듈 생성 시점에
+  복사하고, attention 출력 dropout은 0이면 `nn.Identity`로 만들어 버리므로 생성 뒤 설정을
+  바꾸면 일부가 빠진다. 그래서 `build_model_with_encoder_dropout()`이 encoder 디렉터리를
+  임시로 복사해 config만 바꾼 뒤 laya `build_model()`로 생성하고, 생성 직후
+  `assert_encoder_dropout_applied()`가 실제 모듈 값을 검사한다(multilingual 기준 Dropout
+  모듈 45개 + attention 22개가 모두 P가 아니면 중단, 결과는 `[local] encoder dropout applied: ...`
+  로그와 `local_training_run.json`의 `encoder_dropout_check`). **저장되는
+  `encoder/config.json`은 원래 checkpoint 값(0.0)을 유지**하므로 추론 설정·식별자는 그대로이고,
+  추론·calibration 수집·epoch 선택·온도 피팅은 모두 eval 모드라 dropout이 꺼진다.
+- **`--rdrop-alpha A`** (A ≥ 0, 기본 0 = 끔, `--dropout` 필수): R-Drop(Liang et al.,
+  NeurIPS 2021). micro-batch마다 train 모드 forward를 두 번 돌려(서로 다른 dropout mask),
+  기존 loss(RL + CE)를 두 pass 평균으로 쓰고 `A × 대칭 KL`(0.5·(KL(p1‖p2)+KL(p2‖p1)),
+  질문별 유효 option에만, 질문 평균)을 더한다. grad-accum 나눗셈·gradient clipping·
+  optimizer step마다의 `torch.mps.empty_cache()`는 그대로다.
+- **비용 (2026-09-24 M4 Pro 24GB 실측, 실제 export에서 train 64행, batch 4, 48 micro-step)**:
+  플래그 없음 1.34초/step·MPS 약 6.9GB, `--dropout 0.1`만 1.50초/step(약 1.1배)·약 6.4GB,
+  `--dropout 0.1 --rdrop-alpha 1.0` 3.15초/step(약 **2.35배**)·약 **11.2GB**. R-Drop은
+  forward/backward를 두 번 하므로 연산이 약 2배 이상 들고, 두 pass의 그래프를 동시에 들고
+  있어 메모리도 크게 는다. 전체 규모 학습 전에 `--max-steps`로 메모리를 먼저 확인한다.
+- **기록**: 두 값은 `local_training_run.json`(`dropout`, `rdrop_alpha`)과
+  `training_metadata.json`의 `hyperparameters`에 남고(끄면 `null`), `[local] device=...`
+  시작 줄에도 찍힌다. 두 플래그를 끈 기본 경로는 이전과 loss·가중치 갱신이 비트 단위로
+  같다(`tests/test_laya_kit_regularization.py`).
+- **주의(MPS)**: attention dropout이 켜진 encoder를 **train 모드 + `torch.no_grad()`**로
+  돌리면 PyTorch MPS SDPA가 `NotImplementedError`를 낸다. 학습(grad 켜짐)과 eval 모드
+  경로는 문제없으니, train 모드 그대로 no_grad 평가를 추가하지 않는다.
+
 ## 학습 후 평가(`evaluate_checkpoint`) 버그 수정 (2026-09-23)
 
 - **증상(실측)**: 위 실측 학습의 학습 후 평가 단계가

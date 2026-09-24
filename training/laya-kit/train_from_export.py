@@ -59,6 +59,7 @@ below is copied verbatim from the notebook.
 """
 import argparse
 import json
+import math
 import os
 import subprocess
 import sys
@@ -280,6 +281,21 @@ def resolve_local_batch_and_grad_accum(batch_size_arg, grad_accum_arg):
         return batch_size, grad_accum_arg
     grad_accum = max(1, round(EFFECTIVE_GLOBAL_BATCH / batch_size))
     return batch_size, grad_accum
+
+
+def validate_regularization_args(dropout, rdrop_alpha, local):
+    """jev-change: --dropout / --rdrop-alpha (2026-09-24, both default OFF).
+    Validated before any export/model work so a bad value fails fast, and
+    rejected outside --local so a DDP run can never silently ignore them."""
+    if dropout is not None and not (math.isfinite(dropout) and 0.0 < dropout <= 0.5):
+        die(f"--dropout must satisfy 0 < P <= 0.5, got {dropout}")
+    if not (math.isfinite(rdrop_alpha) and rdrop_alpha >= 0.0):
+        die(f"--rdrop-alpha must be a finite value >= 0, got {rdrop_alpha}")
+    if rdrop_alpha > 0 and dropout is None:
+        die("--rdrop-alpha > 0 requires --dropout P (0 < P <= 0.5): R-Drop regularizes the gap between two "
+            "dropout-perturbed forward passes, and the base encoder config has encoder dropout 0.0")
+    if (dropout is not None or rdrop_alpha > 0) and not local:
+        die("--dropout/--rdrop-alpha are --local only (the DDP torchrun path does not pass them through)")
 
 
 def format_oom_message(batch_size, grad_accum):
@@ -527,6 +543,7 @@ TRAIN_DDP_SCRIPT = r'''
 # the same DDP wiring and hyperparameters as before this refactor; only the
 # loop body moved into a shared function.
 import os, sys, time, json, random, math
+import copy, shutil, tempfile  # jev-change: opt-in --dropout (build_model_with_encoder_dropout)
 import numpy as np
 import torch
 from safetensors.torch import load_file, save_file
@@ -613,6 +630,153 @@ def oom_suggestion(batch_size, grad_accum):
         f"Retry with --batch-size {suggested_batch} --grad-accum {suggested_grad_accum} "
         "(keeps the same effective global batch)."
     )
+
+
+# jev-change: opt-in regularization (--dropout / --rdrop-alpha, --local only,
+# 2026-09-24). Round-2 local training overfit badly (train-subset agreement
+# 0.98/0.92/0.94 vs held-out 0.81/0.64/0.59) and the multilingual encoder's
+# config.json ships attention/embedding/mlp dropout = 0.0, so the encoder
+# trained with no dropout at all (DecisionModel's 2-layer head keeps its own
+# hard-coded nn.TransformerEncoderLayer dropout=0.1 either way). Both flags
+# default OFF, and with them off every function below reduces to the exact
+# pre-change code path.
+ENCODER_DROPOUT_KEYS = ("attention_dropout", "embedding_dropout", "mlp_dropout")
+
+
+def build_model_with_encoder_dropout(cfg, encoder_dir, dropout):
+    """dropout=None: exactly build_model(cfg, encoder_dir=encoder_dir); returns (model, None).
+
+    Otherwise builds the model from a temporary copy of encoder_dir whose
+    config.json sets ENCODER_DROPOUT_KEYS to `dropout`, and returns
+    (model, original) where `original` maps those keys to the checkpoint's own
+    values -- finalize_and_save() writes them back so the saved encoder/config.json
+    (inference config and identity) is unchanged. The values must be in place at
+    construction time: ModernBERT copies them into nn.Dropout(p) and
+    ModernBertAttention.attention_dropout in __init__, and builds out_drop as
+    nn.Identity when attention_dropout == 0, so mutating the config (or the
+    Dropout modules) after build_model() would silently miss part of it. The
+    laya package's build_model() only takes an encoder directory, hence the
+    temporary copy instead of a config override."""
+    if dropout is None:
+        return build_model(cfg, encoder_dir=encoder_dir), None
+    with open(os.path.join(encoder_dir, "config.json")) as f:
+        enc_cfg = json.load(f)
+    original = {k: enc_cfg.get(k) for k in ENCODER_DROPOUT_KEYS}
+    tmp_root = tempfile.mkdtemp(prefix="laya-encoder-dropout-")
+    try:
+        tmp_encoder_dir = os.path.join(tmp_root, "encoder")
+        shutil.copytree(encoder_dir, tmp_encoder_dir)
+        enc_cfg.update({k: float(dropout) for k in ENCODER_DROPOUT_KEYS})
+        with open(os.path.join(tmp_encoder_dir, "config.json"), "w") as f:
+            json.dump(enc_cfg, f, indent=2)
+        model = build_model(cfg, encoder_dir=tmp_encoder_dir)
+    finally:
+        shutil.rmtree(tmp_root, ignore_errors=True)
+    return model, original
+
+
+def encoder_dropout_report(encoder):
+    """What the built encoder modules will actually apply in train mode (not
+    what its config claims): nn.Dropout p values and attention-probability
+    dropout (ModernBertAttention.attention_dropout)."""
+    dropout_ps = [m.p for m in encoder.modules() if isinstance(m, torch.nn.Dropout)]
+    attn_ps = [m.attention_dropout for m in encoder.modules()
+               if isinstance(getattr(m, "attention_dropout", None), float)]
+    return {
+        "dropout_modules": len(dropout_ps),
+        "active_dropout_modules": sum(1 for p in dropout_ps if p > 0),
+        "dropout_module_ps": sorted(set(dropout_ps)),
+        "attention_modules": len(attn_ps),
+        "attention_dropout_values": sorted(set(attn_ps)),
+    }
+
+
+def assert_encoder_dropout_applied(encoder, dropout):
+    report = encoder_dropout_report(encoder)
+    ok = (report["active_dropout_modules"] > 0
+          and report["active_dropout_modules"] == report["dropout_modules"]
+          and report["dropout_module_ps"] == [float(dropout)]
+          and report["attention_modules"] > 0
+          and report["attention_dropout_values"] == [float(dropout)])
+    if not ok:
+        raise RuntimeError(f"--dropout {dropout} did not take effect in the encoder modules: {report}")
+    return report
+
+
+def forward_micro_batch(forward_fn, batch, device, autocast_device, autocast_dtype, autocast_enabled):
+    if autocast_enabled:
+        with torch.autocast(autocast_device, dtype=autocast_dtype):
+            return forward_fn(
+                batch["input_ids"].to(device),
+                batch["attention_mask"].to(device),
+                batch["marker_pos"].to(device),
+                batch["marker_mask"].to(device),
+                batch["qtype"].to(device)
+            )
+    return forward_fn(
+        batch["input_ids"].to(device),
+        batch["attention_mask"].to(device),
+        batch["marker_pos"].to(device),
+        batch["marker_mask"].to(device),
+        batch["qtype"].to(device)
+    )
+
+
+def rl_ce_loss_terms(logits, batch, device, group_size, sigma):
+    """official-notebook-cell 4's per-micro-batch RLCD/GRPO + CE terms, moved
+    here unchanged from run_training_loop(). Returns (loss_rl + 1.0 * loss_ce, r)."""
+    logits = logits.float()
+    mask = batch["marker_mask"].to(device)
+    k = mask.sum(-1, keepdim=True).float()
+    target = batch["target"].to(device)
+
+    eps = torch.randn((group_size,) + logits.shape, device=device) * sigma * mask
+    eps = (eps - eps.sum(-1, keepdim=True) / k) * mask
+    z = logits.detach().unsqueeze(0) + eps
+    q = torch.softmax(z.masked_fill(~mask, -1e4), -1)
+
+    with torch.no_grad():
+        r = proper_reward(q, target.unsqueeze(0), batch["qtype"].to(device), mask, w_sph=0.75, w_rps=1.0)
+        adv = r - r.mean(0, keepdim=True)
+        adv = adv / (adv.std() + 1e-6)
+
+    logp = -(((z - logits.unsqueeze(0)) ** 2) * mask).sum(-1) / (2 * sigma ** 2)
+    loss_rl = -(adv * logp).mean()
+    loss_ce = -(target * torch.log_softmax(logits.masked_fill(~mask, -1e4), -1)).sum(-1).mean()
+    return loss_rl + 1.0 * loss_ce, r
+
+
+def micro_batch_loss(logits, act, batch, device, group_size, sigma, grad_accum):
+    """The default (no R-Drop) per-micro-batch loss -- identical to the
+    pre-extraction `(loss_rl + 1.0 * loss_ce) / grad_accum + 0.0 * act.sum()`."""
+    base, r = rl_ce_loss_terms(logits, batch, device, group_size, sigma)
+    return base / grad_accum + 0.0 * act.sum(), r
+
+
+def masked_symmetric_kl(logits1, logits2, mask):
+    """R-Drop's symmetric KL, 0.5 * (KL(p1||p2) + KL(p2||p1)), between the two
+    passes' per-question distributions over VALID options only (the same
+    marker_mask / masked_fill(-1e4) handling loss_ce uses; choice, score and
+    noul rows are all one row of marker logits here). Summed over options,
+    averaged over questions like loss_ce."""
+    mask_f = mask.float()
+    lp1 = torch.log_softmax(logits1.float().masked_fill(~mask, -1e4), -1)
+    lp2 = torch.log_softmax(logits2.float().masked_fill(~mask, -1e4), -1)
+    kl12 = (lp1.exp() * (lp1 - lp2) * mask_f).sum(-1)
+    kl21 = (lp2.exp() * (lp2 - lp1) * mask_f).sum(-1)
+    return (0.5 * (kl12 + kl21)).mean()
+
+
+def rdrop_micro_batch_loss(out1, out2, batch, device, group_size, sigma, grad_accum, alpha):
+    """R-Drop (Liang et al., NeurIPS 2021): mean of the two train-mode passes'
+    existing losses + alpha * symmetric KL between them, scaled by 1/grad_accum
+    exactly like micro_batch_loss(). Returns (loss, mean reward, kl)."""
+    (logits1, act1), (logits2, act2) = out1, out2
+    base1, r1 = rl_ce_loss_terms(logits1, batch, device, group_size, sigma)
+    base2, r2 = rl_ce_loss_terms(logits2, batch, device, group_size, sigma)
+    kl = masked_symmetric_kl(logits1, logits2, batch["marker_mask"].to(device))
+    loss = (0.5 * (base1 + base2) + alpha * kl) / grad_accum + 0.0 * (act1.sum() + act2.sum())
+    return loss, 0.5 * (r1 + r2), kl
 
 
 def compute_calib_agreement(calib_preds):
@@ -710,12 +874,17 @@ def make_epoch_end_fn(model, calib_items, tok, device, *, autocast_device, autoc
 def run_training_loop(forward_fn, items, params_for_clip, optimizer, scheduler, tok, *,
                        device, epochs, micro_batch, grad_accum, group_size, sigma_start, sigma_end,
                        rank, world_size, use_scaler, scaler, autocast_device, autocast_dtype,
-                       autocast_enabled, max_steps, mem_log_fn, log_prefix, epoch_end_fn=None):
+                       autocast_enabled, max_steps, mem_log_fn, log_prefix, epoch_end_fn=None,
+                       rdrop_alpha=0.0):
     """official-notebook-cell 4's inner training loop, generalized over
     (forward_fn, world_size, autocast/scaler settings) so it is IDENTICAL for
     DDP (world_size=2, forward_fn=ddp_model, cuda fp16 autocast+GradScaler) and
     --local (world_size=1, forward_fn=model, fp32 by default / optional MPS
-    bf16 autocast, no GradScaler)."""
+    bf16 autocast, no GradScaler).
+
+    jev-change: rdrop_alpha > 0 (--rdrop-alpha, --local only) runs each
+    micro-batch's forward twice in train mode and uses rdrop_micro_batch_loss();
+    the default 0.0 keeps the single-forward micro_batch_loss() path."""
     t0 = time.time()
     global_step = 0
     epochs_completed = 0
@@ -737,43 +906,15 @@ def run_training_loop(forward_fn, items, params_for_clip, optimizer, scheduler, 
             batch = collate_train_batch(chunk, tok.pad_token_id)
 
             try:
-                if autocast_enabled:
-                    with torch.autocast(autocast_device, dtype=autocast_dtype):
-                        logits, act = forward_fn(
-                            batch["input_ids"].to(device),
-                            batch["attention_mask"].to(device),
-                            batch["marker_pos"].to(device),
-                            batch["marker_mask"].to(device),
-                            batch["qtype"].to(device)
-                        )
+                if rdrop_alpha > 0:
+                    # jev-change: R-Drop -- two train-mode forwards (independent dropout masks).
+                    out1 = forward_micro_batch(forward_fn, batch, device, autocast_device, autocast_dtype, autocast_enabled)
+                    out2 = forward_micro_batch(forward_fn, batch, device, autocast_device, autocast_dtype, autocast_enabled)
+                    loss, r, rdrop_kl = rdrop_micro_batch_loss(out1, out2, batch, device, group_size, sigma,
+                                                                grad_accum, rdrop_alpha)
                 else:
-                    logits, act = forward_fn(
-                        batch["input_ids"].to(device),
-                        batch["attention_mask"].to(device),
-                        batch["marker_pos"].to(device),
-                        batch["marker_mask"].to(device),
-                        batch["qtype"].to(device)
-                    )
-
-                logits = logits.float()
-                mask = batch["marker_mask"].to(device)
-                k = mask.sum(-1, keepdim=True).float()
-                target = batch["target"].to(device)
-
-                eps = torch.randn((group_size,) + logits.shape, device=device) * sigma * mask
-                eps = (eps - eps.sum(-1, keepdim=True) / k) * mask
-                z = logits.detach().unsqueeze(0) + eps
-                q = torch.softmax(z.masked_fill(~mask, -1e4), -1)
-
-                with torch.no_grad():
-                    r = proper_reward(q, target.unsqueeze(0), batch["qtype"].to(device), mask, w_sph=0.75, w_rps=1.0)
-                    adv = r - r.mean(0, keepdim=True)
-                    adv = adv / (adv.std() + 1e-6)
-
-                logp = -(((z - logits.unsqueeze(0)) ** 2) * mask).sum(-1) / (2 * sigma ** 2)
-                loss_rl = -(adv * logp).mean()
-                loss_ce = -(target * torch.log_softmax(logits.masked_fill(~mask, -1e4), -1)).sum(-1).mean()
-                loss = (loss_rl + 1.0 * loss_ce) / grad_accum + 0.0 * act.sum()
+                    logits, act = forward_micro_batch(forward_fn, batch, device, autocast_device, autocast_dtype, autocast_enabled)
+                    loss, r = micro_batch_loss(logits, act, batch, device, group_size, sigma, grad_accum)
 
                 if use_scaler:
                     scaler.scale(loss).backward()
@@ -811,7 +952,8 @@ def run_training_loop(forward_fn, items, params_for_clip, optimizer, scheduler, 
             if rank == 0 and (n_batches % 50) == 0:
                 cur_lr = scheduler.get_last_lr()[0]
                 mem = f" | MPS: {torch.mps.driver_allocated_memory() / 2**20:.0f}MiB" if device.type == "mps" else ""
-                print(f"  {log_prefix} Epoch {epoch+1}/{epochs} | Step {n_batches} | Loss: {loss.item()*grad_accum:.4f} | Reward: {r.mean().item():.3f} | LR: {cur_lr:.2e}{mem}")
+                rdrop = f" | RDropKL: {rdrop_kl.item():.4f}" if rdrop_alpha > 0 else ""
+                print(f"  {log_prefix} Epoch {epoch+1}/{epochs} | Step {n_batches} | Loss: {loss.item()*grad_accum:.4f} | Reward: {r.mean().item():.3f} | LR: {cur_lr:.2e}{mem}{rdrop}")
 
             if max_steps and global_step >= max_steps:
                 if rank == 0:
@@ -836,7 +978,8 @@ def run_training_loop(forward_fn, items, params_for_clip, optimizer, scheduler, 
 
 
 def finalize_and_save(model, tok, calib_items, output_dir, model_name, base_model_dir_name,
-                       exporter_version, cfg, *, device, autocast_device, autocast_dtype, autocast_enabled):
+                       exporter_version, cfg, *, device, autocast_device, autocast_dtype, autocast_enabled,
+                       encoder_config_restore=None):
     """official-notebook-cell 4's post-training calibration-temperature-fit + save
     step, extracted so both main_ddp() (rank 0 only) and main_local() (always,
     world_size=1) call the IDENTICAL save path -- same checkpoint layout
@@ -845,7 +988,13 @@ def finalize_and_save(model, tok, calib_items, output_dir, model_name, base_mode
     jev-change: calib_items is now the already-loaded list (not a path) so the
     caller can load calibration.jsonl's preprocessed items once and reuse them
     for both epoch_end_fn's per-epoch selection and this final temperature
-    fit, via the shared collect_calib_logits() helper."""
+    fit, via the shared collect_calib_logits() helper.
+
+    jev-change: encoder_config_restore (from build_model_with_encoder_dropout()
+    under --dropout) holds the base checkpoint's own encoder config values; they
+    are written into a copy of the encoder config before saving, so the saved
+    encoder/config.json keeps the checkpoint's dropout values. None (default)
+    saves model.encoder.config as before."""
     print("\nFitting post-training calibration temperatures...")
     calib_preds = collect_calib_logits(model, calib_items, tok, device, autocast_device, autocast_dtype, autocast_enabled)
 
@@ -862,7 +1011,13 @@ def finalize_and_save(model, tok, calib_items, output_dir, model_name, base_mode
     os.makedirs(output_dir, exist_ok=True)
     sd = {k: v.half().contiguous().cpu() for k, v in model.state_dict().items()}
     save_file(sd, os.path.join(output_dir, "model.safetensors"))
-    model.encoder.config.save_pretrained(os.path.join(output_dir, "encoder"))
+    if encoder_config_restore:
+        saved_encoder_config = copy.deepcopy(model.encoder.config)
+        for key, value in encoder_config_restore.items():
+            setattr(saved_encoder_config, key, value)
+        saved_encoder_config.save_pretrained(os.path.join(output_dir, "encoder"))
+    else:
+        model.encoder.config.save_pretrained(os.path.join(output_dir, "encoder"))
     tok.save_pretrained(os.path.join(output_dir, "tokenizer"))
 
     cfg["fine_tuned"] = True
@@ -1014,6 +1169,14 @@ def main_local():
     micro_batch = int(sys.argv[12]) if len(sys.argv) > 12 else MICRO_BATCH
     mps_autocast = sys.argv[13] if len(sys.argv) > 13 else "off"
     max_steps = int(sys.argv[14]) if len(sys.argv) > 14 else 0
+    # jev-change: argv[15]/[16] are --dropout ("none" = keep the checkpoint's
+    # encoder config) and --rdrop-alpha (0 = off); see build_model_with_encoder_dropout().
+    dropout_arg = sys.argv[15] if len(sys.argv) > 15 else "none"
+    encoder_dropout = None if dropout_arg == "none" else float(dropout_arg)
+    rdrop_alpha = float(sys.argv[16]) if len(sys.argv) > 16 else 0.0
+    if rdrop_alpha > 0 and not encoder_dropout:
+        print("[FATAL] --rdrop-alpha > 0 requires --dropout > 0", file=sys.stderr)
+        sys.exit(1)
 
     if device_name == "mps" and not torch.backends.mps.is_available():
         print("[FATAL] --device mps requested but torch.backends.mps.is_available() is False", file=sys.stderr)
@@ -1028,7 +1191,8 @@ def main_local():
     cfg["head_max_len"] = 256
 
     tok = AutoTokenizer.from_pretrained(os.path.join(model_dir, "tokenizer"))
-    model = build_model(cfg, encoder_dir=os.path.join(model_dir, "encoder"))
+    model, encoder_config_restore = build_model_with_encoder_dropout(
+        cfg, os.path.join(model_dir, "encoder"), encoder_dropout)
 
     weights = load_file(os.path.join(model_dir, "model.safetensors"))
     model.load_state_dict(weights, strict=True)
@@ -1037,6 +1201,10 @@ def main_local():
     model.head_checkpointing = True
     model.to(device)
     model.train()
+    encoder_dropout_check = None
+    if encoder_dropout is not None:
+        encoder_dropout_check = assert_encoder_dropout_applied(model.encoder, encoder_dropout)
+        print(f"[local] encoder dropout applied: {encoder_dropout_check}")
 
     all_items = torch.load(train_items_path, weights_only=False)
     my_items = list(all_items)  # world_size=1: no DDP rank split, every item is "mine"
@@ -1059,7 +1227,9 @@ def main_local():
 
     print(f"[local] device={device_name} items={len(my_items)} epochs={EPOCHS} micro_batch={micro_batch} "
           f"grad_accum={grad_accum} effective_global_batch={micro_batch*grad_accum} "
-          f"mps_autocast={mps_autocast} max_steps={max_steps or 'unlimited'}")
+          f"mps_autocast={mps_autocast} max_steps={max_steps or 'unlimited'} "
+          f"dropout={'off' if encoder_dropout is None else encoder_dropout} "
+          f"rdrop_alpha={rdrop_alpha if rdrop_alpha > 0 else 'off'}")
 
     def mem_log_fn(epoch):
         # jev-change: memory-safety logging (spec: log peak MPS memory per
@@ -1089,7 +1259,7 @@ def main_local():
         sigma_start=SIGMA_START, sigma_end=SIGMA_END, rank=0, world_size=1,
         use_scaler=False, scaler=None, autocast_device=autocast_device, autocast_dtype=autocast_dtype,
         autocast_enabled=autocast_enabled, max_steps=max_steps, mem_log_fn=mem_log_fn, log_prefix="[local]",
-        epoch_end_fn=epoch_end_fn)
+        epoch_end_fn=epoch_end_fn, rdrop_alpha=rdrop_alpha)
 
     del optimizer, scheduler
     selected_epoch = None
@@ -1099,7 +1269,8 @@ def main_local():
         del best_state["state_dict"]  # jev-change: free the ~1.3GB CPU copy once loaded.
     finalize_and_save(model, tok, calib_items, output_dir, model_name, base_model_dir_name,
                        exporter_version, cfg, device=device, autocast_device=autocast_device,
-                       autocast_dtype=autocast_dtype, autocast_enabled=autocast_enabled)
+                       autocast_dtype=autocast_dtype, autocast_enabled=autocast_enabled,
+                       encoder_config_restore=encoder_config_restore)
     write_epoch_selection_metadata(output_dir, select_best_epoch, selected_epoch, epoch_agreements)
 
     # jev-change: structured local-run metadata the outer train_from_export.py
@@ -1112,6 +1283,8 @@ def main_local():
             "effective_global_batch": micro_batch * grad_accum, "mps_autocast": mps_autocast,
             "epochs_completed": result["epochs_completed"], "global_step": result["global_step"],
             "stopped_early": result["stopped_early"], "wall_time_s": round(result["elapsed_s"], 3),
+            "dropout": encoder_dropout, "rdrop_alpha": rdrop_alpha if rdrop_alpha > 0 else None,
+            "encoder_dropout_check": encoder_dropout_check,
         }, f, indent=2)
     print(f"[local] wrote {metadata_path}")
 
@@ -1337,7 +1510,18 @@ def main():
                               "local run (2026-09-23) overfit badly by the final epoch -- train agreement "
                               "~0.99/0.92/0.95 (intent/difficulty/risk) vs held-out test ~0.72/0.58/0.60. "
                               "Pass --no-select-best-epoch to keep the old always-last-epoch behavior.")
+    parser.add_argument("--dropout", type=float, default=None,
+                         help="--local only: train with encoder attention/embedding/mlp dropout = P (0 < P <= 0.5). "
+                              "Default: not set -- keep the base checkpoint's encoder config (0.0 for the "
+                              "multilingual checkpoint). The saved encoder/config.json keeps the checkpoint's own "
+                              "values; inference always runs in eval mode.")
+    parser.add_argument("--rdrop-alpha", type=float, default=0.0,
+                         help="--local only: R-Drop weight A >= 0 (default 0 = off). When > 0, each micro-batch "
+                              "runs two train-mode forward passes and adds A * symmetric KL between their "
+                              "per-question option distributions to the mean of the two losses. Requires "
+                              "--dropout. Roughly doubles forward/backward compute per step.")
     args = parser.parse_args()
+    validate_regularization_args(args.dropout, args.rdrop_alpha, args.local)
 
     if args.local:
         resolved_batch_size, resolved_grad_accum = resolve_local_batch_and_grad_accum(args.batch_size, args.grad_accum)
@@ -1455,13 +1639,15 @@ def main():
         # jev-change: --local runs the SAME embedded script with plain python3
         # (no torchrun/NCCL/DDP) -- argv[8] selects main_local(), argv[9] is
         # --select-best-epoch, argv[10:] are device/grad-accum/batch-size/
-        # autocast/max-steps. argv[1:8] are UNCHANGED from the DDP cmd below.
+        # autocast/max-steps/dropout ("none" = unset)/rdrop-alpha. argv[1:8] are
+        # UNCHANGED from the DDP cmd below.
         cmd = [
             sys.executable, str(ddp_script_path),
             str(resolved_model_dir), str(output_dir), str(train_items_path), str(calib_items_path),
             derived_model_name, base_model_dir_name, str(manifest.get("exporter_version") or ""),
             "local", select_best_epoch_flag, args.device, str(resolved_grad_accum), str(resolved_batch_size),
             args.mps_autocast, str(args.max_steps or 0),
+            "none" if args.dropout is None else str(args.dropout), str(args.rdrop_alpha),
         ]
     else:
         # official-notebook-cell: 5 ("Launch Multi-GPU Fine-Tuning with torchrun")
@@ -1511,6 +1697,7 @@ def main():
             "lr_encoder": 2.5e-5, "lr_head": 1.0e-4, "sigma_start": 0.4, "sigma_end": 0.1,
             "weight_decay": 0.01, "max_len": cfg.get("max_len", 1024), "head_max_len": cfg.get("head_max_len", 256),
             "select_best_epoch": args.select_best_epoch,
+            "dropout": args.dropout, "rdrop_alpha": args.rdrop_alpha if args.rdrop_alpha > 0 else None,
         },
         "train_sequences": len(train_items),
         "train_truncated": train_truncated,
