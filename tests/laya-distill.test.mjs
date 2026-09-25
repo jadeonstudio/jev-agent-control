@@ -868,6 +868,55 @@ test('distill compare-teacher reports eval_reference and train_reference separat
   assert.ok(Object.hasOwn(report.eval_reference.questions.intent.by_lang, t1.lang));
 });
 
+test('distill compare-teacher by_split counts sum to the eval_reference total', async t => {
+  const home = fixture(t);
+  const file = writeInputFile(t, [
+    { lang: 'en', task: 'task alpha' }, { lang: 'en', task: 'task bravo' }, { lang: 'ko', task: '작업 찰리' },
+    { lang: 'ko', task: '작업 델타' }, { lang: 'en', task: 'task echo' },
+  ]);
+  distillImport(home, { run: 'run1', inputFile: file });
+  await distillLabel(home, { run: 'run1', confirmEgress: true, key: 'k', provider: fakeProvider({ intent: 'edit', difficulty: 1, risk: 'safe' }), sleepImpl: async () => {} });
+  const tasks = fs.readFileSync(path.join(runDir(home, 'run1'), 'tasks.jsonl'), 'utf8').trim().split('\n').map(JSON.parse);
+  distillImportReference(home, { run: 'run1', source: 'claude-sonnet-5',
+    inputFile: writeInputFile(t, tasks.map(t => referenceLine(t.lang, t.task))) });
+  const report = distillCompareTeacher(home, { run: 'run1' });
+  assert.equal(report.eval_reference.compared, 5);
+  assert.equal(report.eval_reference.by_split.calibration.compared + report.eval_reference.by_split.test.compared, 5);
+  // Every by_split section has full question coverage, not just the totals.
+  for (const splitName of ['calibration', 'test']) {
+    assert.ok(Object.hasOwn(report.eval_reference.by_split[splitName], 'questions'));
+    assert.ok(Object.hasOwn(report.eval_reference.by_split[splitName].questions, 'intent'));
+  }
+  // train_reference (no eval-split concept) must not get a by_split key.
+  assert.equal(report.train_reference.by_split, undefined);
+});
+
+test('distill compare-teacher by_split assigns each task to the same calibration/test split buildDistillDataset uses', async t => {
+  const home = fixture(t);
+  const file = writeInputFile(t, [
+    { lang: 'en', task: 'task alpha' }, { lang: 'en', task: 'task bravo' }, { lang: 'ko', task: '작업 찰리' },
+    { lang: 'ko', task: '작업 델타' }, { lang: 'en', task: 'task echo' }, { lang: 'en', task: 'task foxtrot' },
+  ]);
+  distillImport(home, { run: 'run1', inputFile: file });
+  await distillLabel(home, { run: 'run1', confirmEgress: true, key: 'k', provider: fakeProvider({ intent: 'edit', difficulty: 1, risk: 'safe' }), sleepImpl: async () => {} });
+  const tasks = fs.readFileSync(path.join(runDir(home, 'run1'), 'tasks.jsonl'), 'utf8').trim().split('\n').map(JSON.parse);
+  distillImportReference(home, { run: 'run1', source: 'claude-sonnet-5',
+    inputFile: writeInputFile(t, tasks.map(t => referenceLine(t.lang, t.task))) });
+  const built = buildDistillDataset(home, { run: 'run1' });
+  const { samples: dataset } = readDataset(createTrainingStore({ home }), built.dataset_version);
+  const report = distillCompareTeacher(home, { run: 'run1' });
+  // hashToUuid/group_id/split assignment are private to laya-distill.mjs, so cross-check indirectly:
+  // the build's own per-split sample count (this run only ever emits label_source:'ai_reference' via
+  // eval-role reference lines) must match the report's eval_reference by_split count for that split.
+  const builtSplitCounts = { calibration: 0, test: 0 };
+  for (const s of dataset) if (s.label_source === 'ai_reference') builtSplitCounts[s.split] = (builtSplitCounts[s.split] ?? 0) + 1;
+  // Each task contributes one sample per ROUTE_QUESTIONS entry to the built dataset but one pair to
+  // the report; dividing by the question count recovers per-task counts for a direct comparison.
+  const questionCount = Object.keys(ROUTE_QUESTIONS).length;
+  assert.equal(builtSplitCounts.calibration / questionCount, report.eval_reference.by_split.calibration.compared);
+  assert.equal(builtSplitCounts.test / questionCount, report.eval_reference.by_split.test.compared);
+});
+
 // ============================== status: reference_labels ==============================
 
 test('distill status reports reference_labels total and by role', t => {

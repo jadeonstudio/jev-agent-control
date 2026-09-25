@@ -144,7 +144,11 @@ function argmaxKey(probabilities) {
   for (const [key, value] of Object.entries(probabilities)) if (value > bestValue) { bestValue = value; bestKey = key; }
   return bestKey;
 }
-async function inferOne(layaClient, laya, sample, { timeoutMs = 30000, env = process.env, signal } = {}) {
+// Exported so scripts/laya-benchmark.mjs (a separate reporting tool, not the qualify/compare
+// lifecycle) reuses the exact same per-sample scoring semantics instead of duplicating them:
+// argmax-of-probabilities correctness, INPUT_TRUNCATED/INPUT_REWRITE_REFUSED counted as refused
+// (never correct), and the same threshold-comparable `metric` per question type.
+export async function inferOne(layaClient, laya, sample, { timeoutMs = 30000, env = process.env, signal } = {}) {
   const request = validateRequest({ purpose: sample.purpose, risk: 'routine', state: sample.state, questions: { [sample.question_id]: sample.question } }, DEFAULTS);
   const payload = wireRequest(request, laya.model);
   let raw;
@@ -153,7 +157,7 @@ async function inferOne(layaClient, laya, sample, { timeoutMs = 30000, env = pro
   } catch (e) {
     if (e instanceof ControlError && INPUT_REFUSAL_CODES.has(e.code)) {
       // Never covered by any qualify/compare threshold (metric -Infinity), and never counted correct.
-      return { purpose: sample.purpose, question_id: sample.question_id, correct: false, metric: -Infinity, label_source: sample.label_source, refused: true };
+      return { purpose: sample.purpose, question_id: sample.question_id, correct: false, metric: -Infinity, predicted: null, label_source: sample.label_source, refused: true };
     }
     throw e;
   }
@@ -162,6 +166,10 @@ async function inferOne(layaClient, laya, sample, { timeoutMs = 30000, env = pro
   const answer = n.answers[sample.question_id];
   // Score questions report a continuous probability-weighted expected value in `answer.value` (e.g.
   // 2.0257), never the integer target index -- agreement must compare the argmax label instead.
+  // `predicted` is the same argmax label used for `correct` (score: numeric index; choice: key),
+  // exposed so a caller (e.g. scripts/laya-benchmark.mjs) can build confusion/within-N stats against
+  // `sample.target.value` without re-deriving the argmax itself.
+  const predicted = sample.question.type === 'score' ? Number(argmaxKey(answer.probabilities)) : answer.value;
   const correct = sample.question.type === 'score'
     ? argmaxKey(answer.probabilities) === String(sample.target.value)
     : answer.value === sample.target.value;
@@ -171,7 +179,7 @@ async function inferOne(layaClient, laya, sample, { timeoutMs = 30000, env = pro
   const metric = sample.question.type === 'noul' ? Math.max(answer.probabilityTrue, 1 - answer.probabilityTrue)
     : sample.question.type === 'choice' ? Math.min(answer.confidence, answer.selectedProbability)
     : answer.confidence;
-  return { purpose: sample.purpose, question_id: sample.question_id, correct, metric, label_source: sample.label_source, refused: false };
+  return { purpose: sample.purpose, question_id: sample.question_id, correct, metric, predicted, label_source: sample.label_source, refused: false };
 }
 // Content-free per-question raw stats: n, raw agreement (argmax-correct / n), refused.
 function byQuestionStats(records) {
@@ -185,8 +193,10 @@ function byQuestionStats(records) {
 }
 // When any evaluated sample carries an 'ai_reference' label (owner decision 2026-09-23), the metric
 // this checkpoint is scored against is agreement with that reference model, never "accuracy" — see
-// docs/TRAINING_DATA.md §7 and docs/plan/2026-09-23-laya-local-performance.md.
-function labelSourceSummary(records) {
+// docs/TRAINING_DATA.md §7 and docs/plan/2026-09-23-laya-local-performance.md. Exported so
+// scripts/laya-benchmark.mjs reports the same metric_semantics gate qualify/compare already enforce,
+// instead of a second copy that could drift.
+export function labelSourceSummary(records) {
   const counts = {};
   for (const r of records) counts[r.label_source] = (counts[r.label_source] ?? 0) + 1;
   const metricSemantics = Object.hasOwn(counts, 'ai_reference') ? 'agreement-with-ai-reference' : 'accuracy';

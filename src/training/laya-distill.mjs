@@ -86,7 +86,9 @@ const referenceFile = dir => path.join(dir, 'reference.jsonl');
 
 function normalizeTaskText(s) { return s.trim().replace(/\s+/g, ' '); }
 // No dependency on locale/ICU: a same-user local heuristic, adequate for splitting an owner-authored ko/en corpus.
-function detectLang(s) { return /[가-힣]/.test(s) ? 'ko' : 'en'; }
+// Exported so scripts/laya-benchmark.mjs classifies a built dataset sample's ko/en language the exact
+// same way distillImportShadow does, instead of a second drifting regex.
+export function detectLang(s) { return /[가-힣]/.test(s) ? 'ko' : 'en'; }
 function buildTaskRequest(task) {
   return { purpose: 'route', risk: 'routine', state: { task, context: structuredClone(FIXED_ROUTE_CONTEXT) }, questions: structuredClone(ROUTE_QUESTIONS) };
 }
@@ -397,6 +399,23 @@ const HOST_REVIEW_PROVENANCE = Object.freeze({ provider: 'host', model: 'human-r
 function aiReferenceProvenance(source) {
   return { provider: 'host', model: source, model_version: source, checkpoint: source, runtime_version: 'ai-reference', preprocessing_version: 'wire-request-v1', confidence_semantics: 'none' };
 }
+// Shared by buildDistillDataset and distillCompareTeacher so the calibration/test split assignment
+// for a human-reviewed or role:'eval' reference task can never drift between the two call sites
+// (2026-09-25). `group_id` namespacing matches buildDistillDataset's pre-existing formula exactly:
+// a `group` name can never collide with a bare task_id's own digest, and an ungrouped task's
+// group_id is byte-identical to the pre-group `digest({distill_task: task_id})` formula.
+function groupIdForTask(task) {
+  const groupKey = task.group ?? task.task_id;
+  return task.group ? digest({ distill_group: groupKey }) : digest({ distill_task: task.task_id });
+}
+// Deterministic 50/50 calibration/test split on the GROUP key's hash (not the task's own id), so
+// every eval-grounding member of one group lands in the same split. For an ungrouped task the group
+// key IS the task_id, so this is byte-identical to the pre-group per-task-id formula.
+function evalSplitForTask(task) {
+  const group_id = groupIdForTask(task);
+  const splitSeed = task.group ? group_id : task.task_id;
+  return parseInt(splitSeed.slice(0, 8), 16) % 2 === 0 ? 'calibration' : 'test';
+}
 
 export function buildDistillDataset(home, { run, trainingStore } = {}) {
   validateRunName(run);
@@ -436,25 +455,17 @@ export function buildDistillDataset(home, { run, trainingStore } = {}) {
       const reviewed = reviewById.get(task.task_id);
       const reference = referenceById.get(task.task_id);
       const groupKey = task.group ?? task.task_id;
-      // Namespaced so a `group` name can never collide with a bare task_id's own digest; kept
-      // byte-identical to the pre-group formula (digest({distill_task: task_id})) when task.group
-      // is unset, so ungrouped runs produce the exact same dataset_version/data as before.
-      const group_id = task.group ? digest({ distill_group: groupKey }) : digest({ distill_task: task.task_id });
+      const group_id = groupIdForTask(task);
       let split, provenance, labelSource, labelConfidence, valueFor, probsFor;
       // Precedence per task: human (eval) > reference eval > reference train > Jev teacher (train).
       if (reviewed) {
-        // Deterministic 50/50 calibration/test on the GROUP key's hash (not the task's own id), so
-        // every reviewed member of one group lands in the same split. For an ungrouped task the
-        // group key IS the task_id, so this is byte-identical to the pre-group formula.
-        const splitSeed = task.group ? group_id : task.task_id;
-        split = parseInt(splitSeed.slice(0, 8), 16) % 2 === 0 ? 'calibration' : 'test';
+        split = evalSplitForTask(task);
         provenance = teacher ? teacherProvenance(teacher.model) : HOST_REVIEW_PROVENANCE;
         labelSource = 'human'; labelConfidence = 1;
         valueFor = qid => reviewed.labels[qid];
         probsFor = (q, value) => targetDistribution(q, value);
       } else if (reference && reference.role === 'eval') {
-        const splitSeed = task.group ? group_id : task.task_id;
-        split = parseInt(splitSeed.slice(0, 8), 16) % 2 === 0 ? 'calibration' : 'test';
+        split = evalSplitForTask(task);
         provenance = aiReferenceProvenance(reference.source);
         labelSource = 'ai_reference'; labelConfidence = 1;
         valueFor = qid => reference.labels[qid];
@@ -581,16 +592,31 @@ export function distillCompareTeacher(home, { run } = {}) {
     const teacher = teacherById.get(r.task_id), task = tasksById.get(r.task_id);
     if (!teacher || !task) continue; // only tasks with BOTH a teacher label and a reference label are comparable
     const key = r.role === 'train' ? 'train_reference' : 'eval_reference';
-    bySection[key].push({ lang: task.lang, teacher, reference: r });
+    bySection[key].push({ lang: task.lang, teacher, reference: r, task });
   }
-  const report = { run };
-  for (const [key, items] of Object.entries(bySection)) {
+  function questionsFor(items) {
     const questions = {};
     for (const [qid, q] of Object.entries(ROUTE_QUESTIONS)) {
       const pairs = items.map(it => ({ lang: it.lang, teacherValue: teacherArgmax(it.teacher, qid, q), referenceValue: it.reference.labels[qid] }));
       questions[qid] = questionAgreementReport(pairs, q);
     }
-    report[key] = { compared: items.length, questions };
+    return questions;
+  }
+  const report = { run };
+  for (const [key, items] of Object.entries(bySection)) {
+    const section = { compared: items.length, questions: questionsFor(items) };
+    // by_split uses the exact same evalSplitForTask helper buildDistillDataset uses for these same
+    // reference lines (human review / role:'eval'), so these counts can never drift from the build's
+    // actual calibration/test assignment (2026-09-25).
+    if (key === 'eval_reference') {
+      const bySplit = { calibration: [], test: [] };
+      for (const it of items) bySplit[evalSplitForTask(it.task)].push(it);
+      section.by_split = {};
+      for (const splitName of ['calibration', 'test']) {
+        section.by_split[splitName] = { compared: bySplit[splitName].length, questions: questionsFor(bySplit[splitName]) };
+      }
+    }
+    report[key] = section;
   }
   return report;
 }
