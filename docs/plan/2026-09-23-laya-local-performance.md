@@ -155,7 +155,25 @@ owner 요청: 이 Mac(Apple M4 Pro, GPU 16코어, 통합 메모리 24GB)에서 L
   - 참고: 2차 평가 시점의 방향 판단 — train 부분집합(앞 450표본) 일치율 0.979/0.919/0.944로 학습 데이터는 거의 맞히지만(과적합) 새 문장에서는 difficulty·risk가 0.6대에 머문다. Claude 자기 일치율(0.91~0.94)로 보면 목표 상한은 충분히 높다
 
   - [~] 3차 학습(d5, dropout 0.1): 2026-09-24 20:51 시작, 1 epoch 6,657s(약 1.45s/step, 18,402 items → 4,600 step/epoch), epoch 1 calib 일치율 choice 0.773 / score 0.645 / mean 0.709(같은 dropout·2차 데이터 A/B의 epoch 1은 0.635). owner 지시(소음, 밤샘 금지)로 23:21 epoch 2 중반에 중단. 키트에 epoch 단위 재개가 없어 다음 실행은 처음부터 약 7.5시간.
-  - [ ] 3차 재개: 아래 명령으로 처음부터 학습 → 추론 파일만 복사해 `laya register ... --model laya/multilingual-d5 --input-fit task-head` → `laya qualify --dataset 4452fd05… --holdout d5-claude-test` → `laya compare --holdout d5-claude-test`(활성 = 2차 후보 0d424dad…, 관측 전용) → 합격·무회귀면 `laya promote` 후 상주 서버 재시작 → 합격 시 Hugging Face 모델 카드 초안 작성(owner 요청; 업로드는 owner 확인 후, `huggingface-cli login`은 owner 실행)
+  - [x] 3차 학습 재실행(2026-09-25 10:16~17:40, 4 epoch 26,489s, 약 1.45s/step): calib 일치율 mean 0.686 → 0.734 → 0.738 → **0.759**(epoch 4 선택, choice 0.823 / score 0.695), 보정 temperature 1.65/1.59. 후보 `ba94d517…`(laya/multilingual-d5)
+  - [x] 3차 평가(holdout `d5-claude-test` = d4와 같은 159문장): **qualify 불합격** — calibration 임계값 0.56, test coverage 0.53에서 선택 일치율 0.839(하한 0.789), 목표 0.9·하한 0.8 미달. test 원 일치율 intent 0.849 / difficulty 0.711 / risk 0.635(2차 0.811/0.635/0.591). compare(활성 2차 대비) route raw 0.732 vs 0.679로 모든 문항 우위 → 승격은 불가(불합격)이지만 관측 전용 활성을 3차로 교체(`laya activate`), 상주 서버가 재시작 없이 새 설정을 읽어 `laya/multilingual-d5` 로드 확인
+  - [x] 벤치마크(`scripts/laya-benchmark.mjs`, cb37445, M4 Pro MPS fp16, task-head, test 159문장 × 3문항, Claude 기준 라벨 일치율이며 정확도 아님):
+
+| 모델 | intent | difficulty | difficulty ±1 | risk | high→safe | 콜드 | warm p50/p95 |
+|---|---|---|---|---|---|---|---|
+| Laya d5 (3차, dropout 0.1) | 0.849 | 0.711 | 0.994 | 0.635 | 2 | 3.5s | 124/162ms |
+| Laya d4 + dropout (A/B) | 0.799 | 0.635 | 0.987 | 0.566 | 3 | 4.0s | 120/158ms |
+| Laya d4 (2차) | 0.811 | 0.635 | 0.994 | 0.591 | 1 | 3.9s | 120/156ms |
+| Laya d3k (1차) | 0.711 | 0.560 | 0.969 | 0.579 | 3 | 3.9s | 127/165ms |
+| Laya multilingual 원본 | 0.352 | 0.308 | 0.780 | 0.377 | 25 | 3.9s | 120/164ms |
+| Laya english 원본 | 0.308 | 0.283 | 0.811 | 0.195 | 14 | 3.1s | 294/313ms |
+| Laya typed-decisions 원본 | 0.371 | 0.277 | 0.830 | 0.396 | 6 | 3.1s | 357/380ms |
+| Jev teacher(기존 라벨 재사용, `compare-teacher` by_split test) | 0.811 | 0.396 | 0.862 | 0.654 | 미집계 | — | 약 650~730ms(B6, 별도 측정·API 비용) |
+| Claude 자기 일치율(평가 300 전체, 독립 2회 — 세트가 다름) | 0.977 | 0.913 | — | 0.940 | — | — | — |
+
+    d5 언어별: intent ko 0.899 / en 0.80, difficulty ko 0.722 / en 0.700, risk ko 0.582 / en 0.688(ko risk가 가장 약함). difficulty ±1은 argmax 기준이라 1차 평가 때 쓴 기댓값 기준(0.84~0.91)과 정의가 다르다.
+  - [ ] 다음 방향(owner 결정 필요): (1) 평가 세트 확대 — calibration 141문장이 epoch 선택·온도 보정·임계값에 모두 쓰여 낙관적이고(calib 선택 일치율 ≥0.9 → test 0.839), test 표본이 작아 하한이 낮다. 학습에 안 쓴 새 문장 약 300개를 Claude 전체 읽기로 라벨링해 calibration/test를 늘리면 임계값·하한이 안정되고, 규칙 변경을 기존 test에 맞추는 일(test 엿보기) 없이 검증할 수 있다. (2) 4 epoch까지 calib이 계속 올라 epoch 수 인자 추가 후 6 epoch 시험. (3) risk(특히 한국어) 보강 데이터. (4) 질문 유형별 임계값(qualification 스키마는 choice/score 임계값을 이미 분리하지만 qualify가 같은 값을 넣음) — 새 평가 세트로만 검증
+  - [x] 3차 재개(2026-09-25 완료, 위 결과): 아래 명령으로 처음부터 학습 → 추론 파일만 복사해 `laya register ... --model laya/multilingual-d5 --input-fit task-head` → `laya qualify --dataset 4452fd05… --holdout d5-claude-test` → `laya compare --holdout d5-claude-test`(활성 = 2차 후보 0d424dad…, 관측 전용) → 합격·무회귀면 `laya promote` 후 상주 서버 재시작 → 합격 시 Hugging Face 모델 카드 초안 작성(owner 요청; 업로드는 owner 확인 후, `huggingface-cli login`은 owner 실행)
 
 ```sh
 X=~/.local/share/jev-agent-control/training/exports/4452fd052866af6a671589b09947e26ac9353bb063a87994fed1f1c178af119a/laya
