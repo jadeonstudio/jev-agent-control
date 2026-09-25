@@ -172,7 +172,20 @@ owner 요청: 이 Mac(Apple M4 Pro, GPU 16코어, 통합 메모리 24GB)에서 L
 | Claude 자기 일치율(평가 300 전체, 독립 2회 — 세트가 다름) | 0.977 | 0.913 | — | 0.940 | — | — | — |
 
     d5 언어별: intent ko 0.899 / en 0.80, difficulty ko 0.722 / en 0.700, risk ko 0.582 / en 0.688(ko risk가 가장 약함). difficulty ±1은 argmax 기준이라 1차 평가 때 쓴 기댓값 기준(0.84~0.91)과 정의가 다르다.
-  - [ ] 다음 방향(owner 결정 필요): (1) 평가 세트 확대 — calibration 141문장이 epoch 선택·온도 보정·임계값에 모두 쓰여 낙관적이고(calib 선택 일치율 ≥0.9 → test 0.839), test 표본이 작아 하한이 낮다. 학습에 안 쓴 새 문장 약 300개를 Claude 전체 읽기로 라벨링해 calibration/test를 늘리면 임계값·하한이 안정되고, 규칙 변경을 기존 test에 맞추는 일(test 엿보기) 없이 검증할 수 있다. (2) 4 epoch까지 calib이 계속 올라 epoch 수 인자 추가 후 6 epoch 시험. (3) risk(특히 한국어) 보강 데이터. (4) 질문 유형별 임계값(qualification 스키마는 choice/score 임계값을 이미 분리하지만 qualify가 같은 값을 넣음) — 새 평가 세트로만 검증
+  - [x] 다음 방향(owner 결정 2026-09-25: (1)+(2)+(3) 진행, epoch 단위 재개 포함, 학습은 다음 날 아침): (1) 평가 세트 확대 — calibration 141문장이 epoch 선택·온도 보정·임계값에 모두 쓰여 낙관적이고(calib 선택 일치율 ≥0.9 → test 0.839), test 표본이 작아 하한이 낮다. 학습에 안 쓴 새 문장 약 300개를 Claude 전체 읽기로 라벨링해 calibration/test를 늘리면 임계값·하한이 안정되고, 규칙 변경을 기존 test에 맞추는 일(test 엿보기) 없이 검증할 수 있다. (2) 4 epoch까지 calib이 계속 올라 epoch 수 인자 추가 후 6 epoch 시험. (3) risk(특히 한국어) 보강 데이터. (4) 질문 유형별 임계값(qualification 스키마는 choice/score 임계값을 이미 분리하지만 qualify가 같은 값을 넣음) — 새 평가 세트로만 검증
+  - [x] 키트 `--epochs N`·epoch 단위 재개(`--resume`, `--keep-resume`) 추가(5ef7680): epoch마다 `resume/`에 모델·optimizer·scheduler·난수·최고 epoch 스냅샷(약 5GB) 원자 저장, 설정·데이터·스크립트 해시가 다르면 재개 거부. CPU에서 중단 후 재개 = 무중단과 바이트 동일, MPS에서 selected_epoch·일치율 동일. 새 local 실행은 torch seed 42
+  - [x] 4차 데이터(`~/.local/share/laya/distill-src/r4/`): **평가 300문장**(ko 150·en 150, 원래 평가 세트와 같은 자연 분포 명세, 새 도메인 3개) — Opus 두 명이 독립 라벨링, 일치 intent 0.987 / difficulty 0.927 / risk 0.943(기존 Claude 자기 일치율과 같은 수준), 어긋난 41문장은 세 번째 Opus가 판정. **한국어 risk 보강 485문장**(도메인 5개, 언어별 high 25·범위 제한 25·일반 35·맥락 부족 15). 생성 워커가 길이를 채우려 다른 과제 문단을 이어 붙이는 문제가 반복돼(한 파일은 50개 중 48개) 라벨러의 끝-시작 비교로 찾아 14문장 제외, 오염이 심한 파일은 생성 워커가 기본 문장부터 다시 작성 후 재라벨링
+  - [x] dataset `f32edfbc…`: train 19,857 / calibration 876(292문장) / test 924(308문장), holdout `d6-claude-test`(sha256 2da75bcb…)는 이전 test 477표본을 전부 포함(내용 없는 키 비교로 확인)
+  - [ ] 4차 학습(내일 아침 시작): 아래 명령, 6 epoch 약 11시간 → 첫날 약 4 epoch 후 밤에 중단, 다음 날 `--resume`으로 이어서. 이후 register(`laya/multilingual-d6`) → qualify(`--holdout d6-claude-test`) → compare → 벤치마크(`d6` test, 이전 159문장 결과와 나란히) → 합격 시 promote·모델 카드 초안(업로드는 `jadeonstudio` 계정, owner 확인 후)
+
+```sh
+X=~/.local/share/jev-agent-control/training/exports/f32edfbcdc604449ad01cde225da5e11ed70c8438a6274fab7444b35a2a703d3/laya
+OUT=~/.local/share/laya/training-runs/d6-drop10-e6
+PYTHONUNBUFFERED=1 ~/.local/share/laya/.venv/bin/python -u training/laya-kit/train_from_export.py \
+  --export-dir $X --model-dir ~/.local/share/laya/models/multilingual/multilingual \
+  --output-dir $OUT --local --device mps --batch-size 4 --dropout 0.1 --epochs 6 >> $OUT.log 2>&1
+# 밤에 중단: 프로세스에 SIGTERM (마지막으로 끝난 epoch까지 보존). 다음 날 같은 명령에 --resume 추가
+```
   - [x] 3차 재개(2026-09-25 완료, 위 결과): 아래 명령으로 처음부터 학습 → 추론 파일만 복사해 `laya register ... --model laya/multilingual-d5 --input-fit task-head` → `laya qualify --dataset 4452fd05… --holdout d5-claude-test` → `laya compare --holdout d5-claude-test`(활성 = 2차 후보 0d424dad…, 관측 전용) → 합격·무회귀면 `laya promote` 후 상주 서버 재시작 → 합격 시 Hugging Face 모델 카드 초안 작성(owner 요청; 업로드는 owner 확인 후, `huggingface-cli login`은 owner 실행)
 
 ```sh
