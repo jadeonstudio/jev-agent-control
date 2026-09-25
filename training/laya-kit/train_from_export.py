@@ -58,6 +58,7 @@ already matches the jev export contract exactly, so `build_training_item()`
 below is copied verbatim from the notebook.
 """
 import argparse
+import hashlib
 import json
 import math
 import os
@@ -296,6 +297,150 @@ def validate_regularization_args(dropout, rdrop_alpha, local):
             "dropout-perturbed forward passes, and the base encoder config has encoder dropout 0.0")
     if (dropout is not None or rdrop_alpha > 0) and not local:
         die("--dropout/--rdrop-alpha are --local only (the DDP torchrun path does not pass them through)")
+
+
+DEFAULT_EPOCHS = 4  # TRAIN_DDP_SCRIPT's EPOCHS (the official notebook's value)
+MAX_EPOCHS = 20
+
+
+def validate_epochs_and_resume_args(epochs, resume, keep_resume, local):
+    """jev-change: --epochs / --resume / --keep-resume (2026-09-25, --local only).
+    Returns the resolved epoch count (DEFAULT_EPOCHS when --epochs is omitted).
+    Rejected outside --local like --dropout, so a DDP run never silently ignores them."""
+    if epochs is not None and not (1 <= epochs <= MAX_EPOCHS):
+        die(f"--epochs must satisfy 1 <= N <= {MAX_EPOCHS}, got {epochs}")
+    if (epochs is not None or resume or keep_resume) and not local:
+        die("--epochs/--resume/--keep-resume are --local only (the DDP torchrun path does not pass them through)")
+    return DEFAULT_EPOCHS if epochs is None else epochs
+
+
+# ---------------------------------------------------------------------------
+# jev-change: --local resume support (2026-09-25). TRAIN_DDP_SCRIPT's
+# write_resume_checkpoint() writes <output-dir>/resume/{LATEST,epoch-000N/...};
+# this side reads it back, refuses a resume whose saved configuration differs
+# from the current arguments, and decides whether the cached train/calib items
+# can be reused. Resume granularity is one completed epoch.
+# ---------------------------------------------------------------------------
+RESUME_FORMAT = "laya-kit-resume-v1"  # must equal TRAIN_DDP_SCRIPT's RESUME_FORMAT
+RESUME_DIRNAME = "resume"
+
+
+def file_sha256(path):
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def items_digest(items):
+    """Content digest of preprocessed training items (independent of torch.save's
+    byte layout), recorded with the resume state so a resumed run provably
+    trains on the same items the interrupted run did."""
+    h = hashlib.sha256()
+    for item in items:
+        h.update(json.dumps(item, sort_keys=True, separators=(",", ":")).encode("utf-8"))
+        h.update(b"\n")
+    return h.hexdigest()
+
+
+def build_resume_match_config(*, export_dir, manifest, resolved_model_dir, derived_model_name, epochs,
+                              micro_batch, grad_accum, device, mps_autocast, dropout, rdrop_alpha,
+                              select_best_epoch, cfg):
+    """Everything that must be identical for a resumed run to continue the SAME run.
+    --max-steps, --keep-resume and the admission-check flags are deliberately
+    excluded (they bound or gate a run without changing its math)."""
+    export_dir = Path(export_dir)
+    resolved_model_dir = Path(resolved_model_dir)
+    return {
+        "format": RESUME_FORMAT,
+        "train_script_sha256": hashlib.sha256(TRAIN_DDP_SCRIPT.encode("utf-8")).hexdigest(),
+        "export_manifest_sha256": file_sha256(export_dir / "manifest.json"),
+        "export_train_sha256": file_sha256(export_dir / "train.jsonl"),
+        "export_calibration_sha256": file_sha256(export_dir / "calibration.jsonl"),
+        "exporter_version": manifest.get("exporter_version"),
+        "export_dataset_version": manifest.get("dataset_version"),
+        "export_source_data_sha256": manifest.get("source_data_sha256"),
+        "model_dir": os.path.realpath(resolved_model_dir),
+        "model_weights_sha256": file_sha256(resolved_model_dir / "model.safetensors"),
+        "model_name": derived_model_name,
+        "epochs": epochs,
+        "micro_batch": micro_batch,
+        "grad_accum": grad_accum,
+        "device": device,
+        "mps_autocast": mps_autocast,
+        "dropout": dropout,
+        "rdrop_alpha": rdrop_alpha,
+        "select_best_epoch": select_best_epoch,
+        "max_len": cfg.get("max_len"),
+        "head_max_len": cfg.get("head_max_len"),
+    }
+
+
+def diff_resume_config(saved, current):
+    """List of human-readable mismatches between a saved and the current config."""
+    return [f"{key}: saved={saved.get(key)!r} current={current.get(key)!r}"
+            for key in sorted(set(saved) | set(current)) if saved.get(key) != current.get(key)]
+
+
+def read_resume_state(output_dir):
+    """The latest completed-epoch resume state under <output-dir>/resume/, or
+    None when there is none (no LATEST pointer). A LATEST that points at a
+    missing/incomplete epoch dir is an error, never "no state"."""
+    root = Path(output_dir) / RESUME_DIRNAME
+    latest = root / "LATEST"
+    if not latest.is_file():
+        return None
+    epoch_dir = root / latest.read_text(encoding="utf-8").strip()
+    state_path = epoch_dir / "state.json"
+    if not state_path.is_file() or not (epoch_dir / "training_state.pt").is_file():
+        die(f"{latest} points at {epoch_dir}, which is missing state.json/training_state.pt -- "
+            "the resume state is damaged; delete the resume directory to start over")
+    state = json.loads(state_path.read_text(encoding="utf-8"))
+    state["epoch_dir"] = str(epoch_dir)
+    return state
+
+
+def check_resume_request(output_dir, current_match, resume):
+    """--resume: return the saved state after verifying its config matches exactly
+    (dies listing every mismatch). Without --resume: die if a resume state exists,
+    so a fresh run can never overwrite an interrupted one by accident."""
+    state = read_resume_state(output_dir)
+    root = Path(output_dir) / RESUME_DIRNAME
+    if not resume:
+        if state is not None:
+            die(f"{root} holds an interrupted run (epochs_completed={state.get('epochs_completed')}). "
+                "Pass --resume to continue it, or delete that directory to start a new run.")
+        return None
+    if state is None:
+        die(f"--resume given but no resume state exists under {root} (nothing to resume; "
+            "an interruption before the first completed epoch leaves no checkpoint). "
+            "Re-run without --resume to start over.")
+    mismatches = diff_resume_config(state.get("config") or {}, current_match)
+    if state.get("format") != RESUME_FORMAT:
+        mismatches.insert(0, f"format: saved={state.get('format')!r} current={RESUME_FORMAT!r}")
+    if mismatches:
+        die("refusing to resume: the saved run configuration differs from the current arguments:\n  "
+            + "\n  ".join(mismatches))
+    print(f"[resume] configuration matches; continuing from {state['epoch_dir']} "
+          f"(epochs_completed={state['epochs_completed']}/{current_match['epochs']})")
+    return state
+
+
+def load_cached_items_for_resume(train_items_path, calib_items_path, resume_info, torch_module):
+    """Reuse <output-dir>/train_items.pt/calib_items.pt on --resume only when both
+    exist and their content digests equal the ones recorded by the interrupted run
+    (whose config -- export manifest/split hashes, model, max_len -- was already
+    verified to match). Returns (train_items, calib_items) or None (re-preprocess)."""
+    if not (Path(train_items_path).is_file() and Path(calib_items_path).is_file()):
+        return None
+    train_items = torch_module.load(train_items_path, weights_only=False)
+    calib_items = torch_module.load(calib_items_path, weights_only=False)
+    if (items_digest(train_items) != resume_info.get("train_items_digest")
+            or items_digest(calib_items) != resume_info.get("calib_items_digest")):
+        print("[resume] cached train_items.pt/calib_items.pt do not match the interrupted run; re-preprocessing")
+        return None
+    return train_items, calib_items
 
 
 def format_oom_message(batch_size, grad_accum):
@@ -543,7 +688,7 @@ TRAIN_DDP_SCRIPT = r'''
 # the same DDP wiring and hyperparameters as before this refactor; only the
 # loop body moved into a shared function.
 import os, sys, time, json, random, math
-import copy, shutil, tempfile  # jev-change: opt-in --dropout (build_model_with_encoder_dropout)
+import copy, shutil, tempfile  # jev-change: opt-in --dropout (build_model_with_encoder_dropout), --local resume checkpoints
 import numpy as np
 import torch
 from safetensors.torch import load_file, save_file
@@ -840,13 +985,18 @@ def collect_calib_logits(model, calib_items, tok, device, autocast_device, autoc
 
 
 def make_epoch_end_fn(model, calib_items, tok, device, *, autocast_device, autocast_dtype, autocast_enabled,
-                       rank, world_size, dist_module, select_best_epoch, best_state, epoch_agreements, log_prefix):
+                       rank, world_size, dist_module, select_best_epoch, best_state, epoch_agreements, log_prefix,
+                       keep_best_in_memory=True):
     """Build the epoch_end_fn callback run_training_loop calls after every
     epoch (DDP: only rank 0 evaluates, then all ranks barrier so training
     stays in lockstep). Logs "[select] epoch N calib_agreement ..." and, when
     the mean calibration agreement improves, keeps a CPU copy of the model's
     state_dict in best_state (freed/loaded back in main_ddp()/main_local()
-    after training finishes)."""
+    after training finishes).
+
+    jev-change: keep_best_in_memory=False (--local, 2026-09-25) records only the
+    best score/epoch; the weights go to disk as the resume checkpoint's
+    best_model.pt (write_resume_checkpoint()) instead of a ~1.3GB CPU copy."""
     def epoch_end_fn(epoch):
         if select_best_epoch and rank == 0:
             calib_preds = collect_calib_logits(model, calib_items, tok, device,
@@ -864,7 +1014,8 @@ def make_epoch_end_fn(model, calib_items, tok, device, *, autocast_device, autoc
             if mean_score is not None and (best_state["score"] is None or mean_score > best_state["score"]):
                 best_state["score"] = mean_score
                 best_state["epoch"] = epoch + 1
-                best_state["state_dict"] = {k: v.detach().to("cpu", copy=True) for k, v in model.state_dict().items()}
+                if keep_best_in_memory:
+                    best_state["state_dict"] = {k: v.detach().to("cpu", copy=True) for k, v in model.state_dict().items()}
             model.train()
         if world_size > 1:
             dist_module.barrier()
@@ -875,7 +1026,7 @@ def run_training_loop(forward_fn, items, params_for_clip, optimizer, scheduler, 
                        device, epochs, micro_batch, grad_accum, group_size, sigma_start, sigma_end,
                        rank, world_size, use_scaler, scaler, autocast_device, autocast_dtype,
                        autocast_enabled, max_steps, mem_log_fn, log_prefix, epoch_end_fn=None,
-                       rdrop_alpha=0.0):
+                       rdrop_alpha=0.0, start_epoch=0, start_global_step=0, checkpoint_fn=None):
     """official-notebook-cell 4's inner training loop, generalized over
     (forward_fn, world_size, autocast/scaler settings) so it is IDENTICAL for
     DDP (world_size=2, forward_fn=ddp_model, cuda fp16 autocast+GradScaler) and
@@ -884,13 +1035,23 @@ def run_training_loop(forward_fn, items, params_for_clip, optimizer, scheduler, 
 
     jev-change: rdrop_alpha > 0 (--rdrop-alpha, --local only) runs each
     micro-batch's forward twice in train mode and uses rdrop_micro_batch_loss();
-    the default 0.0 keeps the single-forward micro_batch_loss() path."""
+    the default 0.0 keeps the single-forward micro_batch_loss() path.
+
+    jev-change: --resume (--local only, 2026-09-25). start_epoch/start_global_step
+    continue a run restored from a resume checkpoint: the completed epochs'
+    in-place shuffles are replayed (random.shuffle mutates `items`, so epoch N's
+    order depends on every earlier shuffle) and their training is skipped.
+    checkpoint_fn(epoch, global_step, elapsed_s) runs after each COMPLETED
+    epoch, after epoch_end_fn; never for a --max-steps partial epoch. The
+    defaults (0, 0, None) are the unchanged pre-resume loop."""
     t0 = time.time()
-    global_step = 0
-    epochs_completed = 0
+    global_step = start_global_step
+    epochs_completed = start_epoch
     for epoch in range(epochs):
         random.seed(42 + epoch + rank)
         random.shuffle(items)
+        if epoch < start_epoch:
+            continue
         epoch_loss, n_batches = 0.0, 0
         optimizer.zero_grad(set_to_none=True)
         accum_step = 0
@@ -972,6 +1133,8 @@ def run_training_loop(forward_fn, items, params_for_clip, optimizer, scheduler, 
             epoch_end_fn(epoch)
         if rank == 0:
             print(f"=== {log_prefix} Epoch {epoch+1}/{epochs} Completed in {time.time()-t0:.1f}s | Avg Loss: {epoch_loss/max(1, n_batches):.4f} ===")
+        if checkpoint_fn:
+            checkpoint_fn(epoch, global_step, time.time() - t0)
 
     return {"epochs_completed": epochs_completed, "global_step": global_step,
             "elapsed_s": time.time() - t0, "stopped_early": False}
@@ -1044,6 +1207,131 @@ def write_epoch_selection_metadata(output_dir, select_best_epoch, selected_epoch
         }, f, indent=2)
     print(f"wrote {path}")
     return path
+
+
+# jev-change: per-epoch resumable checkpoints (--local only, 2026-09-25). A full
+# local run is ~1.85 h/epoch and the owner does not run overnight, so a 6-epoch
+# run spans days. Layout (kept textually in sync with train_from_export.py's
+# read_resume_state(), which reads it back before relaunching this script):
+#   <output-dir>/resume/LATEST                    -> "epoch-000N" (replaced atomically)
+#   <output-dir>/resume/epoch-000N/state.json     config, counters, epoch_agreements, best epoch
+#   <output-dir>/resume/epoch-000N/training_state.pt  model + AdamW + scheduler + RNG states
+#   <output-dir>/resume/epoch-000N/best_model.pt  best-epoch weights (fp32), hard-linked forward
+# Each epoch dir is written under a temporary name and renamed into place before
+# LATEST is switched, so an interruption never leaves LATEST pointing at a
+# partial checkpoint. Only the latest completed epoch is kept.
+RESUME_FORMAT = "laya-kit-resume-v1"
+RESUME_DIRNAME = "resume"
+TRAIN_SEED = 42
+
+
+def capture_rng_states(device):
+    rng = {"python": random.getstate(), "numpy": np.random.get_state(), "torch_cpu": torch.get_rng_state()}
+    if device.type == "mps":
+        rng["torch_mps"] = torch.mps.get_rng_state()
+    return rng
+
+
+def restore_rng_states(rng, device):
+    random.setstate(rng["python"])
+    np.random.set_state(rng["numpy"])
+    torch.set_rng_state(rng["torch_cpu"])
+    if device.type == "mps" and "torch_mps" in rng:
+        torch.mps.set_rng_state(rng["torch_mps"])
+
+
+def dir_disk_bytes(path):
+    """Bytes on disk under path, counting each inode once (best_model.pt is
+    hard-linked between epoch dirs)."""
+    seen, total = set(), 0
+    for root, _dirs, files in os.walk(path):
+        for name in files:
+            st = os.lstat(os.path.join(root, name))
+            if (st.st_dev, st.st_ino) not in seen:
+                seen.add((st.st_dev, st.st_ino))
+                total += st.st_size
+    return total
+
+
+def write_resume_checkpoint(resume_root, epochs_completed, *, model, optimizer, scheduler, device, global_step,
+                            epoch_agreements, best_state, prev_epoch_dir, run_config, train_elapsed_s):
+    """Atomically write resume_root/epoch-<N>/ and point resume_root/LATEST at it,
+    then delete every other entry. best_model.pt is written fresh when epoch N is
+    the new best (best_state["epoch"] == N), otherwise hard-linked (copied if
+    linking fails) from prev_epoch_dir. Returns (epoch_dir, bytes_on_disk)."""
+    os.makedirs(resume_root, exist_ok=True)
+    name = f"epoch-{epochs_completed:04d}"
+    final_dir = os.path.join(resume_root, name)
+    tmp_dir = os.path.join(resume_root, f".{name}.tmp-{os.getpid()}")
+    shutil.rmtree(tmp_dir, ignore_errors=True)
+    try:
+        os.makedirs(tmp_dir)
+        torch.save({"model": model.state_dict(), "optimizer": optimizer.state_dict(),
+                    "scheduler": scheduler.state_dict(), "rng": capture_rng_states(device)},
+                   os.path.join(tmp_dir, "training_state.pt"))
+        best_epoch = best_state.get("epoch")
+        best_path = os.path.join(tmp_dir, "best_model.pt")
+        if best_epoch is not None and best_epoch == epochs_completed:
+            torch.save(model.state_dict(), best_path)
+        elif best_epoch is not None:
+            prev_best = os.path.join(prev_epoch_dir, "best_model.pt") if prev_epoch_dir else None
+            if not prev_best or not os.path.isfile(prev_best):
+                raise RuntimeError(f"best epoch {best_epoch} snapshot missing from {prev_epoch_dir}")
+            try:
+                os.link(prev_best, best_path)
+            except OSError:
+                shutil.copy2(prev_best, best_path)
+        state = {
+            "format": RESUME_FORMAT,
+            "config": run_config["match"],
+            "info": run_config["info"],
+            "epochs_completed": epochs_completed,
+            "global_step": global_step,
+            "epoch_agreements": epoch_agreements,
+            "best_score": best_state.get("score"),
+            "best_epoch": best_epoch,
+            "train_elapsed_s": train_elapsed_s,
+            "saved_at": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
+        }
+        with open(os.path.join(tmp_dir, "state.json"), "w") as f:
+            json.dump(state, f, indent=2)
+        if os.path.exists(final_dir):  # unreferenced leftover of an earlier crash (LATEST never pointed here)
+            shutil.rmtree(final_dir)
+        os.rename(tmp_dir, final_dir)
+    except BaseException:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+        raise
+    latest_tmp = os.path.join(resume_root, f".LATEST.tmp-{os.getpid()}")
+    with open(latest_tmp, "w") as f:
+        f.write(name + "\n")
+    os.replace(latest_tmp, os.path.join(resume_root, "LATEST"))
+    for entry in os.listdir(resume_root):
+        if entry in (name, "LATEST"):
+            continue
+        path = os.path.join(resume_root, entry)
+        if os.path.isdir(path):
+            shutil.rmtree(path, ignore_errors=True)
+        else:
+            os.remove(path)
+    return final_dir, dir_disk_bytes(resume_root)
+
+
+def load_resume_checkpoint(epoch_dir, run_config, model, optimizer, scheduler):
+    """Restore model/optimizer/scheduler from epoch_dir (written by
+    write_resume_checkpoint()). Returns (state, rng) -- the caller restores rng
+    with restore_rng_states() immediately before the training loop."""
+    with open(os.path.join(epoch_dir, "state.json")) as f:
+        state = json.load(f)
+    if state.get("format") != RESUME_FORMAT or state.get("config") != run_config["match"]:
+        print(f"[FATAL] resume state {epoch_dir} does not match this run's configuration", file=sys.stderr)
+        sys.exit(1)
+    ckpt = torch.load(os.path.join(epoch_dir, "training_state.pt"), map_location="cpu", weights_only=False)
+    model.load_state_dict(ckpt["model"], strict=True)
+    optimizer.load_state_dict(ckpt["optimizer"])
+    scheduler.load_state_dict(ckpt["scheduler"])
+    rng = ckpt["rng"]
+    del ckpt
+    return state, rng
 
 
 def load_common_argv():
@@ -1162,6 +1450,8 @@ def main_local():
     # world_size=1/rank=0 and forward_fn=model (no DDP wrapper) so the loss,
     # optimizer, LR schedule, epochs, per-device batch size and seed are the
     # SAME as main_ddp(); only process/device wiring and precision differ.
+    # (--local-only opt-ins: --epochs, --dropout/--rdrop-alpha, a fixed torch
+    # seed plus per-epoch resume checkpoints -- see write_resume_checkpoint().)
     (model_dir, output_dir, train_items_path, calib_items_path, model_name,
      base_model_dir_name, exporter_version, _mode, select_best_epoch) = load_common_argv()
     device_name = sys.argv[10] if len(sys.argv) > 10 else "mps"
@@ -1174,6 +1464,20 @@ def main_local():
     dropout_arg = sys.argv[15] if len(sys.argv) > 15 else "none"
     encoder_dropout = None if dropout_arg == "none" else float(dropout_arg)
     rdrop_alpha = float(sys.argv[16]) if len(sys.argv) > 16 else 0.0
+    # jev-change: argv[17] is --epochs (default EPOCHS -- drives the loop AND the
+    # cosine schedule length); argv[18] is the run configuration JSON
+    # ({"match": ..., "info": ...}, built by train_from_export.py) that enables
+    # per-epoch resume checkpoints; argv[19] is "fresh" or the resume epoch dir;
+    # argv[20] is "keep" (--keep-resume) or "clean". Without argv[18] no resume
+    # checkpoint is written (direct invocations keep the pre-resume behavior).
+    epochs = int(sys.argv[17]) if len(sys.argv) > 17 else EPOCHS
+    run_config = json.loads(sys.argv[18]) if len(sys.argv) > 18 else None
+    resume_from = sys.argv[19] if len(sys.argv) > 19 and sys.argv[19] != "fresh" else None
+    keep_resume = len(sys.argv) > 20 and sys.argv[20] == "keep"
+    resume_root = os.path.join(output_dir, RESUME_DIRNAME)
+    if resume_from is not None and run_config is None:
+        print("[FATAL] resuming requires the run configuration (argv[18])", file=sys.stderr)
+        sys.exit(1)
     if rdrop_alpha > 0 and not encoder_dropout:
         print("[FATAL] --rdrop-alpha > 0 requires --dropout > 0", file=sys.stderr)
         sys.exit(1)
@@ -1214,7 +1518,7 @@ def main_local():
     calib_items = torch.load(calib_items_path, weights_only=False)
 
     optimizer, scheduler = build_optimizer_and_scheduler(
-        list(model.named_parameters()), len(my_items), micro_batch, grad_accum, EPOCHS)
+        list(model.named_parameters()), len(my_items), micro_batch, grad_accum, epochs)
 
     # jev-change: MPS fp16 autocast is unreliable for training (mixed-dtype
     # matmul asserts observed on this hardware during inference spikes --
@@ -1225,7 +1529,7 @@ def main_local():
     autocast_dtype = torch.bfloat16 if autocast_enabled else None
     autocast_device = "mps" if device_name == "mps" else "cpu"
 
-    print(f"[local] device={device_name} items={len(my_items)} epochs={EPOCHS} micro_batch={micro_batch} "
+    print(f"[local] device={device_name} items={len(my_items)} epochs={epochs} micro_batch={micro_batch} "
           f"grad_accum={grad_accum} effective_global_batch={micro_batch*grad_accum} "
           f"mps_autocast={mps_autocast} max_steps={max_steps or 'unlimited'} "
           f"dropout={'off' if encoder_dropout is None else encoder_dropout} "
@@ -1244,22 +1548,55 @@ def main_local():
                 print(f"[mem] epoch {epoch+1} mps memory read failed: {e}")
 
     # jev-change: per-epoch calibration-agreement checkpoint selection --
-    # world_size=1 here, so epoch_end_fn never barriers.
+    # world_size=1 here, so epoch_end_fn never barriers. With resume
+    # checkpoints on (run_config given) the best weights live on disk in the
+    # checkpoint's best_model.pt instead of a ~1.3GB CPU copy.
+    checkpointing = run_config is not None
     best_state = {"score": None, "epoch": None, "state_dict": None}
     epoch_agreements = []
+    start_epoch, start_global_step, prior_elapsed_s = 0, 0, 0.0
+    saved = {"epoch_dir": None, "epochs": 0}
+    rng = None
+    if resume_from is not None:
+        state, rng = load_resume_checkpoint(resume_from, run_config, model, optimizer, scheduler)
+        start_epoch, start_global_step = state["epochs_completed"], state["global_step"]
+        prior_elapsed_s = state["train_elapsed_s"]
+        epoch_agreements.extend(state["epoch_agreements"])
+        best_state["score"], best_state["epoch"] = state["best_score"], state["best_epoch"]
+        saved["epoch_dir"], saved["epochs"] = resume_from, start_epoch
+        print(f"[resume] restored {resume_from}: epochs_completed={start_epoch}/{epochs} "
+              f"global_step={start_global_step} best_epoch={best_state['epoch']}")
     epoch_end_fn = make_epoch_end_fn(
         model, calib_items, tok, device, autocast_device=autocast_device, autocast_dtype=autocast_dtype,
         autocast_enabled=autocast_enabled, rank=0, world_size=1, dist_module=None,
         select_best_epoch=select_best_epoch, best_state=best_state, epoch_agreements=epoch_agreements,
-        log_prefix="[local]")
+        log_prefix="[local]", keep_best_in_memory=not checkpointing)
 
+    def checkpoint_fn(epoch, global_step, elapsed_s):
+        epoch_dir, size = write_resume_checkpoint(
+            resume_root, epoch + 1, model=model, optimizer=optimizer, scheduler=scheduler, device=device,
+            global_step=global_step, epoch_agreements=epoch_agreements, best_state=best_state,
+            prev_epoch_dir=saved["epoch_dir"], run_config=run_config, train_elapsed_s=prior_elapsed_s + elapsed_s)
+        saved["epoch_dir"], saved["epochs"] = epoch_dir, epoch + 1
+        print(f"[resume] saved epoch {epoch + 1}/{epochs} checkpoint to {epoch_dir} "
+              f"({size / 2**30:.2f} GiB on disk under {resume_root})")
+
+    # jev-change: fixed torch seed for a fresh local run (RLCD noise, dropout masks) so
+    # an interrupted+resumed run can be checked against an uninterrupted one; a resumed
+    # run restores the saved RNG states instead.
+    if rng is not None:
+        restore_rng_states(rng, device)
+        del rng
+    else:
+        torch.manual_seed(TRAIN_SEED)
     result = run_training_loop(
         model, my_items, list(model.parameters()), optimizer, scheduler, tok,
-        device=device, epochs=EPOCHS, micro_batch=micro_batch, grad_accum=grad_accum, group_size=GROUP_SIZE,
+        device=device, epochs=epochs, micro_batch=micro_batch, grad_accum=grad_accum, group_size=GROUP_SIZE,
         sigma_start=SIGMA_START, sigma_end=SIGMA_END, rank=0, world_size=1,
         use_scaler=False, scaler=None, autocast_device=autocast_device, autocast_dtype=autocast_dtype,
         autocast_enabled=autocast_enabled, max_steps=max_steps, mem_log_fn=mem_log_fn, log_prefix="[local]",
-        epoch_end_fn=epoch_end_fn, rdrop_alpha=rdrop_alpha)
+        epoch_end_fn=epoch_end_fn, rdrop_alpha=rdrop_alpha, start_epoch=start_epoch,
+        start_global_step=start_global_step, checkpoint_fn=checkpoint_fn if checkpointing else None)
 
     del optimizer, scheduler
     selected_epoch = None
@@ -1267,6 +1604,14 @@ def main_local():
         selected_epoch = best_state["epoch"]
         model.load_state_dict(best_state["state_dict"], strict=True)
         del best_state["state_dict"]  # jev-change: free the ~1.3GB CPU copy once loaded.
+    elif select_best_epoch and best_state["epoch"] is not None:
+        selected_epoch = best_state["epoch"]
+        # The model already holds the best weights when the best epoch is the last one
+        # evaluated (always true for a --max-steps partial epoch, which is never
+        # checkpointed); otherwise the best epoch is <= the last saved checkpoint.
+        if selected_epoch != epoch_agreements[-1]["epoch"]:
+            best_path = os.path.join(saved["epoch_dir"], "best_model.pt")
+            model.load_state_dict(torch.load(best_path, map_location="cpu"), strict=True)
     finalize_and_save(model, tok, calib_items, output_dir, model_name, base_model_dir_name,
                        exporter_version, cfg, device=device, autocast_device=autocast_device,
                        autocast_dtype=autocast_dtype, autocast_enabled=autocast_enabled,
@@ -1281,12 +1626,24 @@ def main_local():
         json.dump({
             "device": device_name, "mode": "local", "grad_accum": grad_accum, "micro_batch": micro_batch,
             "effective_global_batch": micro_batch * grad_accum, "mps_autocast": mps_autocast,
-            "epochs_completed": result["epochs_completed"], "global_step": result["global_step"],
-            "stopped_early": result["stopped_early"], "wall_time_s": round(result["elapsed_s"], 3),
+            "epochs": epochs, "epochs_completed": result["epochs_completed"], "global_step": result["global_step"],
+            "stopped_early": result["stopped_early"],
+            # jev-change: training-loop time summed over every resumed leg.
+            "wall_time_s": round(prior_elapsed_s + result["elapsed_s"], 3),
+            "resumed_from_epoch": start_epoch if resume_from is not None else None,
             "dropout": encoder_dropout, "rdrop_alpha": rdrop_alpha if rdrop_alpha > 0 else None,
             "encoder_dropout_check": encoder_dropout_check,
         }, f, indent=2)
     print(f"[local] wrote {metadata_path}")
+
+    # jev-change: the saved checkpoint above is the product; the resume state is
+    # only for an interrupted run, so it is removed unless --keep-resume.
+    if os.path.isdir(resume_root):
+        if keep_resume:
+            print(f"[resume] kept {resume_root} ({dir_disk_bytes(resume_root) / 2**30:.2f} GiB, --keep-resume)")
+        else:
+            shutil.rmtree(resume_root)
+            print(f"[resume] removed {resume_root} after the final save")
 
 
 def main():
@@ -1520,8 +1877,19 @@ def main():
                               "runs two train-mode forward passes and adds A * symmetric KL between their "
                               "per-question option distributions to the mean of the two losses. Requires "
                               "--dropout. Roughly doubles forward/backward compute per step.")
+    parser.add_argument("--epochs", type=int, default=None,
+                         help=f"--local only: number of epochs N (1 <= N <= {MAX_EPOCHS}, default {DEFAULT_EPOCHS}). "
+                              "Sets both the loop count and the cosine LR schedule length.")
+    parser.add_argument("--resume", action="store_true",
+                         help="--local only: continue the interrupted run whose per-epoch checkpoint is in "
+                              "<output-dir>/resume/ (from the next epoch after the last COMPLETED one). Refuses "
+                              "unless every saved setting matches the current arguments; dies if there is no "
+                              "resume state.")
+    parser.add_argument("--keep-resume", action="store_true",
+                         help="--local only: keep <output-dir>/resume/ after the final save (default: removed).")
     args = parser.parse_args()
     validate_regularization_args(args.dropout, args.rdrop_alpha, args.local)
+    resolved_epochs = validate_epochs_and_resume_args(args.epochs, args.resume, args.keep_resume, args.local)
 
     if args.local:
         resolved_batch_size, resolved_grad_accum = resolve_local_batch_and_grad_accum(args.batch_size, args.grad_accum)
@@ -1607,8 +1975,42 @@ def main():
             },
         )
 
-    train_items, train_truncated, train_total = preprocess_split(dataset["train"], tok, cfg, render_options, build_sequence, QTYPES, agent_shim)
-    calib_items, calib_truncated, calib_total = preprocess_split(dataset["validation"], tok, cfg, render_options, build_sequence, QTYPES, agent_shim)
+    # jev-change: --local resume (2026-09-25). The run configuration is checked
+    # BEFORE preprocessing so a mismatched --resume fails fast; a fresh --local
+    # run refuses to start over an existing resume state.
+    train_items_path = output_dir / "train_items.pt"
+    calib_items_path = output_dir / "calib_items.pt"
+    run_match, resume_state, cached_items = None, None, None
+    if args.local:
+        run_match = build_resume_match_config(
+            export_dir=export_dir, manifest=manifest, resolved_model_dir=resolved_model_dir,
+            derived_model_name=derived_model_name, epochs=resolved_epochs, micro_batch=resolved_batch_size,
+            grad_accum=resolved_grad_accum, device=args.device, mps_autocast=args.mps_autocast,
+            dropout=args.dropout, rdrop_alpha=args.rdrop_alpha, select_best_epoch=args.select_best_epoch, cfg=cfg)
+        resume_state = check_resume_request(output_dir, run_match, args.resume)
+    if resume_state is not None:
+        cached_items = load_cached_items_for_resume(train_items_path, calib_items_path, resume_state["info"], torch)
+    if cached_items is not None:
+        train_items, calib_items = cached_items
+        info = resume_state["info"]
+        train_truncated, train_total = info["train_truncated"], info["train_total"]
+        calib_truncated, calib_total = info["calib_truncated"], info["calib_total"]
+        print("[resume] reusing cached train_items.pt/calib_items.pt (export and item digests match)")
+    else:
+        train_items, train_truncated, train_total = preprocess_split(dataset["train"], tok, cfg, render_options, build_sequence, QTYPES, agent_shim)
+        calib_items, calib_truncated, calib_total = preprocess_split(dataset["validation"], tok, cfg, render_options, build_sequence, QTYPES, agent_shim)
+    run_info = None
+    if args.local:
+        run_info = {
+            "train_items_digest": items_digest(train_items), "calib_items_digest": items_digest(calib_items),
+            "train_truncated": train_truncated, "train_total": train_total,
+            "calib_truncated": calib_truncated, "calib_total": calib_total,
+            "started_at": resume_state["info"]["started_at"] if resume_state else started_at,
+        }
+        if resume_state is not None and (run_info["train_items_digest"] != resume_state["info"]["train_items_digest"]
+                                         or run_info["calib_items_digest"] != resume_state["info"]["calib_items_digest"]):
+            die("refusing to resume: re-preprocessed train/calibration items differ from the ones the interrupted "
+                "run trained on (preprocessing code or tokenizer changed)")
 
     if not args.skip_admission_check:
         check_tokenizer_admission(train_truncated + calib_truncated, train_total + calib_total, args.max_truncated_fraction, args.allow_truncation)
@@ -1622,10 +2024,9 @@ def main():
         die("no usable calibration sequences after preprocessing")
 
     output_dir.mkdir(parents=True, exist_ok=True)
-    train_items_path = output_dir / "train_items.pt"
-    calib_items_path = output_dir / "calib_items.pt"
-    torch.save(train_items, train_items_path)
-    torch.save(calib_items, calib_items_path)
+    if cached_items is None:
+        torch.save(train_items, train_items_path)
+        torch.save(calib_items, calib_items_path)
 
     if args.dry_run:
         print("[dry-run] export + tokenizer admission verified. Stopping before torchrun/local training.")
@@ -1648,6 +2049,10 @@ def main():
             "local", select_best_epoch_flag, args.device, str(resolved_grad_accum), str(resolved_batch_size),
             args.mps_autocast, str(args.max_steps or 0),
             "none" if args.dropout is None else str(args.dropout), str(args.rdrop_alpha),
+            # jev-change: argv[17:21] = --epochs, run configuration JSON (enables per-epoch resume
+            # checkpoints), "fresh" or the resume epoch dir, "keep"/"clean" (--keep-resume).
+            str(resolved_epochs), json.dumps({"match": run_match, "info": run_info}),
+            resume_state["epoch_dir"] if resume_state else "fresh", "keep" if args.keep_resume else "clean",
         ]
     else:
         # official-notebook-cell: 5 ("Launch Multi-GPU Fine-Tuning with torchrun")
@@ -1693,7 +2098,7 @@ def main():
         "mode": "local" if args.local else "ddp",
         "device": args.device if args.local else "cuda",
         "hyperparameters": {
-            "epochs": 4, "micro_batch": resolved_batch_size, "grad_accum": resolved_grad_accum, "group_size": 4,
+            "epochs": resolved_epochs, "micro_batch": resolved_batch_size, "grad_accum": resolved_grad_accum, "group_size": 4,
             "lr_encoder": 2.5e-5, "lr_head": 1.0e-4, "sigma_start": 0.4, "sigma_end": 0.1,
             "weight_decay": 0.01, "max_len": cfg.get("max_len", 1024), "head_max_len": cfg.get("head_max_len", 256),
             "select_best_epoch": args.select_best_epoch,
@@ -1703,7 +2108,10 @@ def main():
         "train_truncated": train_truncated,
         "calibration_sequences": len(calib_items),
         "calibration_truncated": calib_truncated,
-        "started_at": started_at,
+        # jev-change: a resumed run keeps the interrupted run's start time and records when it resumed.
+        "started_at": run_info["started_at"] if run_info else started_at,
+        "resumed_at": started_at if resume_state else None,
+        "resumed_from_epoch": resume_state["epochs_completed"] if resume_state else None,
         "finished_training_at": finished_training_at,
         "finished_at": finished_at,
         "metrics": metrics,

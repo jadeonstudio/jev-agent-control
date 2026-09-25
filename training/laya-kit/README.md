@@ -208,7 +208,7 @@ owner 결정(2026-09-23): fine-tune 기준 checkpoint는 **multilingual**(mmBERT
   이 경로가 그대로 동작하지 않는다.
 - `train_from_export.py --local`이 이 문제를 우회한다: `torchrun`/NCCL/DDP 없이 단일
   프로세스로 **동일한** loss(RLCD+GRPO)·optimizer(AdamW, encoder/head 분리 LR)·cosine LR
-  schedule·epochs(4)·per-device batch size·seed를 재사용한다(`TRAIN_DDP_SCRIPT` 내부를
+  schedule·epochs(기본 4, `--local`에서만 `--epochs`로 변경 가능 -- 아래 절)·per-device batch size·seed를 재사용한다(`TRAIN_DDP_SCRIPT` 내부를
   `run_training_loop()`/`finalize_and_save()`로 리팩터해 DDP 경로(`main_ddp`, 그대로
   유지)와 로컬 경로(`main_local`, world_size=1/rank=0)가 같은 함수를 호출). `datasets`
   패키지 없이(로컬 laya venv에는 미설치) 표준 라이브러리 `json`만으로 export의
@@ -331,6 +331,70 @@ owner 결정(2026-09-23): fine-tune 기준 checkpoint는 **multilingual**(mmBERT
 - **주의(MPS)**: attention dropout이 켜진 encoder를 **train 모드 + `torch.no_grad()`**로
   돌리면 PyTorch MPS SDPA가 `NotImplementedError`를 낸다. 학습(grad 켜짐)과 eval 모드
   경로는 문제없으니, train 모드 그대로 no_grad 평가를 추가하지 않는다.
+
+## Epoch 수 지정과 중단 후 이어서 학습 (`--epochs`, `--resume`, `--keep-resume`, `--local` 전용, 2026-09-25)
+
+- **배경**: 전체 export(18,402행, batch 4 × grad-accum 16) 로컬 MPS 학습은 epoch당 약 1.85시간이고,
+  밤샘 실행은 하지 않는다(노트북 소음). 6 epoch 학습은 이틀에 걸치므로 epoch 단위로 멈췄다 이어야 한다.
+- **`--epochs N`** (1 ≤ N ≤ 20, 기본 4 = 이전 동작): 학습 루프 횟수와 cosine LR schedule 전체 길이
+  (`T_max = (학습 항목 수 // (batch × grad-accum)) × N`)를 함께 정한다. `local_training_run.json`의
+  `epochs`와 `training_metadata.json`의 `hyperparameters.epochs`에 기록된다. DDP 경로에서는 거부된다.
+- **저장되는 것** (`--local`이면 항상, 완료된 epoch마다 `[select]` 판정 직후):
+  `<output-dir>/resume/epoch-000N/`에 `training_state.pt`(모델 state_dict, AdamW 상태, scheduler 상태,
+  Python·NumPy·torch CPU·MPS RNG 상태), `best_model.pt`(지금까지 calibration 일치율 최고 epoch의
+  가중치 -- 이제 RAM 대신 디스크에 둔다. 새 최고가 아니면 이전 epoch의 파일을 hard link로 넘긴다),
+  `state.json`(완료 epoch 수, global_step, epoch별 agreement, 최고 epoch/점수, 누적 학습 시간, 실행 설정).
+  임시 디렉터리에 다 쓴 뒤 이름을 바꾸고 `resume/LATEST`를 원자적으로 교체하므로, 저장 도중
+  끊겨도 LATEST는 항상 온전한 이전 epoch을 가리킨다. 최신 epoch 하나만 남기고 나머지는 지운다.
+- **실행 설정 일치 검사**: `state.json`의 설정(export `manifest.json`·`train.jsonl`·`calibration.jsonl`
+  sha256, exporter/dataset 버전, base 모델 경로와 `model.safetensors` sha256, 학습 스크립트 sha256,
+  epochs, batch/grad-accum, device, mps-autocast, dropout, rdrop-alpha, select-best-epoch,
+  max_len/head_max_len)이 현재 인자와 하나라도 다르면 `--resume`은 불일치 목록을 출력하고 멈춘다.
+  `--max-steps`, `--keep-resume`, admission 검사 옵션은 비교하지 않는다. kit 코드가 바뀌어도
+  (스크립트 sha256이 달라져) 이어서 학습할 수 없다 -- 멈춘 사이에는 kit을 고치지 않는다.
+- **전처리 캐시**: `--resume`일 때 `<output-dir>/train_items.pt`/`calib_items.pt`가 있고 내용 digest가
+  중단된 실행이 기록한 값과 같으면 전처리를 건너뛴다(export 일치는 위 설정 검사로 이미 확인됨).
+  다르거나 없으면 다시 전처리하고, 그 결과 digest가 기록과 다르면 이어서 학습하지 않고 멈춘다.
+- **재개 단위는 epoch**: epoch 중간에 끊으면 마지막으로 완료된 epoch부터 그 다음 epoch을 처음부터
+  다시 돈다(끊긴 epoch의 진행분은 버려진다). 첫 epoch이 끝나기 전에 끊기면 재개할 상태가 없다.
+  재개 시 완료된 epoch들의 셔플을 재생하고 RNG를 복원하므로, CPU에서는 끊김 없는 실행과 최종
+  가중치·`epoch_agreements`·`selected_epoch`가 비트 단위로 같다(`tests/test_laya_kit_resume.py`).
+  MPS는 커널 비결정성 때문에 완전히 같다는 보장은 없다. 새로 시작하는 `--local` 실행은
+  torch seed를 42로 고정한다(이전에는 고정하지 않았다).
+- **안전장치**: `--resume` 없이 같은 `--output-dir`에 재개 상태가 있으면 새 실행은 시작하지 않는다
+  (중단된 실행을 덮어쓰지 않도록). 새로 시작하려면 `<output-dir>/resume/`를 직접 지운다.
+  `--resume`인데 상태가 없으면 새로 시작하지 않고 멈춘다.
+- **정리**: 최종 저장(온도 피팅, `model.safetensors`, 메타데이터) 성공 뒤 `resume/`를 지운다.
+  `--keep-resume`이면 남기고 크기를 출력한다. `training_metadata.json`에는 원래 `started_at`과
+  `resumed_at`/`resumed_from_epoch`가, `local_training_run.json`에는 모든 구간을 합한 `wall_time_s`와
+  `resumed_from_epoch`가 남는다.
+- **디스크 비용**: multilingual(파라미터 약 3.2억 개) 기준 `training_state.pt` 약 3.9GB(fp32 가중치
+  1.3GB + AdamW 상태 2.6GB) + `best_model.pt` 1.3GB = 상시 약 5.2GB(실측 4.80GiB). 저장하는 순간에는 이전
+  epoch과 새 epoch이 잠깐 같이 있어 최대 약 9~10GB가 필요하다. epoch마다 이만큼을 쓰는 시간이 더 든다.
+- **밤에 멈추고 아침에 잇기** (예: 6 epoch, dropout 0.1):
+  ```sh
+  PY=/Users/jangjiyong/.local/share/laya/.venv/bin/python
+  # 배열로 둔다(zsh는 따옴표 없는 "$ARGS" 문자열을 인자로 쪼개지 않는다).
+  ARGS=(--export-dir exports/<hash>/laya
+        --model-dir /Users/jangjiyong/.local/share/laya/models/multilingual/multilingual
+        --output-dir <출력-디렉터리> --local --device mps --batch-size 4 --epochs 6 --dropout 0.1)
+  # 1일차: 시작. 저녁에 "[resume] saved epoch N/6 checkpoint" 줄(또는 <출력-디렉터리>/resume/LATEST
+  # 갱신)을 확인한 직후 터미널에서 Ctrl-C.
+  PYTHONUNBUFFERED=1 $PY training/laya-kit/train_from_export.py "${ARGS[@]}" 2>&1 | tee -a train.log
+  # 2일차 아침: 같은 인자에 --resume만 붙인다(다른 인자를 바꾸면 거부된다).
+  PYTHONUNBUFFERED=1 $PY training/laya-kit/train_from_export.py "${ARGS[@]}" --resume 2>&1 | tee -a train.log
+  ```
+  epoch 중간에 Ctrl-C를 누르면 그 epoch의 진행분(최대 약 1.85시간)을 잃으므로, `[resume] saved epoch`
+  줄이 찍힌 직후에 멈추는 것이 좋다. 로그를 파일로 보낼 때 `PYTHONUNBUFFERED=1`이 없으면 출력이
+  버퍼에 쌓여 그 줄이 늦게 보인다. 백그라운드(`&`)로 띄운 프로세스는 SIGINT를 무시하므로 Ctrl-C/
+  `kill -INT`가 듣지 않는다 -- 그 경우 `kill` (SIGTERM)로 멈춰도 마지막 완료 epoch부터 이어진다.
+- **MPS 실측 (2026-09-25, M4 Pro 24GB, 실제 export에서 train 64행 + calibration 423행 + test 8행,
+  `--batch-size 4 --epochs 2 --dropout 0.1`)**: 끊김 없는 실행 A와, epoch 2 도중 SIGTERM으로 끊은 뒤
+  `--resume`으로 마친 실행 B의 `epoch_agreements`(0.3599/0.3777)와 `selected_epoch`(2)가 완전히 같았다.
+  fp16 가중치는 0.003%(최대 차 6.1e-5)가 달랐는데, 끊김 없는 실행 두 번(A와 C)끼리도 0.0025%·최대 차
+  6.1e-5로 같은 수준이 달라 MPS 실행 간 비결정성 범위 안이다. 재개 상태 크기는 epoch마다 4.80GiB,
+  재개 시 전처리 캐시를 재사용했고, 설정 불일치(`--dropout 0.2`)와 상태가 있는데 `--resume` 없이 시작한
+  경우는 둘 다 상태를 건드리지 않고 거부됐다.
 
 ## 학습 후 평가(`evaluate_checkpoint`) 버그 수정 (2026-09-23)
 
