@@ -123,6 +123,16 @@ test('every derived JSONL row is screened, not just the first', t => {
   assert.equal(fs.existsSync(path.join(f.store.root, 'exports/example/data.jsonl')), false);
   assert.throws(() => safeContent({ state: '{"environment":{"THING":"value"}}' }), /TRAINING_SENSITIVE/);
 });
+// A JSON-encoded string (the Laya export's `state` column) must be screened on its PARSED content only:
+// escaping turns a newline before an "@team.channel" mention into "\n@..." whose literal "n@" looked like
+// an email, so export rejected tasks that import/build had accepted (2026-09-26, 7 tasks / 21 rows).
+test('safeContent screens a JSON-encoded string by its parsed content, not by escape artefacts', () => {
+  const task = 'Deploy after the review.\n@payments-oncall.team please confirm in the thread';
+  assert.doesNotThrow(() => safeContent({ task }));
+  assert.doesNotThrow(() => safeContent({ state: JSON.stringify({ task }) }));
+  assert.throws(() => safeContent({ state: JSON.stringify({ task: 'mail ops@company.com first' }) }), /TRAINING_SENSITIVE/);
+  assert.throws(() => safeContent({ state: JSON.stringify({ task: 'call 010-1234-5678' }) }), /TRAINING_SENSITIVE/);
+});
 // The dataset-write/read boundary in writeDerived (store.mjs) checks the SAME exported constant on
 // both the write-size check and the read-back-for-immutability check, so a derived canonical dataset
 // larger than the old 64 MiB cap (owner-reported: ~24,000-sample dataset already exceeded it) can be

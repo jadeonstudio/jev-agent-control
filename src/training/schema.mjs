@@ -49,7 +49,9 @@ export function safeContent(value, key = '') {
       const trimmed = v.trim();
       if ((trimmed.startsWith('{') && trimmed.endsWith('}')) || (trimmed.startsWith('[') && trimmed.endsWith(']'))) {
         let parsed; try { parsed = JSON.parse(trimmed); } catch { /* ordinary text */ }
-        if (parsed && typeof parsed === 'object') { if (containsSensitiveData(parsed, key)) fail('TRAINING_SENSITIVE_OR_OVERSIZED'); visit(parsed, depth + 1); }
+        // A JSON-encoded value is screened by its parsed content only; pattern-matching its escaped text
+        // produced false positives (a newline before "@team" became "\n@team", read as an email).
+        if (parsed && typeof parsed === 'object') { if (containsSensitiveData(parsed, key)) fail('TRAINING_SENSITIVE_OR_OVERSIZED'); visit(parsed, depth + 1); return; }
       }
       if (/[\w.+-]+@[\w.-]+\.[A-Za-z]{2,}/.test(v) || /\b(?:010|011)[ -]?\d{3,4}[ -]?\d{4}\b/.test(v) ||
           /\b\d{6}[- ]?[1-4]\d{6}\b/.test(v) || /\b(?:sk_live_|sk_test_|xox[baprs]-|AIza)[A-Za-z0-9_-]{8,}/.test(v)) fail('TRAINING_SENSITIVE_OR_OVERSIZED');
