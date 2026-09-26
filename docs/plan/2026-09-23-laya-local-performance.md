@@ -179,7 +179,19 @@ owner 요청: 이 Mac(Apple M4 Pro, GPU 16코어, 통합 메모리 24GB)에서 L
   - [x] 4차 학습(dropout 0.1, 6 epoch, 2026-09-25 20:03~00:14 epoch 1–2 → owner 지시로 중단, 09-26 09:33 `--resume`으로 epoch 3부터 재개~18:0x): epoch당 약 2h05m. 새 보정 세트(292문장) calib 일치율 mean 0.690 → 0.723 → 0.765 → 0.773 → 0.769 → **0.786**(epoch 6 선택, choice 0.822 / score 0.750), 보정 temperature 2.80/2.25. 같은 보정 세트로 잰 3차 모델 기준선 0.765(choice 0.813 / score 0.716; 보정 세트 절반은 3차의 epoch 선택에 쓰여 3차에 유리). 재개는 설정·데이터·스크립트 해시 일치 확인 후 epoch 3부터 정상 진행. 후보 `d145e848…`(laya/multilingual-d6)
   - [x] 4차 평가(holdout `d6-claude-test` 308문장 × 3 = 924): **qualify 불합격, 차이 0.004** — calibration 임계값 0.62, test coverage 0.52(481답)에서 선택 일치율 **0.896**(하한 0.866), 목표 0.9 미달(정답 2개 차이). 하한 조건(0.8)은 통과. test 원 일치율 intent 0.880 / difficulty 0.718 / risk 0.692. compare(활성 3차 대비, 같은 holdout) raw 0.763 vs 0.750, 전 문항 우위 → 관측 전용 활성을 4차로 교체, 상주 서버가 `laya/multilingual-d6` 로드 확인
   - [x] 벤치마크(`d6` test 308문장): d6 0.880/0.718/0.692, d5 0.870/0.711/0.669, d4 0.844/0.685/0.640, multilingual 원본 0.308/0.292/0.451(high→safe 43). 언어별 risk: **ko 0.623 → 0.667**(한국어 보강 효과), en 0.718 → 0.718. 이전 159문장 기준 d6 0.862/0.704/0.635(d5 0.849/0.711/0.635)
-  - [ ] 다음 방향(owner 결정 필요): 합격 기준 미세 미달. 임계값 규칙·질문별 임계값을 바꾸면 지금 test에 맞춘 것이 되므로 새 평가 세트로만 검증해야 한다
+  - [x] 다음 방향: owner 결정(2026-09-26) — 규칙은 그대로 두고 모델만 개선(risk 보강 데이터 + 8 epoch). 임계값 규칙·질문별 임계값 변경은 지금 test에 맞춘 것이 되므로 하지 않는다
+  - [x] 5차 데이터(`~/.local/share/laya/distill-src/r5/`, 한국어 `GEN_SPEC_KO_RISK.md` 강화 + 영어 `GEN_SPEC_EN_RISK.md` 신설): 한국어 4개·영어 4개 도메인 800문장 → 이어붙이기 오염 33개 제외(영어 커머스 22개, 유통·물류는 생성 워커가 한 칸씩 밀린 확장 문단을 고친 뒤 재라벨링해도 5개 남음) + 민감정보 1개 → **766문장**(ko 389·en 378), 라벨 risk high 251(33%)·caution 242·safe 261·unknown 13
+  - [x] 파생 파일 64MiB 상한 초과로 build 실패 → 상한을 `MAX_DERIVED_BYTES`(256MiB) 하나로 통합(0958e41). export가 JSON 문자열의 줄바꿈 뒤 "@팀" 멘션을 이메일로 오인해 7개 task를 거부 → 파싱한 내용으로만 검사(7ceba35)
+  - [x] dataset `b5d84d29…`: train 22,155 / calibration 876 / test 924, holdout `d7-claude-test` sha256이 `d6-claude-test`와 동일(2da75bcb…)
+  - [ ] 5차 학습(다음 날 아침): 아래 명령(8 epoch, 약 2h20m/epoch, 저녁마다 epoch 저장 후 중단·`--resume`)
+
+```sh
+X=~/.local/share/jev-agent-control/training/exports/b5d84d29c2f409662ce37f1978d4371a274321eb33094c016603b8cf120ebe20/laya
+OUT=~/.local/share/laya/training-runs/d7-drop10-e8
+PYTHONUNBUFFERED=1 ~/.local/share/laya/.venv/bin/python -u training/laya-kit/train_from_export.py \
+  --export-dir $X --model-dir ~/.local/share/laya/models/multilingual/multilingual \
+  --output-dir $OUT --local --device mps --batch-size 4 --dropout 0.1 --epochs 8 >> $OUT.log 2>&1   # 이어서: 같은 명령 + --resume
+```
   - [x] 4차 학습 계획(참고, 위에서 완료): 아래 명령, 6 epoch 약 11시간 → 첫날 약 4 epoch 후 밤에 중단, 다음 날 `--resume`으로 이어서. 이후 register(`laya/multilingual-d6`) → qualify(`--holdout d6-claude-test`) → compare → 벤치마크(`d6` test, 이전 159문장 결과와 나란히) → 합격 시 promote·모델 카드 초안(업로드는 `jadeonstudio` 계정, owner 확인 후)
 
 ```sh
