@@ -6,7 +6,7 @@ import { randomUUID } from 'node:crypto';
 import { atomicWrite, setMode } from '../src/storage.mjs';
 import { createDecisionEngine } from '../src/engine.mjs';
 import { createTrainingStore, outsideGit } from '../src/training/store.mjs';
-import { digest, encode, POLICY_VERSION, validateOutcome, safeContent } from '../src/training/schema.mjs';
+import { digest, encode, POLICY_VERSION, MAX_DERIVED_BYTES, validateOutcome, safeContent } from '../src/training/schema.mjs';
 import { evaluateDecision, evaluateStore, summarizeComparisons, indexEvents } from '../src/training/evaluate.mjs';
 import { buildDataset, readDataset, exportDataset, validateDatasetSource } from '../src/training/dataset.mjs';
 import { recordHost } from '../src/training/host.mjs';
@@ -122,6 +122,31 @@ test('every derived JSONL row is screened, not just the first', t => {
   assert.throws(() => f.store.lock(() => f.store.writeDerived('exports/example/data.jsonl', '{}\n{"secret":"bad"}\n')), /TRAINING_SENSITIVE/);
   assert.equal(fs.existsSync(path.join(f.store.root, 'exports/example/data.jsonl')), false);
   assert.throws(() => safeContent({ state: '{"environment":{"THING":"value"}}' }), /TRAINING_SENSITIVE/);
+});
+// The dataset-write/read boundary in writeDerived (store.mjs) checks the SAME exported constant on
+// both the write-size check and the read-back-for-immutability check, so a derived canonical dataset
+// larger than the old 64 MiB cap (owner-reported: ~24,000-sample dataset already exceeded it) can be
+// written and then read back without the two checks disagreeing (2026-09-26 dataset growth fix).
+test('derived artifact cap is one exported MAX_DERIVED_BYTES constant, raised past the old 64 MiB limit', t => {
+  const f = fixture(t);
+  assert.equal(MAX_DERIVED_BYTES, 256 * 1024 * 1024);
+  const OLD_CAP = 64 * 1024 * 1024;
+  assert.ok(MAX_DERIVED_BYTES > OLD_CAP);
+  // Many short lines (not one huge line): safeContent's per-line email-pattern regex check is
+  // quadratic in a single string's length, so a realistic small-record JSONL (like an actual
+  // canonical dataset) reaches the target size in seconds instead of minutes.
+  const line = JSON.stringify({ pad: 'x'.repeat(40) }) + '\n';
+  const lineBytes = Buffer.byteLength(line);
+  const targetBytes = OLD_CAP + 5 * 1024 * 1024; // just over the old cap, well under MAX_DERIVED_BYTES
+  const contents = line.repeat(Math.ceil(targetBytes / lineBytes));
+  const size = Buffer.byteLength(contents);
+  assert.ok(size > OLD_CAP && size < MAX_DERIVED_BYTES);
+  const file = f.store.lock(() => f.store.writeDerived('exports/example/large.jsonl', contents));
+  // Re-writing identical contents forces writeDerived to read the existing file back (old !== null
+  // branch) with the same maxBytes: MAX_DERIVED_BYTES used on write, proving both sides agree.
+  const again = f.store.lock(() => f.store.writeDerived('exports/example/large.jsonl', contents));
+  assert.equal(again, file);
+  assert.equal(fs.readFileSync(file, 'utf8'), contents);
 });
 test('outside-Git, private permissions and immutable events are enforced', t => {
   const f = fixture(t); const d = f.save(decision()); const file = path.join(f.store.root, 'raw/decisions', d.decision_id + '.json');

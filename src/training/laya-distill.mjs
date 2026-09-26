@@ -12,7 +12,7 @@ import { getCredential, loadConfig } from '../storage.mjs';
 import { loadFeaturePolicy } from '../feature-policy.mjs';
 import { ROUTE_QUESTIONS } from '../routing.mjs';
 import { createTrainingStore } from './store.mjs';
-import { POLICY_VERSION, digest, encode, only, text, safeContent, targetDistribution, validateTarget } from './schema.mjs';
+import { POLICY_VERSION, MAX_DERIVED_BYTES, digest, encode, only, text, safeContent, targetDistribution, validateTarget } from './schema.mjs';
 import { EVALUATION_POLICY } from './evaluate.mjs';
 
 // route requests always use this fixed context so routeGuard would let a real spawn reach the model;
@@ -73,7 +73,7 @@ function appendPrivateJsonl(file, obj) {
     fs.fsyncSync(fd);
   } finally { fs.closeSync(fd); }
 }
-function readPrivateJsonl(file, maxBytes = 64 * 1024 * 1024) {
+function readPrivateJsonl(file, maxBytes = MAX_DERIVED_BYTES) {
   const t = readText(file, { optional: true, privateFile: true, maxBytes });
   if (t === null) return [];
   return t.trim() ? t.trim().split('\n').map(line => JSON.parse(line)) : [];
@@ -114,7 +114,7 @@ export function distillImport(home, { run, inputFile, readFileImpl = (f) => fs.r
   const dir = ensureRunDir(home, run);
   return withRunLock(dir, () => {
     const raw = readFileImpl(inputFile);
-    if (Buffer.byteLength(raw) > 64 * 1024 * 1024) fail('DISTILL_INPUT_TOO_LARGE');
+    if (Buffer.byteLength(raw) > MAX_DERIVED_BYTES) fail('DISTILL_INPUT_TOO_LARGE');
     const file = tasksFile(dir);
     const seen = new Set(readPrivateJsonl(file).map(t => t.task_id));
     let total = 0, added = 0, skippedSensitive = 0, skippedDuplicate = 0;
@@ -206,7 +206,7 @@ export function distillImportReference(home, { run, inputFile, source, role = 'e
   const dir = ensureRunDir(home, run);
   return withRunLock(dir, () => {
     const raw = readFileImpl(inputFile);
-    if (Buffer.byteLength(raw) > 64 * 1024 * 1024) fail('DISTILL_INPUT_TOO_LARGE');
+    if (Buffer.byteLength(raw) > MAX_DERIVED_BYTES) fail('DISTILL_INPUT_TOO_LARGE');
     const tasksById = new Map(readPrivateJsonl(tasksFile(dir)).map(t => [t.task_id, t]));
     const file = referenceFile(dir);
     const existing = new Set(readPrivateJsonl(file).map(l => l.task_id));

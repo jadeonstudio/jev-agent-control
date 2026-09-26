@@ -7,7 +7,7 @@ import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { noSymlinks, ensureDir, readText, atomicWrite } from '../storage.mjs';
 import { fail, PURPOSES, DEFAULTS, ControlError } from '../constants.mjs';
-import { HASH, digest, encode, only } from './schema.mjs';
+import { HASH, MAX_DERIVED_BYTES, digest, encode, only } from './schema.mjs';
 import { readDataset } from './dataset.mjs';
 import { createTrainingStore } from './store.mjs';
 import { loadProviderConfig, validateProviderConfig, normalizeInference, createLayaClient } from '../inference.mjs';
@@ -127,7 +127,7 @@ export function listHoldouts(home) {
 function readHoldout(home, name) {
   if (!NAME_RE.test(String(name))) fail('INVALID_HOLDOUT_NAME');
   const manifest = JSON.parse(readText(path.join(holdoutsDir(home), `${name}.json`), { privateFile: true, maxBytes: 65536 }));
-  const contents = readText(path.join(holdoutsDir(home), `${name}.jsonl`), { privateFile: true, maxBytes: 64 * 1024 * 1024 });
+  const contents = readText(path.join(holdoutsDir(home), `${name}.jsonl`), { privateFile: true, maxBytes: MAX_DERIVED_BYTES });
   if (manifest.sha256 !== digest(contents)) fail('HOLDOUT_CORRUPTED');
   const samples = contents.trim() ? contents.trim().split('\n').map(JSON.parse) : [];
   if (samples.length !== manifest.sample_count) fail('HOLDOUT_CORRUPTED');

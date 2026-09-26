@@ -10,6 +10,12 @@ export const HASH = /^[0-9a-f]{64}$/;
 export const EVIDENCE = /^sha256:[0-9a-f]{64}$/;
 export const KINDS = ['decisions', 'outcomes', 'evaluations'];
 export const LABEL_SOURCES = ['objective', 'human', 'host_review', 'provider_agreement'];
+// Single cap for every DERIVED training artifact (canonical dataset + preferences, dataset manifest
+// reads, laya export files, frozen holdouts, distill run files/inputs). Raised from 64 MiB to 256 MiB
+// (dataset growth, 2026-09-26): the canonical dataset for ~24,000 samples already exceeded 64 MiB.
+// This does NOT cover raw captured-event limits (single event 48 KiB, 100,000 events per kind, the
+// raw snapshot scan cap in store.mjs), which are a separate, intentionally small, per-event budget.
+export const MAX_DERIVED_BYTES = 256 * 1024 * 1024;
 
 // Preserve state, option and question order: all are part of the model's actual input.
 export function stable(value, parent = '') {

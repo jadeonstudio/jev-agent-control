@@ -3,7 +3,7 @@ import path from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { resolveHome, ensureDir, noSymlinks, readText, atomicWrite } from '../storage.mjs';
 import { errorCode, fail } from '../constants.mjs';
-import { SCHEMA_VERSION, KINDS, UUID, encode, digest, only, safeContent, validateDecision, validateOutcome, validateEvent } from './schema.mjs';
+import { SCHEMA_VERSION, KINDS, UUID, MAX_DERIVED_BYTES, encode, digest, only, safeContent, validateDecision, validateOutcome, validateEvent } from './schema.mjs';
 
 export function outsideGit(target) {
   let dir = path.resolve(target);
@@ -140,10 +140,10 @@ export function createTrainingStore({ home = resolveHome(), now = () => new Date
   function writeDerived(relative, contents) {
     if (typeof relative !== 'string' || path.isAbsolute(relative) || relative.split(/[\\/]/).includes('..') || !/^(datasets|manifests|exports)\//.test(relative)) fail('INVALID_DATASET_PATH');
     outsideGit(root);
-    if (typeof contents !== 'string' || Buffer.byteLength(contents) > 64 * 1024 * 1024) fail('DATASET_TOO_LARGE');
+    if (typeof contents !== 'string' || Buffer.byteLength(contents) > MAX_DERIVED_BYTES) fail('DATASET_TOO_LARGE');
     for (const line of contents.split('\n').filter(x => x.trim())) safeContent(JSON.parse(line));
     const file = path.join(root, relative); noSymlinks(file); ensureDir(path.dirname(file), true);
-    const old = readText(file, { optional: true, privateFile: true, maxBytes: 64 * 1024 * 1024 });
+    const old = readText(file, { optional: true, privateFile: true, maxBytes: MAX_DERIVED_BYTES });
     if (old !== null) { if (old !== contents) fail('IMMUTABLE_DATASET_CONFLICT'); return file; }
     atomicWrite(file, contents, { expected: null }); return file;
   }

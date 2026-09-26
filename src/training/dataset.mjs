@@ -3,7 +3,7 @@ import { readText } from '../storage.mjs';
 import { DEFAULTS, PURPOSES, ID, fail } from '../constants.mjs';
 import { validateRequest, wireRequest } from '../contracts.mjs';
 // Canonical validation shares the inference input contract.
-import { POLICY_VERSION, HASH, encode, digest, safeContent, targetDistribution, validateTarget, validateProvenance, only, id } from './schema.mjs';
+import { POLICY_VERSION, HASH, MAX_DERIVED_BYTES, encode, digest, safeContent, targetDistribution, validateTarget, validateProvenance, only, id } from './schema.mjs';
 import { EVALUATION_POLICY, indexEvents, evaluateDecision, pairedPreferences, summarizeComparisons } from './evaluate.mjs';
 
 export function validateDatasetSource(store) {
@@ -81,7 +81,7 @@ export function buildDataset(store, { allowSmall = false } = {}) {
     const preferences = pairedPreferences(rows);
     const data = samples.map(encode).join('\n') + (samples.length ? '\n' : '');
     const prefs = preferences.map(encode).join('\n') + (preferences.length ? '\n' : '');
-    if (Buffer.byteLength(data) + Buffer.byteLength(prefs) > 64 * 1024 * 1024) fail('DATASET_TOO_LARGE');
+    if (Buffer.byteLength(data) + Buffer.byteLength(prefs) > MAX_DERIVED_BYTES) fail('DATASET_TOO_LARGE');
     const source_digest = digest({ events: snapshot.events.filter(e => e.kind !== 'evaluations').map(e => e.checksum).sort(), invalid: snapshot.invalid });
     const version = digest({ source_digest, policy: EVALUATION_POLICY, data: digest(data), preferences: digest(prefs) });
     const distribution = field => samples.reduce((out, s) => { out[s[field]] = (out[s[field]] || 0) + 1; return out; }, Object.create(null));
@@ -107,7 +107,7 @@ export function buildDataset(store, { allowSmall = false } = {}) {
 export function readDataset(store, version) {
   if (typeof version !== 'string' || !HASH.test(version)) fail('INVALID_DATASET_VERSION');
   const manifest = JSON.parse(readText(path.join(store.root, 'manifests', `${version}.json`), { privateFile: true, maxBytes: 49152 }));
-  const contents = readText(path.join(store.root, 'datasets', version, 'canonical.jsonl'), { privateFile: true, maxBytes: 64 * 1024 * 1024 });
+  const contents = readText(path.join(store.root, 'datasets', version, 'canonical.jsonl'), { privateFile: true, maxBytes: MAX_DERIVED_BYTES });
   if (manifest.dataset_version !== version || manifest.data_sha256 !== digest(contents) || manifest.evaluation_policy_version !== POLICY_VERSION) fail('DATASET_MANIFEST_MISMATCH');
   const samples = contents.trim() ? contents.trim().split('\n').map(JSON.parse) : [];
   if (samples.length !== manifest.sample_count) fail('DATASET_MANIFEST_MISMATCH');

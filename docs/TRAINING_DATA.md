@@ -89,7 +89,7 @@ $JEV_HOME/links/<key-hash>.json  # 0700/0600, tool_use_id/agent_id -> decision_i
 
 JSONL 동시 append 대신 **이벤트별 불변 JSON 파일**을 사용한다. 디렉터리 0700 / 파일 0600, 작업 트리·bare Git 저장소 내부 및 symlink 경로를 거부한다. UUID, checksum, O_EXCL, fsync 및 공유 쓰기 lock으로 중복/충돌을 확인한다. lock 충돌은 명시적 실패로 반환하며 몰래 성공 처리하거나 이전 lock을 훔치지 않는다. 프로세스 중단 후 `.lock`이 남으면 모든 writer 종료를 확인하고 해당 빈 lock 디렉터리만 수동 복구한다. 원본이나 백업 전체를 에이전트에 출력하지 않는다.
 
-원본은 append-only다. 파일 손상은 해당 이벤트를 격리해 계산에서 제외하고 숫자·오류 코드로 보고한다. 한 종류당 100,000개 / 단일 event 48KiB / 스캔 64MiB / 파생 파일 64MiB 상한이다. 장기간 운영은 작업 구간별 별도 보관·내보내기가 필요하다. 자동 삭제나 DB 서버는 없다.
+원본은 append-only다. 파일 손상은 해당 이벤트를 격리해 계산에서 제외하고 숫자·오류 코드로 보고한다. 한 종류당 100,000개 / 단일 event 48KiB / 스캔 64MiB / 파생 파일(canonical dataset·preferences·manifest·export·holdout·distill run 파일) 256MiB 상한이다(데이터셋 증가로 2026-09-26 상향, `MAX_DERIVED_BYTES`, raw 스캔·이벤트 상한은 그대로 유지). 장기간 운영은 작업 구간별 별도 보관·내보내기가 필요하다. 자동 삭제나 DB 서버는 없다.
 
 저장하지 않는 것: 실제 API 키·credential·access token, 환경 전체, 고객/개인정보, 전체 대화, 저장소 전체, 불필요한 파일 내용. 상태는 최대 4KiB의 최소 자료만 허용하고 필드/비밀값/개인정보 패턴을 다시 검사한다. JSON 문자열 안의 민감 필드와 export의 모든 행도 검사한다. 패턴 검사는 완전한 DLP가 아니다. 호출자는 입력을 최소화·비식별화하고 export 전 사람이 재검토해야 한다. 동일 OS 사용자·root에 대한 암호화 금고/위변조 방지는 아니다.
 
